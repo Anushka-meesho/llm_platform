@@ -1,0 +1,22 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Go binaries
+llm_platform_go/llm_platform_go
+
+# Env / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

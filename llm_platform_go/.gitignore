@@ -1,0 +1,22 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+llm_platform_go
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Environment / secrets
+.env
+*.env
+
+# Test output
+*.out
+
+# macOS
+.DS_Store

@@ -1,0 +1,29 @@
+@import "tailwindcss";
+@import "@meesho/merlin-ui-tailwind/theme/merlin.css";
+
+/* ── Override Merlin CSS variables ───────────────────────────────────────── */
+:root {
+  --primary-bg:   #FFFFFF;
+  --secondary-bg: #F3F3F3;
+  --tertiary-bg:  #E8E8E8;
+
+  --primary-border:   #E0E0E0;
+  --secondary-border: #EBEBEB;
+  --tertiary-border:  #F2F2F2;
+
+  --accent:           #E8442A;
+  --text-primary:     #1A1A1A;
+  --text-secondary:   #6B6B6B;
+
+  --font-family-heading: 'Inter', sans-serif;
+  --font-family-body:    'Inter', sans-serif;
+  --font-family-button:  'Inter', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}

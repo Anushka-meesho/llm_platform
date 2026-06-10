@@ -1,0 +1,8 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+llm_platform.db
+test_db.py
