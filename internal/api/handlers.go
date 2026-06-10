@@ -1,0 +1,228 @@
+package api
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"llm_platform_go/internal/db"
+	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/types"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+type Handler struct {
+	DB      *sql.DB
+	Clients *llm.Clients
+}
+
+// POST /run
+func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req types.RunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Prompt == "" {
+		writeError(w, http.StatusUnprocessableEntity, "prompt must not be empty")
+		return
+	}
+
+	runID := uuid.New().String()
+	wallStart := time.Now()
+
+	runResult := llm.RunAll(r.Context(), h.Clients, &req)
+
+	totalMs := int(time.Since(wallStart).Milliseconds())
+
+	var succeeded, failed int
+	respResults := make([]types.ModelResultResponse, 0, len(runResult.Results))
+
+	now := time.Now().UTC()
+
+	for _, mr := range runResult.Results {
+		var sessionID *string
+		if req.SessionID != "" {
+			sessionID = &req.SessionID
+		}
+		var sysPrompt *string
+		if req.SystemPrompt != "" {
+			sysPrompt = &req.SystemPrompt
+		}
+
+		row := &types.RunRow{
+			RunID:        runID,
+			SessionID:    sessionID,
+			Prompt:       req.Prompt,
+			SystemPrompt: sysPrompt,
+			Model:        mr.Model,
+			Response:     mr.Response,
+			LatencyMs:    mr.LatencyMs,
+			InputTokens:  mr.InputTokens,
+			OutputTokens: mr.OutputTokens,
+			TotalTokens:  mr.TotalTokens,
+			CostUSD:      mr.CostUSD,
+			Success:      mr.Success,
+			Error:        mr.Error,
+			CreatedAt:    now,
+		}
+		_ = db.InsertRun(h.DB, row) // log errors in production; don't fail the response
+
+		if mr.Success {
+			succeeded++
+		} else {
+			failed++
+		}
+
+		respResults = append(respResults, types.ModelResultResponse{
+			Model:        mr.Model,
+			Response:     mr.Response,
+			LatencyMs:    mr.LatencyMs,
+			InputTokens:  mr.InputTokens,
+			OutputTokens: mr.OutputTokens,
+			TotalTokens:  mr.TotalTokens,
+			CostUSD:      mr.CostUSD,
+			Success:      mr.Success,
+			Error:        mr.Error,
+		})
+	}
+
+	var sysPromptPtr *string
+	if req.SystemPrompt != "" {
+		sysPromptPtr = &req.SystemPrompt
+	}
+
+	writeJSON(w, http.StatusOK, types.RunResponse{
+		RunID:            runID,
+		Prompt:           req.Prompt,
+		SystemPrompt:     sysPromptPtr,
+		Results:          respResults,
+		TotalWallClockMs: totalMs,
+		ModelsSucceeded:  succeeded,
+		ModelsFailed:     failed,
+	})
+}
+
+// GET /sessions
+func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
+	page := queryIntOrDefault(r, "page", 1)
+	pageSize := queryIntOrDefault(r, "page_size", 8)
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	if page < 1 {
+		page = 1
+	}
+
+	sessions, total, err := db.ListSessions(h.DB, page, pageSize)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, types.SessionListResponse{
+		Page:          page,
+		PageSize:      pageSize,
+		TotalSessions: total,
+		TotalPages:    db.TotalPages(total, pageSize),
+		Sessions:      sessions,
+	})
+}
+
+// GET /sessions/{session_id}
+func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+
+	rows, err := db.GetSession(h.DB, sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+	if len(rows) == 0 {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	// Group rows by run_id, preserving chronological order.
+	type turnKey struct {
+		runID     string
+		createdAt time.Time
+	}
+	orderMap := make(map[string]int) // runID → index in turns slice
+	var turns []types.SessionTurn
+
+	for _, row := range rows {
+		idx, exists := orderMap[row.RunID]
+		if !exists {
+			idx = len(turns)
+			orderMap[row.RunID] = idx
+			turns = append(turns, types.SessionTurn{
+				RunID:        row.RunID,
+				Prompt:       row.Prompt,
+				SystemPrompt: row.SystemPrompt,
+				CreatedAt:    row.CreatedAt,
+				Results:      []types.TurnResult{},
+			})
+		}
+		turns[idx].Results = append(turns[idx].Results, types.TurnResult{
+			Model:        row.Model,
+			Response:     row.Response,
+			LatencyMs:    row.LatencyMs,
+			InputTokens:  row.InputTokens,
+			OutputTokens: row.OutputTokens,
+			TotalTokens:  row.TotalTokens,
+			CostUSD:      row.CostUSD,
+			Success:      row.Success,
+			Error:        row.Error,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, types.SessionDetailResponse{
+		SessionID: sessionID,
+		Turns:     turns,
+	})
+}
+
+// DELETE /sessions
+func (h *Handler) DeleteSessions(w http.ResponseWriter, r *http.Request) {
+	var req types.DeleteSessionsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		return
+	}
+
+	deleted, err := db.DeleteSessions(h.DB, req.SessionIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, types.DeleteSessionsResponse{
+		DeletedCount: int(deleted),
+		SessionIDs:   req.SessionIDs,
+	})
+}
+
+// GET /health
+func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":           "ok",
+		"models_available": llm.DefaultModels,
+	})
+}
+
+func queryIntOrDefault(r *http.Request, key string, def int) int {
+	s := r.URL.Query().Get(key)
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
+}
