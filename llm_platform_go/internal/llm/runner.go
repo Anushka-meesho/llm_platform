@@ -8,23 +8,21 @@ import (
 	"time"
 
 	"llm_platform_go/internal/types"
-
-	openai "github.com/sashabaranov/go-openai"
 )
 
-// providerConfig maps a friendly model name to its actual model ID and which client to use.
+// providerConfig maps a friendly model name to its actual model ID and which provider to use.
 type providerConfig struct {
 	modelID  string
-	clientFn func(*Clients) *openai.Client
+	clientFn func(*Clients) Provider
 }
 
-// registry is the single-source-of-truth for provider routing.
+// registry is the single source of truth for provider routing.
 // To swap Groq for Claude: replace the "llama-groq" entry with a claude providerConfig
-// and implement a ModelCaller for the Anthropic SDK.
+// and add an anthropicProvider implementation in client.go.
 var registry = map[string]providerConfig{
-	"gpt-4o-mini":  {"gpt-4o-mini", func(c *Clients) *openai.Client { return c.OpenAI }},
-	"llama-groq":   {"llama-3.3-70b-versatile", func(c *Clients) *openai.Client { return c.Groq }},
-	"gemini-flash": {"gemini-2.0-flash", func(c *Clients) *openai.Client { return c.Gemini }},
+	"gpt-4o-mini":  {"gpt-4o-mini", func(c *Clients) Provider { return c.OpenAI }},
+	"llama-groq":   {"llama-3.3-70b-versatile", func(c *Clients) Provider { return c.Groq }},
+	"gemini-flash": {"gemini-2.0-flash", func(c *Clients) Provider { return c.Gemini }},
 }
 
 // RunAll fans out to all requested models concurrently and returns results in
@@ -67,8 +65,8 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 	}
 
 	messages := buildMessages(modelName, req)
-	client := cfg.clientFn(clients)
-	if client == nil {
+	provider := cfg.clientFn(clients)
+	if provider == nil {
 		return errResult(modelName, start, "LLM client not configured")
 	}
 
@@ -77,24 +75,24 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 		maxTok = *req.MaxTokens
 	}
 
-	var resp openai.ChatCompletionResponse
-	var err error
-	apiReq := openai.ChatCompletionRequest{
+	apiReq := chatRequest{
 		Model:       cfg.modelID,
 		Messages:    messages,
 		MaxTokens:   maxTok,
 		Temperature: temp,
 	}
 
+	var resp *chatResponse
+	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = client.CreateChatCompletion(ctx, apiReq)
+		resp, err = provider.Call(ctx, &apiReq)
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
 			break // context cancelled or timed out — do not retry
 		}
-		var apiErr *openai.APIError
+		var apiErr *APIError
 		if errors.As(err, &apiErr) && isRetryable(apiErr.HTTPStatusCode) {
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 			continue
@@ -133,14 +131,11 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 
 // buildMessages constructs the message slice for the API call.
 // Priority: model_conversations history > single-turn prompt.
-func buildMessages(modelName string, req *types.RunRequest) []openai.ChatCompletionMessage {
-	var msgs []openai.ChatCompletionMessage
+func buildMessages(modelName string, req *types.RunRequest) []chatMessage {
+	var msgs []chatMessage
 
 	if req.SystemPrompt != "" {
-		msgs = append(msgs, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: req.SystemPrompt,
-		})
+		msgs = append(msgs, chatMessage{Role: "system", Content: req.SystemPrompt})
 	}
 
 	if hist, ok := req.ModelConversations[modelName]; ok && len(hist) > 0 {
@@ -152,16 +147,10 @@ func buildMessages(modelName string, req *types.RunRequest) []openai.ChatComplet
 			default:
 				content = fmt.Sprintf("%v", v)
 			}
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:    m.Role,
-				Content: content,
-			})
+			msgs = append(msgs, chatMessage{Role: m.Role, Content: content})
 		}
 	} else {
-		msgs = append(msgs, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: req.Prompt,
-		})
+		msgs = append(msgs, chatMessage{Role: "user", Content: req.Prompt})
 	}
 
 	return msgs
@@ -187,7 +176,7 @@ func classifyError(err error) string {
 	}
 
 	// API errors
-	var apiErr *openai.APIError
+	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.HTTPStatusCode {
 		case 400:
@@ -199,7 +188,7 @@ func classifyError(err error) string {
 		case 429:
 			return "Rate limit hit — all retries exhausted"
 		case 500:
-			return "OpenAI internal error — all retries exhausted"
+			return "Provider internal error — all retries exhausted"
 		case 503:
 			return "Service unavailable — all retries exhausted"
 		}
