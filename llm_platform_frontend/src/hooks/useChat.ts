@@ -7,7 +7,7 @@ import type {
   TApiMessage,
   TSessionDetail,
 } from '../types';
-import { MODELS } from '../types';
+import { DEFAULT_COMPARE_MODELS, MODELS } from '../types';
 import { api } from '../api/client';
 
 const emptyConversations = (): Record<string, TUIMessage[]> =>
@@ -48,7 +48,7 @@ export const useChat = () => {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedModels, setSelectedModels] = useState<string[]>([...MODELS]);
+  const [selectedModels, setSelectedModels] = useState<string[]>([...DEFAULT_COMPARE_MODELS]);
   const [temperature, setTemperature] = useState(0.7);
   const [systemPrompt, setSystemPrompt] = useState('');
   const [maxOutputTokens, setMaxOutputTokens] = useState(1000);
@@ -78,6 +78,8 @@ export const useChat = () => {
           total_tokens: r.total_tokens,
           cost_usd: r.cost_usd,
           success: r.success,
+          run_id: turn.run_id,
+          model: r.model,
         };
         newConvs[r.model].push(userMsg, assistantMsg);
       }
@@ -150,6 +152,8 @@ export const useChat = () => {
               total_tokens: r.total_tokens,
               cost_usd: r.cost_usd,
               success: r.success,
+              run_id: result.run_id,
+              model: r.model,
             };
             next[r.model] = [...(prev[r.model] ?? []), assistantMsg];
           }

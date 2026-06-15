@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"time"
 
 	"llm_platform_go/internal/types"
@@ -13,16 +14,74 @@ import (
 // providerConfig maps a friendly model name to its actual model ID and which provider to use.
 type providerConfig struct {
 	modelID  string
+	provider string // attribution name recorded on runs (openai/groq/gemini/anthropic)
 	clientFn func(*Clients) Provider
+	// reasoning marks OpenAI reasoning-family models (gpt-5, o-series) whose
+	// chat-completions wire rejects max_tokens and non-default temperature —
+	// CallModel sends max_completion_tokens and omits temperature instead.
+	reasoning bool
 }
 
-// registry is the single source of truth for provider routing.
-// To swap Groq for Claude: replace the "llama-groq" entry with a claude providerConfig
-// and add an anthropicProvider implementation in client.go.
+var (
+	openaiC    = func(c *Clients) Provider { return c.OpenAI }
+	groqC      = func(c *Clients) Provider { return c.Groq }
+	geminiC    = func(c *Clients) Provider { return c.Gemini }
+	anthropicC = func(c *Clients) Provider { return c.Anthropic }
+)
+
+// registry is the single source of truth for provider routing. Every entry is
+// registered whether or not that provider's API key is configured — a missing
+// key surfaces as a per-call auth error, never a startup failure.
 var registry = map[string]providerConfig{
-	"gpt-4o-mini":  {"gpt-4o-mini", func(c *Clients) Provider { return c.OpenAI }},
-	"llama-groq":   {"llama-3.3-70b-versatile", func(c *Clients) Provider { return c.Groq }},
-	"gemini-flash": {"gemini-2.0-flash", func(c *Clients) Provider { return c.Gemini }},
+	// ── OpenAI ──────────────────────────────────────────────────────────────
+	"gpt-5.1":      {modelID: "gpt-5.1", provider: "openai", clientFn: openaiC, reasoning: true},
+	"gpt-5":        {modelID: "gpt-5", provider: "openai", clientFn: openaiC, reasoning: true},
+	"gpt-5-mini":   {modelID: "gpt-5-mini", provider: "openai", clientFn: openaiC, reasoning: true},
+	"gpt-5-nano":   {modelID: "gpt-5-nano", provider: "openai", clientFn: openaiC, reasoning: true},
+	"gpt-4.1":      {modelID: "gpt-4.1", provider: "openai", clientFn: openaiC},
+	"gpt-4.1-mini": {modelID: "gpt-4.1-mini", provider: "openai", clientFn: openaiC},
+	"gpt-4.1-nano": {modelID: "gpt-4.1-nano", provider: "openai", clientFn: openaiC},
+	"gpt-4o":       {modelID: "gpt-4o", provider: "openai", clientFn: openaiC},
+	"gpt-4o-mini":  {modelID: "gpt-4o-mini", provider: "openai", clientFn: openaiC},
+
+	// ── Groq ────────────────────────────────────────────────────────────────
+	"llama-groq": {modelID: "llama-3.3-70b-versatile", provider: "groq", clientFn: groqC},
+
+	// ── Gemini (OpenAI-compatible endpoint) ─────────────────────────────────
+	"gemini-3-pro":          {modelID: "gemini-3-pro-preview", provider: "gemini", clientFn: geminiC},
+	"gemini-2.5-pro":        {modelID: "gemini-2.5-pro", provider: "gemini", clientFn: geminiC},
+	"gemini-2.5-flash":      {modelID: "gemini-2.5-flash", provider: "gemini", clientFn: geminiC},
+	"gemini-2.5-flash-lite": {modelID: "gemini-2.5-flash-lite", provider: "gemini", clientFn: geminiC},
+	"gemini-flash":          {modelID: "gemini-2.0-flash", provider: "gemini", clientFn: geminiC},
+
+	// ── Anthropic (native Messages API — anthropic.go) ──────────────────────
+	"claude-fable-5":    {modelID: "claude-fable-5", provider: "anthropic", clientFn: anthropicC},
+	"claude-opus-4-8":   {modelID: "claude-opus-4-8", provider: "anthropic", clientFn: anthropicC},
+	"claude-sonnet-4-6": {modelID: "claude-sonnet-4-6", provider: "anthropic", clientFn: anthropicC},
+	"claude-haiku-4-5":  {modelID: "claude-haiku-4-5", provider: "anthropic", clientFn: anthropicC},
+}
+
+// ProviderName returns the attribution name for a model key ("" if unknown).
+func ProviderName(model string) string {
+	return registry[model].provider
+}
+
+// KnownModel reports whether the model key exists in the routing registry.
+func KnownModel(model string) bool {
+	_, ok := registry[model]
+	return ok
+}
+
+// AllModels returns every routing key in the registry, sorted. Backs the
+// health endpoint's models_available (DefaultModels stays the small /run
+// fan-out default — fanning out to the whole registry would be expensive).
+func AllModels() []string {
+	keys := make([]string, 0, len(registry))
+	for k := range registry {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // RunAll fans out to all requested models concurrently and returns results in
@@ -50,8 +109,23 @@ func RunAll(ctx context.Context, clients *Clients, req *types.RunRequest) *RunRe
 	return &RunResult{Prompt: req.Prompt, Results: results}
 }
 
-// callSingleModel calls one provider and always returns a ModelResult — never panics.
+// callSingleModel adapts a playground /run request into a CallModel invocation.
 func callSingleModel(ctx context.Context, clients *Clients, modelName string, req *types.RunRequest) ModelResult {
+	temp := float32(0.7)
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
+	maxTok := 1000
+	if req.MaxTokens != nil {
+		maxTok = *req.MaxTokens
+	}
+	return CallModel(ctx, clients, modelName, buildMessages(modelName, req), temp, maxTok)
+}
+
+// CallModel calls one model with the given messages and always returns a
+// ModelResult — never panics. This is the single execution path shared by the
+// playground fan-out (/run) and the task prediction endpoint (/v1/tasks/.../predict).
+func CallModel(ctx context.Context, clients *Clients, modelName string, messages []ChatMessage, temperature float32, maxTokens int) ModelResult {
 	start := time.Now()
 
 	cfg, ok := registry[modelName]
@@ -59,27 +133,29 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 		return errResult(modelName, start, fmt.Sprintf("unknown model: %s", modelName))
 	}
 
-	temp := float32(0.7)
-	if req.Temperature != nil {
-		temp = float32(*req.Temperature)
-	}
-
-	messages := buildMessages(modelName, req)
 	provider := cfg.clientFn(clients)
 	if provider == nil {
 		return errResult(modelName, start, "LLM client not configured")
 	}
 
-	maxTok := 1000
-	if req.MaxTokens != nil {
-		maxTok = *req.MaxTokens
+	// Circuit breaker: fail fast while the provider's circuit is open.
+	if !defaultBreakers.Allow(cfg.provider) {
+		r := errResult(modelName, start, "provider circuit open — recent failures, retry shortly")
+		r.infraFailure = true // open circuit counts as infra trouble for fallback
+		return r
 	}
 
 	apiReq := chatRequest{
 		Model:       cfg.modelID,
 		Messages:    messages,
-		MaxTokens:   maxTok,
-		Temperature: temp,
+		MaxTokens:   maxTokens,
+		Temperature: temperature,
+	}
+	if cfg.reasoning {
+		// gpt-5 family / o-series: max_tokens and temperature are rejected.
+		apiReq.MaxTokens = 0
+		apiReq.MaxCompletionTokens = maxTokens
+		apiReq.Temperature = 0 // omitted via omitempty → provider default
 	}
 
 	var resp *chatResponse
@@ -102,8 +178,18 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 
 	latencyMs := int(time.Since(start).Milliseconds())
 
+	// Feed the breaker: infra failures count against the provider; any
+	// completed exchange (success or a 4xx config error) counts as healthy.
+	if isInfraFailure(err) {
+		defaultBreakers.RecordFailure(cfg.provider)
+	} else {
+		defaultBreakers.RecordSuccess(cfg.provider)
+	}
+
 	if err != nil {
-		return errResult(modelName, start, classifyError(err))
+		r := errResult(modelName, start, classifyError(err))
+		r.infraFailure = isInfraFailure(err)
+		return r
 	}
 	if len(resp.Choices) == 0 {
 		return errResult(modelName, start, "empty response from model")
@@ -119,6 +205,7 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 
 	return ModelResult{
 		Model:        modelName,
+		Provider:     cfg.provider,
 		Response:     &text,
 		LatencyMs:    latencyMs,
 		InputTokens:  inTok,
@@ -131,11 +218,11 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 
 // buildMessages constructs the message slice for the API call.
 // Priority: model_conversations history > single-turn prompt.
-func buildMessages(modelName string, req *types.RunRequest) []chatMessage {
-	var msgs []chatMessage
+func buildMessages(modelName string, req *types.RunRequest) []ChatMessage {
+	var msgs []ChatMessage
 
 	if req.SystemPrompt != "" {
-		msgs = append(msgs, chatMessage{Role: "system", Content: req.SystemPrompt})
+		msgs = append(msgs, ChatMessage{Role: "system", Content: req.SystemPrompt})
 	}
 
 	if hist, ok := req.ModelConversations[modelName]; ok && len(hist) > 0 {
@@ -147,10 +234,10 @@ func buildMessages(modelName string, req *types.RunRequest) []chatMessage {
 			default:
 				content = fmt.Sprintf("%v", v)
 			}
-			msgs = append(msgs, chatMessage{Role: m.Role, Content: content})
+			msgs = append(msgs, ChatMessage{Role: m.Role, Content: content})
 		}
 	} else {
-		msgs = append(msgs, chatMessage{Role: "user", Content: req.Prompt})
+		msgs = append(msgs, ChatMessage{Role: "user", Content: req.Prompt})
 	}
 
 	return msgs
@@ -207,6 +294,7 @@ func errResult(model string, start time.Time, msg string) ModelResult {
 	latencyMs := int(time.Since(start).Milliseconds())
 	return ModelResult{
 		Model:     model,
+		Provider:  ProviderName(model), // "" for unknown models
 		LatencyMs: latencyMs,
 		Success:   false,
 		Error:     &msg,

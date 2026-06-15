@@ -28,6 +28,8 @@ func newTestDB(t *testing.T) *sql.DB {
 
 func strPtr(s string) *string { return &s }
 
+const testUser = "u-test"
+
 func TestInsertAndGetSession(t *testing.T) {
 	database := newTestDB(t)
 
@@ -44,6 +46,7 @@ func TestInsertAndGetSession(t *testing.T) {
 		TotalTokens:  30,
 		CostUSD:   0.000123,
 		Success:   true,
+		UserID:    strPtr(testUser),
 		CreatedAt: time.Now().UTC(),
 	}
 
@@ -51,7 +54,7 @@ func TestInsertAndGetSession(t *testing.T) {
 		t.Fatalf("InsertRun: %v", err)
 	}
 
-	rows, err := appdb.GetSession(database, sessionID)
+	rows, err := appdb.GetSession(database, testUser, sessionID)
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
@@ -76,7 +79,7 @@ func TestInsertAndGetSession(t *testing.T) {
 
 func TestGetSessionUnknown(t *testing.T) {
 	database := newTestDB(t)
-	rows, err := appdb.GetSession(database, "no-such-session")
+	rows, err := appdb.GetSession(database, testUser, "no-such-session")
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
@@ -100,6 +103,7 @@ func TestListSessionsPagination(t *testing.T) {
 				Model:     "gpt-4o-mini",
 				Response:  strPtr("response"),
 				Success:   true,
+				UserID:    strPtr(testUser),
 				CreatedAt: now.Add(time.Duration(sess) * time.Minute),
 			}
 			if err := appdb.InsertRun(database, row); err != nil {
@@ -109,7 +113,7 @@ func TestListSessionsPagination(t *testing.T) {
 	}
 
 	// Page 1, size 3 → 3 sessions
-	sessions, total, err := appdb.ListSessions(database, 1, 3)
+	sessions, total, err := appdb.ListSessions(database, testUser, 1, 3)
 	if err != nil {
 		t.Fatalf("ListSessions p1: %v", err)
 	}
@@ -124,7 +128,7 @@ func TestListSessionsPagination(t *testing.T) {
 	}
 
 	// Page 2, size 3 → 2 sessions
-	sessions2, _, err := appdb.ListSessions(database, 2, 3)
+	sessions2, _, err := appdb.ListSessions(database, testUser, 2, 3)
 	if err != nil {
 		t.Fatalf("ListSessions p2: %v", err)
 	}
@@ -144,6 +148,7 @@ func TestListSessionsOrderedByMostRecent(t *testing.T) {
 			Prompt:    "prompt",
 			Model:     "gpt-4o-mini",
 			Success:   true,
+			UserID:    strPtr(testUser),
 			CreatedAt: base.Add(time.Duration(i) * time.Hour),
 		}
 		if err := appdb.InsertRun(database, row); err != nil {
@@ -151,7 +156,7 @@ func TestListSessionsOrderedByMostRecent(t *testing.T) {
 		}
 	}
 
-	sessions, _, err := appdb.ListSessions(database, 1, 10)
+	sessions, _, err := appdb.ListSessions(database, testUser, 1, 10)
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
@@ -171,6 +176,7 @@ func TestDeleteSessions(t *testing.T) {
 			Prompt:    "p",
 			Model:     "gpt-4o-mini",
 			Success:   true,
+			UserID:    strPtr(testUser),
 			CreatedAt: now,
 		}
 		if err := appdb.InsertRun(database, row); err != nil {
@@ -178,7 +184,7 @@ func TestDeleteSessions(t *testing.T) {
 		}
 	}
 
-	deleted, err := appdb.DeleteSessions(database, []string{"s1", "s2"})
+	deleted, err := appdb.DeleteSessions(database, testUser, []string{"s1", "s2"})
 	if err != nil {
 		t.Fatalf("DeleteSessions: %v", err)
 	}
@@ -187,7 +193,7 @@ func TestDeleteSessions(t *testing.T) {
 	}
 
 	// s3 should still exist
-	rows, _ := appdb.GetSession(database, "s3")
+	rows, _ := appdb.GetSession(database, testUser, "s3")
 	if len(rows) != 1 {
 		t.Errorf("s3 should still have 1 row, got %d", len(rows))
 	}
@@ -195,7 +201,7 @@ func TestDeleteSessions(t *testing.T) {
 
 func TestDeleteSessionsNonExistent(t *testing.T) {
 	database := newTestDB(t)
-	deleted, err := appdb.DeleteSessions(database, []string{"ghost-1", "ghost-2"})
+	deleted, err := appdb.DeleteSessions(database, testUser, []string{"ghost-1", "ghost-2"})
 	if err != nil {
 		t.Fatalf("DeleteSessions: %v", err)
 	}
@@ -206,7 +212,7 @@ func TestDeleteSessionsNonExistent(t *testing.T) {
 
 func TestDeleteSessionsEmpty(t *testing.T) {
 	database := newTestDB(t)
-	deleted, err := appdb.DeleteSessions(database, []string{})
+	deleted, err := appdb.DeleteSessions(database, testUser, []string{})
 	if err != nil {
 		t.Fatalf("DeleteSessions empty: %v", err)
 	}

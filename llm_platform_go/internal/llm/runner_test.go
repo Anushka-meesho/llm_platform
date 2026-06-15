@@ -35,7 +35,7 @@ func (m *mockProvider) Call(ctx context.Context, req *chatRequest) (*chatRespons
 func successMock(content string) *mockProvider {
 	return &mockProvider{results: []callResult{{
 		resp: &chatResponse{
-			Choices: []chatChoice{{Message: chatMessage{Role: "assistant", Content: content}}},
+			Choices: []chatChoice{{Message: ChatMessage{Role: "assistant", Content: content}}},
 			Usage:   chatUsage{PromptTokens: 10, CompletionTokens: 20},
 		},
 	}}}
@@ -118,7 +118,7 @@ func TestCallSingleModel_EmptyChoices(t *testing.T) {
 func TestCallSingleModel_EmptyContent(t *testing.T) {
 	mock := &mockProvider{results: []callResult{{
 		resp: &chatResponse{
-			Choices: []chatChoice{{Message: chatMessage{Content: ""}}},
+			Choices: []chatChoice{{Message: ChatMessage{Content: ""}}},
 		},
 	}}}
 	clients := clientsWith(mock, nil, nil)
@@ -153,7 +153,7 @@ func TestCallSingleModel_RetriesOnTransientError(t *testing.T) {
 		{err: &APIError{HTTPStatusCode: 429, Message: "rate limit"}},
 		{err: &APIError{HTTPStatusCode: 429, Message: "rate limit"}},
 		{resp: &chatResponse{
-			Choices: []chatChoice{{Message: chatMessage{Content: "ok"}}},
+			Choices: []chatChoice{{Message: ChatMessage{Content: "ok"}}},
 			Usage:   chatUsage{PromptTokens: 5, CompletionTokens: 5},
 		}},
 	}}

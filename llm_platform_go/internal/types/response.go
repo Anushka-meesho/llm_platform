@@ -85,5 +85,59 @@ type RunRow struct {
 	CostUSD      float64
 	Success      bool
 	Error        *string
-	CreatedAt    time.Time
+	UserID       *string
+	UserEmail    *string
+	// Task keying + observability (Phase 0)
+	TaskID        *string
+	PromptVersion int
+	Provider      *string
+	FallbackUsed  bool
+	CacheHit      bool
+	IsTest        bool // Studio test-panel call, not production traffic
+	CreatedAt     time.Time
+}
+
+// ── Feedback ────────────────────────────────────────────────────────────────
+
+type FeedbackRequest struct {
+	RunID  string `json:"run_id"`
+	Model  string `json:"model"`
+	Rating int    `json:"rating"` // 1–5
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+type ModelStats struct {
+	Model        string  `json:"model"`
+	Runs         int     `json:"runs"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	AvgRating    float64 `json:"avg_rating"` // 0 if no ratings yet
+	RatingCount  int     `json:"rating_count"`
+}
+
+type DailyPoint struct {
+	Date        string  `json:"date"` // YYYY-MM-DD
+	CostUSD     float64 `json:"cost_usd"`
+	TotalTokens int     `json:"total_tokens"`
+	Runs        int     `json:"runs"`
+}
+
+type TaskStats struct {
+	TaskID       string  `json:"task_id"`
+	Runs         int     `json:"runs"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	SuccessRate  float64 `json:"success_rate"` // 0..1
+}
+
+type DashboardResponse struct {
+	TotalRuns    int          `json:"total_runs"`
+	TotalTokens  int          `json:"total_tokens"`
+	TotalCostUSD float64      `json:"total_cost_usd"`
+	ByTask       []TaskStats  `json:"by_task"`
+	ByModel      []ModelStats `json:"by_model"`
+	Daily        []DailyPoint `json:"daily"`
 }

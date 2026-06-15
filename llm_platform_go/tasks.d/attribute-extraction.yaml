@@ -1,0 +1,64 @@
+# Task config — the plug-and-play onboarding contract (design doc §2.2).
+# Files in tasks.d/ are upserted into the registry at startup; editing the
+# prompt here and restarting bumps the task's prompt_version automatically.
+id: attribute-extraction
+name: Attribute Extraction
+description: >
+  Extract structured product attributes from a listing's title, description,
+  and category. First real task on the platform (CIS prefill shadow target).
+
+model: llama-groq # swap to gemini-flash when the Gemini key is configured
+fallback_models: [gpt-4o-mini] # stored now; fallback execution lands in Phase 1
+temperature: 0.1
+max_tokens: 800
+daily_budget_usd: 50 # stored now; enforcement lands in Phase 1
+
+input_schema:
+  type: object
+  required: [title, category]
+  additionalProperties: false
+  properties:
+    title:
+      type: string
+      minLength: 3
+    description:
+      type: string
+    category:
+      type: string
+      minLength: 2
+
+output_schema:
+  type: object
+  required: [attributes, confidence]
+  properties:
+    attributes:
+      type: object
+      additionalProperties:
+        type: string
+    confidence:
+      type: number
+      minimum: 0
+      maximum: 1
+
+system_prompt: >
+  You are a product attribute extraction engine for an e-commerce catalog.
+  Respond with JSON only — no prose, no markdown fences.
+
+prompt_template: |
+  Extract product attributes from this listing.
+
+  Title: {{.title}}
+  {{if .description}}Description: {{.description}}{{end}}
+  Category: {{.category}}
+
+  Return a JSON object with exactly two keys:
+  - "attributes": an object of attribute name -> value (strings only, e.g. "color": "red", "material": "cotton")
+  - "confidence": a number between 0 and 1 for your overall confidence
+
+  Extract only attributes clearly supported by the listing text. Respond with JSON only.
+
+# Prediction cache: identical requests (same prompt version, rendered prompt,
+# model, params) are served from Redis without a provider call for the TTL.
+cache:
+  enabled: true
+  ttl: 24h

@@ -19,14 +19,18 @@ type Provider interface {
 }
 
 // chatRequest is the OpenAI-compatible chat completions request body.
+// OpenAI's reasoning models (gpt-5 family, o-series) reject max_tokens and
+// non-default temperature — for those, CallModel sets MaxCompletionTokens
+// instead and omits Temperature (registry flag `reasoning`).
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float32       `json:"temperature,omitempty"`
+	Model               string        `json:"model"`
+	Messages            []ChatMessage `json:"messages"`
+	MaxTokens           int           `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	Temperature         float32       `json:"temperature,omitempty"`
 }
 
-type chatMessage struct {
+type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
@@ -38,7 +42,7 @@ type chatResponse struct {
 }
 
 type chatChoice struct {
-	Message chatMessage `json:"message"`
+	Message ChatMessage `json:"message"`
 }
 
 type chatUsage struct {
@@ -116,30 +120,46 @@ func (p *openAICompatProvider) Call(ctx context.Context, req *chatRequest) (*cha
 // No hard timeout — request context (set by the handler) handles cancellation.
 var sharedHTTPClient = &http.Client{Timeout: 120 * time.Second}
 
+// NewOpenAICompatProvider returns a Provider for any OpenAI-compatible chat
+// completions endpoint — self-hosted vLLM, gateways, or test fakes.
+func NewOpenAICompatProvider(baseURL, apiKey string) Provider {
+	return &openAICompatProvider{baseURL: baseURL, apiKey: apiKey, client: sharedHTTPClient}
+}
+
 // Clients holds one configured Provider per LLM backend.
-// To swap Groq for Claude: replace the Groq field with a Claude Provider.
 type Clients struct {
-	OpenAI Provider
-	Groq   Provider // ← replace with Claude when ready
-	Gemini Provider
+	OpenAI    Provider
+	Groq      Provider
+	Gemini    Provider
+	Anthropic Provider // native Messages API (anthropic.go), not OpenAI-compatible
 }
 
 func BuildClients(cfg *config.Config) *Clients {
+	// Anthropic's SDK rejects a missing key client-side (a plain error, which
+	// would misclassify as an infra failure and trip the breaker). Leave the
+	// provider nil when unconfigured — calls then get the standard
+	// "LLM client not configured" result, same as any unconfigured backend.
+	var anthropicProvider Provider
+	if cfg.AnthropicKey != "" {
+		anthropicProvider = NewAnthropicProvider(cfg.AnthropicKey, cfg.AnthropicBaseURL)
+	}
+
 	return &Clients{
 		OpenAI: &openAICompatProvider{
-			baseURL: "https://api.openai.com/v1",
+			baseURL: cfg.OpenAIBaseURL,
 			apiKey:  cfg.OpenAIKey,
 			client:  sharedHTTPClient,
 		},
 		Groq: &openAICompatProvider{
-			baseURL: "https://api.groq.com/openai/v1",
+			baseURL: cfg.GroqBaseURL,
 			apiKey:  cfg.GroqKey,
 			client:  sharedHTTPClient,
 		},
 		Gemini: &openAICompatProvider{
-			baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+			baseURL: cfg.GeminiBaseURL,
 			apiKey:  cfg.GeminiKey,
 			client:  sharedHTTPClient,
 		},
+		Anthropic: anthropicProvider,
 	}
 }

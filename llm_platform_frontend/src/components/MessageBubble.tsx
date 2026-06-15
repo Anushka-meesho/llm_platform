@@ -1,5 +1,6 @@
 import { Typography } from '@meesho/merlin-ui-tailwind';
 import type { TUIMessage } from '../types';
+import StarRating from './StarRating';
 
 type TMessageBubbleProps = {
   message: TUIMessage;
@@ -44,7 +45,7 @@ const AssistantBubble = ({
         {message.content}
       </Typography>
     </div>
-    <div className="flex gap-3 ml-1">
+    <div className="flex items-center gap-3 ml-1">
       {message.latency_ms > 0 && (
         <span className="text-[10px] text-tertiary-text">⏱ {message.latency_ms}ms</span>
       )}
@@ -53,6 +54,13 @@ const AssistantBubble = ({
       )}
       {message.cost_usd != null && (
         <span className="text-[10px] text-tertiary-text">${message.cost_usd.toFixed(6)}</span>
+      )}
+      {message.success && message.run_id && message.model && (
+        <StarRating
+          runId={message.run_id}
+          model={message.model}
+          initial={message.rating ?? 0}
+        />
       )}
     </div>
   </div>

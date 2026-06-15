@@ -10,18 +10,67 @@ import (
 	"time"
 
 	"llm_platform_go/internal/api"
+	"llm_platform_go/internal/auth"
+	"llm_platform_go/internal/cache"
 	appdb "llm_platform_go/internal/db"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
+	"llm_platform_go/internal/users"
 
 	_ "modernc.org/sqlite"
 )
 
-// mockClients returns Clients with nil underlying openai.Client values.
-// The runner will fail on each call, which is fine for endpoint-shape tests
-// that don't need real LLM responses.
-// For tests that need success responses, insert pre-cooked DB rows directly.
+const (
+	testSecret = "test-secret"
+	testIssuer = "test"
+)
+
+// testToken is a valid session token for the seeded demo "admin" user, used to
+// authenticate requests against the protected endpoints.
+func testToken(t *testing.T) string {
+	t.Helper()
+	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin"}
+	tok, err := auth.IssueToken(u, []byte(testSecret), testIssuer, time.Hour)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+	return tok
+}
+
+// jsonBody wraps a JSON string as a request body reader.
+func jsonBody(s string) *bytes.Buffer { return bytes.NewBufferString(s) }
+
+// authReq builds a request carrying the test session token.
+func authReq(t *testing.T, method, url, body string) *http.Request {
+	t.Helper()
+	var r *http.Request
+	var err error
+	if body == "" {
+		r, err = http.NewRequest(method, url, nil)
+	} else {
+		r, err = http.NewRequest(method, url, bytes.NewBufferString(body))
+		r.Header.Set("Content-Type", "application/json")
+	}
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	r.Header.Set("Authorization", "Bearer "+testToken(t))
+	return r
+}
+
+// newTestServer wires a fully authenticated test server with nil model
+// clients — model calls fail, which is fine for endpoint-shape tests. For
+// tests that need successful model output, use newTestServerWithClients.
 func newTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
+	return newTestServerWithClients(t, &llm.Clients{})
+}
+
+func newTestServerWithClients(t *testing.T, clients *llm.Clients) (*httptest.Server, *sql.DB) {
+	return newTestServerWithCache(t, clients, nil)
+}
+
+func newTestServerWithCache(t *testing.T, clients *llm.Clients, predictionCache cache.Cache) (*httptest.Server, *sql.DB) {
 	t.Helper()
 	database, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -37,8 +86,24 @@ func newTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 		"gpt-4o-mini": {InputPer1M: 0.15, OutputPer1M: 0.60},
 	})
 
-	clients := &llm.Clients{} // nil clients → callSingleModel returns errors, which is fine
-	router := api.NewRouter(database, clients)
+	taskStore := tasks.NewStore(database)
+	if err := tasks.SeedPlayground(taskStore); err != nil {
+		t.Fatalf("seed playground: %v", err)
+	}
+
+	router := api.NewRouter(api.RouterDeps{
+		DB:      database,
+		Clients: clients,
+		Users:   users.NewDemoStore(),
+		Tasks:   taskStore,
+		Cache:   predictionCache,
+		Auth: api.AuthConfig{
+			Secret:      []byte(testSecret),
+			CookieName:  "llm_platform_token",
+			Issuer:      testIssuer,
+			TokenExpiry: time.Hour,
+		},
+	})
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(func() {
@@ -59,10 +124,20 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+func TestRunEndpointRequiresAuth(t *testing.T) {
+	srv, _ := newTestServer(t)
+	resp, err := http.Post(srv.URL+"/run", "application/json", bytes.NewBufferString(`{"prompt":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST /run: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401", resp.StatusCode)
+	}
+}
+
 func TestRunEndpointEmptyPrompt(t *testing.T) {
 	srv, _ := newTestServer(t)
-	body := `{"prompt":""}`
-	resp, err := http.Post(srv.URL+"/run", "application/json", bytes.NewBufferString(body))
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/run", `{"prompt":""}`))
 	if err != nil {
 		t.Fatalf("POST /run: %v", err)
 	}
@@ -73,7 +148,7 @@ func TestRunEndpointEmptyPrompt(t *testing.T) {
 
 func TestRunEndpointInvalidJSON(t *testing.T) {
 	srv, _ := newTestServer(t)
-	resp, err := http.Post(srv.URL+"/run", "application/json", bytes.NewBufferString("not-json"))
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/run", "not-json"))
 	if err != nil {
 		t.Fatalf("POST /run: %v", err)
 	}
@@ -86,7 +161,7 @@ func TestRunEndpointReturnsShape(t *testing.T) {
 	srv, _ := newTestServer(t)
 	// With nil clients, each model call will fail — but the response shape is still correct.
 	body := `{"prompt":"hello","models":["gpt-4o-mini"]}`
-	resp, err := http.Post(srv.URL+"/run", "application/json", bytes.NewBufferString(body))
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/run", body))
 	if err != nil {
 		t.Fatalf("POST /run: %v", err)
 	}
@@ -111,7 +186,7 @@ func TestRunEndpointReturnsShape(t *testing.T) {
 
 func TestListSessionsEmpty(t *testing.T) {
 	srv, _ := newTestServer(t)
-	resp, err := http.Get(srv.URL + "/sessions")
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodGet, srv.URL+"/sessions", ""))
 	if err != nil {
 		t.Fatalf("GET /sessions: %v", err)
 	}
@@ -130,7 +205,7 @@ func TestListSessionsEmpty(t *testing.T) {
 
 func TestGetSessionNotFound(t *testing.T) {
 	srv, _ := newTestServer(t)
-	resp, err := http.Get(srv.URL + "/sessions/no-such-id")
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodGet, srv.URL+"/sessions/no-such-id", ""))
 	if err != nil {
 		t.Fatalf("GET /sessions/no-such-id: %v", err)
 	}
@@ -150,13 +225,14 @@ func TestGetSessionFound(t *testing.T) {
 		Model:     "gpt-4o-mini",
 		Response:  strPtr("a response"),
 		Success:   true,
+		UserID:    strPtr("u-admin"),
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := appdb.InsertRun(database, row); err != nil {
 		t.Fatalf("InsertRun: %v", err)
 	}
 
-	resp, err := http.Get(srv.URL + "/sessions/" + sessID)
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodGet, srv.URL+"/sessions/"+sessID, ""))
 	if err != nil {
 		t.Fatalf("GET /sessions/%s: %v", sessID, err)
 	}
@@ -187,6 +263,7 @@ func TestDeleteSessionsEndpoint(t *testing.T) {
 			Prompt:    "p",
 			Model:     "gpt-4o-mini",
 			Success:   true,
+			UserID:    strPtr("u-admin"),
 			CreatedAt: time.Now().UTC(),
 		}
 		if err := appdb.InsertRun(database, row); err != nil {
@@ -195,9 +272,7 @@ func TestDeleteSessionsEndpoint(t *testing.T) {
 	}
 
 	body := `{"session_ids":["d1","d2"]}`
-	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sessions", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodDelete, srv.URL+"/sessions", body))
 	if err != nil {
 		t.Fatalf("DELETE /sessions: %v", err)
 	}

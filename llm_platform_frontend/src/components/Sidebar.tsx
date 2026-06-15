@@ -8,7 +8,7 @@ import {
   cn,
 } from '@meesho/merlin-ui-tailwind';
 import type { TSessionSummary, TSessionDetail } from '../types';
-import { MODELS } from '../types';
+import { MODEL_GROUPS } from '../types';
 
 type TSidebarProps = {
   selectedModels: string[];
@@ -48,6 +48,9 @@ const Sidebar = ({
   onFetchPage,
 }: TSidebarProps) => {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // Per-provider expand/collapse. Unset = default: open when a model in the
+  // group is selected, collapsed otherwise.
+  const [openProviders, setOpenProviders] = useState<Record<string, boolean>>({});
 
   const handleModelChange = useCallback(
     (model: string, checked: boolean) => {
@@ -105,19 +108,50 @@ const Sidebar = ({
         >
           Models
         </Typography>
-        <div className="flex flex-col gap-2">
-          {MODELS.map((model) => (
-            <Checkbox
-              key={model}
-              checked={selectedModels.includes(model)}
-              onChange={({ checked }) => handleModelChange(model, checked)}
-              label={
-                <Typography variant="body" size="3" className="text-primary-text">
-                  {model}
-                </Typography>
-              }
-            />
-          ))}
+        <div className="flex flex-col gap-1">
+          {MODEL_GROUPS.map((group) => {
+            const selectedCount = group.models.filter((m) =>
+              selectedModels.includes(m),
+            ).length;
+            const open = openProviders[group.provider] ?? selectedCount > 0;
+            return (
+              <div key={group.provider}>
+                <button
+                  onClick={() =>
+                    setOpenProviders((prev) => ({ ...prev, [group.provider]: !open }))
+                  }
+                  className="w-full flex items-center justify-between py-1 rounded-md hover:bg-tertiary-bg px-1 transition-colors"
+                  title={open ? `Collapse ${group.provider}` : `Expand ${group.provider}`}
+                >
+                  <Typography variant="body" size="3" className="text-primary-text font-medium">
+                    {group.provider}
+                  </Typography>
+                  <Typography variant="body" size="1" className="text-tertiary-text">
+                    {selectedCount > 0
+                      ? `${selectedCount}/${group.models.length}`
+                      : group.models.length}{' '}
+                    {open ? '▾' : '▸'}
+                  </Typography>
+                </button>
+                {open && (
+                  <div className="flex flex-col gap-2 pl-3 py-1">
+                    {group.models.map((model) => (
+                      <Checkbox
+                        key={model}
+                        checked={selectedModels.includes(model)}
+                        onChange={({ checked }) => handleModelChange(model, checked)}
+                        label={
+                          <Typography variant="body" size="3" className="text-primary-text">
+                            {model}
+                          </Typography>
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 

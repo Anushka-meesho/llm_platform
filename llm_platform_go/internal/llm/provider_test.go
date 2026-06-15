@@ -14,7 +14,7 @@ import (
 
 func okResponse(content string, promptTok, completionTok int) chatResponse {
 	return chatResponse{
-		Choices: []chatChoice{{Message: chatMessage{Role: "assistant", Content: content}}},
+		Choices: []chatChoice{{Message: ChatMessage{Role: "assistant", Content: content}}},
 		Usage:   chatUsage{PromptTokens: promptTok, CompletionTokens: completionTok},
 	}
 }
@@ -30,7 +30,7 @@ func newProvider(srv *httptest.Server, key string) *openAICompatProvider {
 func minimalReq() *chatRequest {
 	return &chatRequest{
 		Model:       "gpt-4o-mini",
-		Messages:    []chatMessage{{Role: "user", Content: "hello"}},
+		Messages:    []ChatMessage{{Role: "user", Content: "hello"}},
 		MaxTokens:   100,
 		Temperature: 0.7,
 	}
@@ -100,7 +100,7 @@ func TestProvider_RequestBodyForwarded(t *testing.T) {
 
 	req := &chatRequest{
 		Model:       "llama-3.3-70b-versatile",
-		Messages:    []chatMessage{{Role: "user", Content: "test"}},
+		Messages:    []ChatMessage{{Role: "user", Content: "test"}},
 		MaxTokens:   512,
 		Temperature: 0.5,
 	}

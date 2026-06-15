@@ -7,21 +7,59 @@ import (
 	"strconv"
 	"time"
 
+	"llm_platform_go/internal/auth"
+	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
+	"llm_platform_go/internal/users"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
+// AuthConfig carries everything the auth handlers and middleware need to mint
+// and validate session tokens.
+type AuthConfig struct {
+	Secret      []byte
+	CookieName  string
+	Issuer      string
+	Domain      string
+	Secure      bool
+	TokenExpiry time.Duration
+}
+
 type Handler struct {
 	DB      *sql.DB
 	Clients *llm.Clients
+	Users   users.Store
+	Tasks   *tasks.Store
+	Runs    *db.RunWriter // async observability writer; nil → synchronous inserts
+	Cache   cache.Cache   // prediction cache; nil → caching off
+	Auth    AuthConfig
+
+	spend spendCache // budget gate's in-memory daily-spend view (no hot-path SUM)
+}
+
+// requireUser pulls the authenticated user from context. Handlers behind
+// RequireAuth can assume it's present, but we guard defensively.
+func requireUser(w http.ResponseWriter, r *http.Request) (*auth.User, bool) {
+	u, ok := auth.FromContext(r.Context())
+	if !ok || u == nil {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return nil, false
+	}
+	return u, true
 }
 
 // POST /run
 func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	var req types.RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
@@ -32,6 +70,8 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := user.Subject
+	userEmail := user.Email
 	runID := uuid.New().String()
 	wallStart := time.Now()
 
@@ -43,6 +83,7 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 	respResults := make([]types.ModelResultResponse, 0, len(runResult.Results))
 
 	now := time.Now().UTC()
+	playgroundID := tasks.PlaygroundTaskID
 
 	for _, mr := range runResult.Results {
 		var sessionID *string
@@ -53,6 +94,7 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 		if req.SystemPrompt != "" {
 			sysPrompt = &req.SystemPrompt
 		}
+		provider := mr.Provider
 
 		row := &types.RunRow{
 			RunID:        runID,
@@ -68,9 +110,13 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 			CostUSD:      mr.CostUSD,
 			Success:      mr.Success,
 			Error:        mr.Error,
+			UserID:       &userID,
+			UserEmail:    &userEmail,
+			TaskID:       &playgroundID, // Compare UI usage is cost-attributed like any task
+			Provider:     &provider,
 			CreatedAt:    now,
 		}
-		_ = db.InsertRun(h.DB, row) // log errors in production; don't fail the response
+		h.insertRun(row) // observability write — never fails the response
 
 		if mr.Success {
 			succeeded++
@@ -109,6 +155,10 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 
 // GET /sessions
 func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	page := queryIntOrDefault(r, "page", 1)
 	pageSize := queryIntOrDefault(r, "page_size", 8)
 	if pageSize > 100 {
@@ -118,7 +168,7 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 		page = 1
 	}
 
-	sessions, total, err := db.ListSessions(h.DB, page, pageSize)
+	sessions, total, err := db.ListSessions(h.DB, user.Subject, page, pageSize)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
@@ -135,9 +185,13 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 
 // GET /sessions/{session_id}
 func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	sessionID := chi.URLParam(r, "session_id")
 
-	rows, err := db.GetSession(h.DB, sessionID)
+	rows, err := db.GetSession(h.DB, user.Subject, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
@@ -189,13 +243,17 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /sessions
 func (h *Handler) DeleteSessions(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	var req types.DeleteSessionsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
 		return
 	}
 
-	deleted, err := db.DeleteSessions(h.DB, req.SessionIDs)
+	deleted, err := db.DeleteSessions(h.DB, user.Subject, req.SessionIDs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
@@ -211,8 +269,57 @@ func (h *Handler) DeleteSessions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":           "ok",
-		"models_available": llm.DefaultModels,
+		"models_available": llm.AllModels(),
 	})
+}
+
+// GET /pricing — serves the pricing table so the frontend estimates with the
+// same rates the backend uses for actual cost calculation.
+func (h *Handler) Pricing(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{"pricing": llm.PricingTable()})
+}
+
+// POST /feedback  {run_id, model, rating}
+func (h *Handler) Feedback(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	var req types.FeedbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		return
+	}
+	if req.RunID == "" || req.Model == "" {
+		writeError(w, http.StatusUnprocessableEntity, "run_id and model are required")
+		return
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		writeError(w, http.StatusUnprocessableEntity, "rating must be between 1 and 5")
+		return
+	}
+
+	if err := db.UpsertFeedback(h.DB, req.RunID, req.Model, user.Subject, req.Rating); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"run_id": req.RunID, "model": req.Model, "rating": req.Rating,
+	})
+}
+
+// GET /dashboard — per-user usage aggregates.
+func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	stats, err := db.DashboardStats(h.DB, user.Subject)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func queryIntOrDefault(r *http.Request, key string, def int) int {

@@ -33,6 +33,16 @@ func LoadPricingFromMap(m map[string]Rate) error {
 	return nil
 }
 
+// PricingTable returns a copy of the loaded pricing table. Served by GET /pricing
+// so the frontend uses the same rates as the backend (single source of truth).
+func PricingTable() map[string]Rate {
+	out := make(map[string]Rate, len(pricingTable))
+	for k, v := range pricingTable {
+		out[k] = v
+	}
+	return out
+}
+
 // CalculateCost returns the estimated USD cost for one model call.
 // Returns 0.0 for unknown models (no panic, just free).
 func CalculateCost(model string, inputTokens, outputTokens int) float64 {

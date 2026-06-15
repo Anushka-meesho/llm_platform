@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-llm_platform_go
+docs/
 
 # Database files
 *.db

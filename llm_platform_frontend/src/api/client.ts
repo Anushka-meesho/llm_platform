@@ -3,9 +3,27 @@ import type {
   TRunResponse,
   TSessionListResponse,
   TSessionDetail,
+  TUser,
+  TPricing,
+  TDashboard,
+  TTask,
+  TPromptVersion,
+  TPredictResult,
+  TTaskStatsDetail,
 } from '../types';
 
 const BASE = '';
+
+// ApiError carries the HTTP status so callers (e.g. the auth gate) can react to
+// 401s specifically.
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    this.name = 'ApiError';
+  }
+}
 
 async function fetchJSON<T>(
   url: string,
@@ -15,10 +33,18 @@ async function fetchJSON<T>(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, {
+      ...options,
+      // Send/receive the session cookie across the dev proxy.
+      credentials: 'include',
+      signal: controller.signal,
+    });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      throw new Error((data as { detail?: string }).detail ?? `HTTP ${res.status}`);
+      throw new ApiError(
+        res.status,
+        (data as { detail?: string }).detail ?? `HTTP ${res.status}`,
+      );
     }
     return res.json() as Promise<T>;
   } finally {
@@ -26,32 +52,91 @@ async function fetchJSON<T>(
   }
 }
 
+const jsonPost = (body: unknown): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+
 export const api = {
+  // ── Auth ──────────────────────────────────────────────────────────────
+  me: () => fetchJSON<{ user: TUser }>(`${BASE}/auth/me`),
+  demoUsers: () => fetchJSON<{ users: TUser[] }>(`${BASE}/auth/demo-users`),
+  login: (userId: string) =>
+    fetchJSON<{ user: TUser }>(`${BASE}/auth/login`, jsonPost({ user_id: userId })),
+  logout: () => fetchJSON<{ status: string }>(`${BASE}/auth/logout`, { method: 'POST' }),
+
+  // ── Core ──────────────────────────────────────────────────────────────
   run: (payload: TRunRequest) =>
-    fetchJSON<TRunResponse>(
-      `${BASE}/run`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      },
-      60_000,
-    ),
+    fetchJSON<TRunResponse>(`${BASE}/run`, jsonPost(payload), 60_000),
 
   listSessions: (page = 1, pageSize = 8) =>
     fetchJSON<TSessionListResponse>(
       `${BASE}/sessions?page=${page}&page_size=${pageSize}`,
     ),
 
-  getSession: (id: string) =>
-    fetchJSON<TSessionDetail>(`${BASE}/sessions/${id}`),
+  getSession: (id: string) => fetchJSON<TSessionDetail>(`${BASE}/sessions/${id}`),
 
   deleteSessions: (ids: string[]) =>
     fetchJSON<{ deleted_count: number }>(`${BASE}/sessions`, {
+      ...jsonPost({ session_ids: ids }),
       method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_ids: ids }),
     }),
+
+  // ── Estimation / feedback / dashboard ───────────────────────────────────
+  pricing: () => fetchJSON<{ pricing: TPricing }>(`${BASE}/pricing`),
+
+  feedback: (runId: string, model: string, rating: number) =>
+    fetchJSON<{ rating: number }>(
+      `${BASE}/feedback`,
+      jsonPost({ run_id: runId, model, rating }),
+    ),
+
+  dashboard: () => fetchJSON<TDashboard>(`${BASE}/dashboard`),
+
+  // ── Task registry / Studio ────────────────────────────────────────────
+  listTasks: () => fetchJSON<{ tasks: TTask[] }>(`${BASE}/v1/tasks`),
+
+  getTask: (id: string) => fetchJSON<TTask>(`${BASE}/v1/tasks/${id}`),
+
+  // PUT has merge semantics server-side: only the fields present in `patch`
+  // change; everything else keeps its current value.
+  updateTask: (id: string, patch: Partial<TTask>) =>
+    fetchJSON<TTask>(`${BASE}/v1/tasks/${id}`, {
+      ...jsonPost(patch),
+      method: 'PUT',
+    }),
+
+  listVersions: (id: string) =>
+    fetchJSON<{ task_id: string; active_version: number; versions: TPromptVersion[] }>(
+      `${BASE}/v1/tasks/${id}/versions`,
+    ),
+
+  saveDraft: (id: string, promptTemplate: string, systemPrompt: string, note: string) =>
+    fetchJSON<{ task_id: string; version: number }>(
+      `${BASE}/v1/tasks/${id}/versions`,
+      jsonPost({ prompt_template: promptTemplate, system_prompt: systemPrompt, note }),
+    ),
+
+  deployVersion: (id: string, version: number) =>
+    fetchJSON<{ task_id: string; active_version: number }>(
+      `${BASE}/v1/tasks/${id}/deploy`,
+      jsonPost({ version }),
+    ),
+
+  testTask: (
+    id: string,
+    inputs: Record<string, unknown>,
+    opts?: { version?: number; model?: string },
+  ) =>
+    fetchJSON<TPredictResult>(
+      `${BASE}/v1/tasks/${id}/test`,
+      jsonPost({ inputs, version: opts?.version, model: opts?.model }),
+      60_000,
+    ),
+
+  taskStats: (id: string, days = 30) =>
+    fetchJSON<TTaskStatsDetail>(`${BASE}/v1/tasks/${id}/stats?days=${days}`),
 
   health: () => fetchJSON<{ status: string }>(`${BASE}/health`),
 };
