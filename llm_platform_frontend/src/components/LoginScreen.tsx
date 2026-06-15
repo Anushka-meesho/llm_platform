@@ -81,7 +81,10 @@ const LoginScreen = () => {
                     <span className="text-primary-text font-medium">
                       {signingIn === u.id ? 'Signing in…' : u.name}
                     </span>
-                    <span className="text-[11px] text-tertiary-text">{u.email}</span>
+                    <span className="text-[11px] text-tertiary-text">
+                      {u.email}
+                      {u.role && <span className="ml-1 uppercase tracking-wide">· {u.role}</span>}
+                    </span>
                   </span>
                 </span>
               </Button>

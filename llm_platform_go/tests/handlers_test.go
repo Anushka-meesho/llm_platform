@@ -30,7 +30,7 @@ const (
 // authenticate requests against the protected endpoints.
 func testToken(t *testing.T) string {
 	t.Helper()
-	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin"}
+	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: auth.RoleAdmin}
 	tok, err := auth.IssueToken(u, []byte(testSecret), testIssuer, time.Hour)
 	if err != nil {
 		t.Fatalf("issue token: %v", err)

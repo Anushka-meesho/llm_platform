@@ -3,6 +3,8 @@ package users
 import (
 	"context"
 	"sort"
+
+	"llm_platform_go/internal/auth"
 )
 
 // DemoStore is an ephemeral, in-memory Store seeded with a fixed set of users.
@@ -22,9 +24,13 @@ type DemoStore struct {
 
 // NewDemoStore returns a DemoStore seeded with the default demo users.
 func NewDemoStore() *DemoStore {
+	// One user per RBAC role so the demo login screen can exercise the full
+	// authorization matrix (see internal/auth/rbac.go).
 	seed := []*User{
-		{ID: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: "admin"},
-		{ID: "u-analyst", Email: "analyst@demo.local", Name: "Analyst", Role: "analyst"},
+		{ID: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: auth.RoleAdmin},
+		{ID: "u-creator", Email: "creator@demo.local", Name: "Maya (Creator)", Role: auth.RoleCreator},
+		{ID: "u-approver", Email: "approver@demo.local", Name: "Sam (Approver)", Role: auth.RoleApprover},
+		{ID: "u-viewer", Email: "viewer@demo.local", Name: "Vee (Viewer)", Role: auth.RoleViewer},
 	}
 	s := &DemoStore{byID: make(map[string]*User, len(seed))}
 	for _, u := range seed {

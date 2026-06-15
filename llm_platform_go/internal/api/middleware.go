@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"llm_platform_go/internal/auth"
@@ -33,6 +34,27 @@ func RequireAuth(secret []byte, cookieName string) func(http.Handler) http.Handl
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+		})
+	}
+}
+
+// RequirePermission gates a route on an RBAC capability. It must be layered
+// after RequireAuth (it reads the user the latter placed on the context) and
+// returns 403 when the authenticated principal's role lacks the permission.
+func RequirePermission(perm auth.Permission) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user, ok := auth.FromContext(r.Context())
+			if !ok || user == nil {
+				writeError(w, http.StatusUnauthorized, "authentication required")
+				return
+			}
+			if !user.Can(perm) {
+				writeError(w, http.StatusForbidden,
+					fmt.Sprintf("role %q is not permitted to %s", user.Role, perm))
+				return
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }

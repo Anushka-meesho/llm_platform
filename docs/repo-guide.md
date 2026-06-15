@@ -21,7 +21,7 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 - Task registry (YAML + API), task-keyed prediction endpoint with schema enforcement
 - **Resilient routing:** fallback chains + per-provider circuit breaker, `X-Platform-Degraded` contract
 - **Budget enforcement:** per-task daily caps → 429 + `Retry-After` (0 = exempt)
-- **Service auth:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready)
+- **Service auth + RBAC:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready) with a role; role-based authorization enforced at the gateway (creator / approver / caller / viewer / admin — see §3.3)
 - **Prompt registry:** first-class versions (draft → test → deploy), auto-history, Studio UI (Tasks page)
 - **Shadow harness:** `/v1/shadow/compare` measures field-level match rate + latency p50/p95 vs labelled expectations
 - **Observability:** async buffered run writer (hot path never blocks on SQLite), per-task stats endpoint
@@ -128,6 +128,32 @@ the `Authorization: Bearer` header **or** the HttpOnly session cookie (`TokenFro
 The Bearer path means **service-to-service auth already works mechanically** — what's
 missing (Phase 1) is a way to mint long-lived service principals distinct from UI sessions.
 
+**Role-based authorization (`internal/auth/rbac.go`).** The PFS User Journey separates a
+prompt **creator** (authors/iterates), an **approver** (owns the publish gate — Gate 2),
+and a service **caller** (only invokes predict). RBAC encodes that as four capabilities —
+`task:read`, `task:predict`, `task:write` (create/update/draft/test/shadow), `task:deploy`
+(the publish gate, deliberately split from `task:write`) — mapped to five roles:
+
+| Role | read | predict | write | deploy |
+|---|---|---|---|---|
+| `admin` | ✓ | ✓ | ✓ | ✓ |
+| `creator` | ✓ | ✓ | ✓ | — |
+| `approver` | ✓ | ✓ | — | ✓ |
+| `caller` | ✓ | ✓ | — | — |
+| `viewer` | ✓ | — | — | — |
+
+The role rides **inside the signed JWT** (`Claims.Role`), so the gateway authorizes from the
+token alone — no per-request identity-store lookup (hot path stays DB-free). A token with no
+role claim resolves to `caller` (`DefaultRole`) — least privilege that can still predict +
+read, so pre-RBAC service tokens (e.g. the client portal's baked `svc:demo-client`) keep
+working. `RequirePermission(perm)` middleware (`internal/api/middleware.go`) gates each `/v1`
+route in `router.go` and returns **403** on denial; Studio playground routes (`/run`,
+`/sessions`, `/feedback`, `/dashboard`, `/pricing`, `/auth/me`) stay open to any authenticated
+user. Login stamps the role from `users.User.Role`; `cmd/issue-token -role` mints service
+tokens with a role (validated against `KnownRole`). The demo store seeds one user per role.
+Frontend mirrors the matrix in `src/auth/permissions.ts` (UI gating only — the gateway is the
+source of truth) and the Studio hides/disables edit/deploy actions per role.
+
 ### 3.4 Identity seam — `internal/users`
 
 ```go
@@ -137,10 +163,12 @@ type Store interface {
 }
 ```
 
-`DemoStore` is in-memory, seeded with `u-admin` / `u-analyst`, persists **nothing** (by
-design — there is no demo data to migrate). **Moving to real SSO = implement `Store`
-against the IdP + change one constructor line in `main.go`.** Nothing else in the
-codebase knows where users come from.
+`DemoStore` is in-memory, seeded with one user per RBAC role (`u-admin`, `u-creator`,
+`u-approver`, `u-viewer` — see §3.3), persists **nothing** (by design — there is no demo
+data to migrate). `User.Role` is the field the login handler stamps into the session token.
+**Moving to real SSO = implement `Store` against the IdP + change one constructor line in
+`main.go`** (the IdP supplies the role). Nothing else in the codebase knows where users
+come from.
 
 ### 3.5 Task registry — `internal/tasks` (the platform core)
 
@@ -320,7 +348,8 @@ falls back to synchronous inserts when nil (tests stay deterministic).
 **Public:** `GET /health` · `GET /auth/demo-users` · `POST /auth/login {user_id}` (sets
 cookie) · `POST /auth/logout`.
 
-**Behind `RequireAuth`:**
+**Behind `RequireAuth`** (and, for `/v1/tasks/*`, `RequirePermission` — see the RBAC
+matrix in §3.3; the Studio playground rows below are open to any authenticated user):
 
 | Endpoint | Purpose |
 |---|---|
@@ -424,8 +453,9 @@ cd llm_platform_frontend && npm run dev             # :5173 (proxies to :8000)
 # Client portal
 cd llm_platform_client && npm run dev               # :5174 (proxies /v1 /health /pricing to :8000)
 
-# Mint a service token (e.g. for the client portal or CIS)
-cd llm_platform_go && go run ./cmd/issue-token -sub svc:cis -email cis@svc.local -ttl 8760h
+# Mint a service token (e.g. for the client portal or CIS). -role defaults to caller
+# (read + predict); use admin|creator|approver|viewer for a different principal.
+cd llm_platform_go && go run ./cmd/issue-token -sub svc:cis -email cis@svc.local -role caller -ttl 8760h
 
 # Verify
 go build ./... && go vet ./... && go test ./...     # backend
@@ -473,7 +503,7 @@ signed with the test secret.
 ## 6. Design Decisions & Invariants (do not regress)
 
 1. **Pure Go, single binary** — no LiteLLM/Langfuse/Python. Decided 2026-06-12.
-2. **Task is the unit of everything** — cost, versioning, (future) RBAC/budgets/eval.
+2. **Task is the unit of everything** — cost, versioning, RBAC, budgets, (future) eval.
    Every run row must carry `task_id`.
 3. **The platform never owns caller business logic** — no "if confidence < X then
    route to QC" inside the platform.

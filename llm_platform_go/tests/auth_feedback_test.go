@@ -40,7 +40,7 @@ func TestDemoStore(t *testing.T) {
 }
 
 func TestTokenRoundTrip(t *testing.T) {
-	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin"}
+	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: auth.RoleAdmin}
 	tok, err := auth.IssueToken(u, []byte(testSecret), testIssuer, time.Hour)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)

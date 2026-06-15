@@ -67,7 +67,14 @@ const AppShell = () => {
                 <Typography variant="body" size="2" className="text-primary-text font-medium">
                   {user.name}
                 </Typography>
-                <span className="text-[10px] text-tertiary-text">{user.email}</span>
+                <span className="text-[10px] text-tertiary-text">
+                  {user.email}
+                  {user.role && (
+                    <span className="ml-1 rounded bg-tertiary-bg px-1 py-px uppercase tracking-wide text-primary-text">
+                      {user.role}
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
           )}

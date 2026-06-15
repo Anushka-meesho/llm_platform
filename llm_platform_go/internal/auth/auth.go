@@ -14,17 +14,19 @@ type contextKey string
 
 const userContextKey contextKey = "auth_user"
 
-// User represents an authenticated UI user.
+// User represents an authenticated principal (UI session or service token).
 type User struct {
 	Subject string `json:"sub"`
 	Email   string `json:"email"`
 	Name    string `json:"name,omitempty"`
+	Role    string `json:"role,omitempty"` // RBAC role; empty resolves to DefaultRole
 	Issuer  string `json:"iss,omitempty"`
 }
 
 type Claims struct {
 	Email string `json:"email,omitempty"`
 	Name  string `json:"name,omitempty"`
+	Role  string `json:"role,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -33,6 +35,7 @@ func NewClaims(user *User, issuer string, expiry time.Duration) *Claims {
 	return &Claims{
 		Email: user.Email,
 		Name:  user.Name,
+		Role:  user.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.Subject,
 			Issuer:    issuer,
@@ -67,10 +70,15 @@ func ParseToken(tokenString string, secret []byte) (*User, error) {
 		return nil, errors.New("missing required claims")
 	}
 
+	role := claims.Role
+	if role == "" {
+		role = DefaultRole
+	}
 	return &User{
 		Subject: claims.Subject,
 		Email:   claims.Email,
 		Name:    claims.Name,
+		Role:    role,
 		Issuer:  claims.Issuer,
 	}, nil
 }

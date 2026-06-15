@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"net/http"
 
+	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/llm"
@@ -65,6 +66,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 	r.Group(func(pr chi.Router) {
 		pr.Use(RequireAuth(deps.Auth.Secret, deps.Auth.CookieName))
 
+		// Available to any authenticated principal: auth bootstrap and the
+		// Studio playground sample tools (Compare/Estimate/Dashboard). RBAC
+		// governs the product task API below, not these UI helpers.
 		pr.Get("/auth/me", h.Me)
 		pr.Get("/pricing", h.Pricing)
 		pr.Post("/run", h.RunEndpoint)
@@ -74,26 +78,34 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.Post("/feedback", h.Feedback)
 		pr.Get("/dashboard", h.Dashboard)
 
+		// Product task API — each route gated on the RBAC capability it needs.
+		// read: anyone with task access. predict: callers + authors. write:
+		// authoring (creator/admin). deploy: the publish gate (approver/admin).
+		read := RequirePermission(auth.PermTaskRead)
+		predict := RequirePermission(auth.PermTaskPredict)
+		write := RequirePermission(auth.PermTaskWrite)
+		deploy := RequirePermission(auth.PermTaskDeploy)
+
 		// Task-keyed product API (design doc §4). Note: /v1/tasks/runs/{run_id}
 		// is registered before /v1/tasks/{task_id} routes so "runs" doesn't
 		// match as a task id.
-		pr.Get("/v1/tasks/runs/{run_id}", h.GetTaskRun)
-		pr.Post("/v1/tasks", h.CreateTask)
-		pr.Get("/v1/tasks", h.ListTasks)
-		pr.Get("/v1/tasks/{task_id}", h.GetTask)
-		pr.Put("/v1/tasks/{task_id}", h.UpdateTask)
-		pr.Post("/v1/tasks/{task_id}/predict", h.Predict)
+		pr.With(read).Get("/v1/tasks/runs/{run_id}", h.GetTaskRun)
+		pr.With(write).Post("/v1/tasks", h.CreateTask)
+		pr.With(read).Get("/v1/tasks", h.ListTasks)
+		pr.With(read).Get("/v1/tasks/{task_id}", h.GetTask)
+		pr.With(write).Put("/v1/tasks/{task_id}", h.UpdateTask)
+		pr.With(predict).Post("/v1/tasks/{task_id}/predict", h.Predict)
 
 		// Prompt registry + Studio (Phase 1).
-		pr.Get("/v1/tasks/{task_id}/versions", h.ListPromptVersions)
-		pr.Post("/v1/tasks/{task_id}/versions", h.SaveDraftVersion)
-		pr.Post("/v1/tasks/{task_id}/deploy", h.DeployVersion)
-		pr.Post("/v1/tasks/{task_id}/test", h.TestTask)
-		pr.Get("/v1/tasks/{task_id}/stats", h.TaskStats)
+		pr.With(read).Get("/v1/tasks/{task_id}/versions", h.ListPromptVersions)
+		pr.With(write).Post("/v1/tasks/{task_id}/versions", h.SaveDraftVersion)
+		pr.With(deploy).Post("/v1/tasks/{task_id}/deploy", h.DeployVersion)
+		pr.With(write).Post("/v1/tasks/{task_id}/test", h.TestTask)
+		pr.With(read).Get("/v1/tasks/{task_id}/stats", h.TaskStats)
 
 		// Shadow comparison harness (Phase 1 success metric).
-		pr.Post("/v1/shadow/compare", h.ShadowCompare)
-		pr.Get("/v1/shadow/reports", h.ListShadowReports)
+		pr.With(write).Post("/v1/shadow/compare", h.ShadowCompare)
+		pr.With(read).Get("/v1/shadow/reports", h.ListShadowReports)
 	})
 
 	return r

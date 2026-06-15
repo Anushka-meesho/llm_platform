@@ -44,7 +44,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	authUser := &auth.User{Subject: u.ID, Email: u.Email, Name: u.Name}
+	authUser := &auth.User{Subject: u.ID, Email: u.Email, Name: u.Name, Role: u.Role}
 	token, err := auth.IssueToken(authUser, h.Auth.Secret, h.Auth.Issuer, h.Auth.TokenExpiry)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to issue token: "+err.Error())
@@ -75,6 +75,7 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 			"id":    u.Subject,
 			"email": u.Email,
 			"name":  u.Name,
+			"role":  u.Role,
 		},
 	})
 }

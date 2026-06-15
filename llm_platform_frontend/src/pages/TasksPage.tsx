@@ -8,6 +8,8 @@ import type {
 } from '../types';
 import { MODELS, MODEL_GROUPS } from '../types';
 import { api } from '../api/client';
+import { useAuth } from '../auth/useAuth';
+import { can } from '../auth/permissions';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 
 // TasksPage is the Prompt Studio: browse registered tasks, edit prompts as
@@ -99,6 +101,9 @@ const TasksPage = () => {
 // ── Detail view ───────────────────────────────────────────────────────────────
 
 const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise<void> }) => {
+  const { user } = useAuth();
+  const canWrite = can(user?.role, 'task:write');
+  const canDeploy = can(user?.role, 'task:deploy');
   const [versions, setVersions] = useState<TPromptVersion[]>([]);
   const [stats, setStats] = useState<TTaskStatsDetail | null>(null);
   const [draft, setDraft] = useState(task.prompt_template);
@@ -191,8 +196,18 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
         </div>
       )}
 
+      {!canWrite && (
+        <div className="bg-secondary-bg border border-solid border-tertiary-border rounded-md px-3 py-2">
+          <Typography variant="body" size="2" className="text-tertiary-text">
+            {canDeploy
+              ? 'Approver access: you can publish versions but not edit prompts.'
+              : 'Read-only access: editing and publishing are disabled for your role.'}
+          </Typography>
+        </div>
+      )}
+
       {/* Model routing */}
-      <ModelSection task={task} onSaved={onChanged} setFlash={setFlash} />
+      <ModelSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
       {/* Prompt editor */}
       <Section title="Prompt editor">
@@ -219,8 +234,9 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
           <Button
             variant="primary"
             size="s"
-            disabled={!draftDirty || busy !== null}
+            disabled={!draftDirty || busy !== null || !canWrite}
             onClick={saveDraft}
+            title={canWrite ? undefined : 'Your role cannot edit prompts'}
           >
             {busy === 'save' ? 'Saving…' : 'Save draft'}
           </Button>
@@ -259,7 +275,7 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
               >
                 {compareVersion?.version === v.version ? 'Hide' : 'View'}
               </Button>
-              {!v.active && (
+              {!v.active && canDeploy && (
                 <Button
                   variant="outline"
                   size="s"
@@ -306,10 +322,12 @@ const ModelSection = ({
   task,
   onSaved,
   setFlash,
+  canWrite,
 }: {
   task: TTask;
   onSaved: () => Promise<void>;
   setFlash: (msg: string) => void;
+  canWrite: boolean;
 }) => {
   const savedChain = [task.model, ...(task.fallback_models ?? [])];
   const [chain, setChain] = useState<string[]>(savedChain);
@@ -420,7 +438,13 @@ const ModelSection = ({
               })}
             </select>
           )}
-          <Button variant="primary" size="s" disabled={!dirty || saving} onClick={save}>
+          <Button
+            variant="primary"
+            size="s"
+            disabled={!dirty || saving || !canWrite}
+            onClick={save}
+            title={canWrite ? undefined : 'Your role cannot edit task config'}
+          >
             {saving ? 'Saving…' : 'Save routing'}
           </Button>
           {dirty && (
