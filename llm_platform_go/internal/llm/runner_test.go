@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -45,8 +46,8 @@ func errorMock(err error) *mockProvider {
 	return &mockProvider{results: []callResult{{err: err}}}
 }
 
-func clientsWith(openai, groq, gemini Provider) *Clients {
-	return &Clients{OpenAI: openai, Groq: groq, Gemini: gemini}
+func clientsWith(gateway Provider) *Clients {
+	return &Clients{Gateway: gateway}
 }
 
 func simpleReq(prompt string) *types.RunRequest {
@@ -57,9 +58,7 @@ func simpleReq(prompt string) *types.RunRequest {
 
 func TestCallSingleModel_Success(t *testing.T) {
 	mock := successMock("hello back")
-	clients := clientsWith(mock, nil, nil)
-
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+	result := callSingleModel(context.Background(), clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
 
 	if !result.Success {
 		t.Fatalf("expected success, got error: %v", result.Error)
@@ -86,13 +85,11 @@ func TestCallSingleModel_UnknownModel(t *testing.T) {
 	}
 }
 
-func TestCallSingleModel_NilProvider(t *testing.T) {
-	// gpt-4o-mini is in registry but Clients.OpenAI is nil
-	clients := clientsWith(nil, nil, nil)
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+func TestSingleClientNilGateway(t *testing.T) {
+	result := callSingleModel(context.Background(), clientsWith(nil), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
-		t.Fatal("expected failure for nil provider")
+		t.Fatal("expected failure for nil gateway")
 	}
 	if result.Error == nil || *result.Error != "LLM client not configured" {
 		t.Errorf("error: got %v", result.Error)
@@ -103,9 +100,8 @@ func TestCallSingleModel_EmptyChoices(t *testing.T) {
 	mock := &mockProvider{results: []callResult{{
 		resp: &chatResponse{Choices: []chatChoice{}},
 	}}}
-	clients := clientsWith(mock, nil, nil)
 
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+	result := callSingleModel(context.Background(), clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
 		t.Fatal("expected failure for empty choices")
@@ -121,9 +117,8 @@ func TestCallSingleModel_EmptyContent(t *testing.T) {
 			Choices: []chatChoice{{Message: chatMessage{Content: ""}}},
 		},
 	}}}
-	clients := clientsWith(mock, nil, nil)
 
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+	result := callSingleModel(context.Background(), clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
 		t.Fatal("expected failure for empty content")
@@ -138,111 +133,103 @@ func TestCallSingleModel_ContextCancelled(t *testing.T) {
 	cancel()
 
 	mock := successMock("irrelevant")
-	result := callSingleModel(ctx, clientsWith(mock, nil, nil), "gpt-4o-mini", simpleReq("hi"))
+	result := callSingleModel(ctx, clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
 		t.Fatal("expected failure for cancelled context")
 	}
 }
 
-// ── retry logic ───────────────────────────────────────────────────────────────
-
-func TestCallSingleModel_RetriesOnTransientError(t *testing.T) {
-	// First two calls return 429, third succeeds.
-	mock := &mockProvider{results: []callResult{
-		{err: &APIError{HTTPStatusCode: 429, Message: "rate limit"}},
-		{err: &APIError{HTTPStatusCode: 429, Message: "rate limit"}},
-		{resp: &chatResponse{
-			Choices: []chatChoice{{Message: chatMessage{Content: "ok"}}},
-			Usage:   chatUsage{PromptTokens: 5, CompletionTokens: 5},
-		}},
-	}}
-	clients := clientsWith(mock, nil, nil)
-
-	// Patch sleep to avoid 6s delay in tests — we do this by using a cancelable
-	// context with a generous deadline (retries sleep but context allows them).
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
-
-	if !result.Success {
-		t.Fatalf("expected success after retries, got error: %v", result.Error)
-	}
-	if mock.calls.Load() != 3 {
-		t.Errorf("expected 3 calls (2 failures + 1 success), got %d", mock.calls.Load())
-	}
-}
-
-func TestCallSingleModel_NoRetryOnPermanentError(t *testing.T) {
-	// 401 is not retryable — should stop after first call.
-	mock := errorMock(&APIError{HTTPStatusCode: 401, Message: "bad key"})
-	clients := clientsWith(mock, nil, nil)
-
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+func TestCallSingleModel_ErrorSurfacedFromGateway(t *testing.T) {
+	mock := errorMock(&APIError{HTTPStatusCode: 429, Message: "rate limit"})
+	result := callSingleModel(context.Background(), clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
 		t.Fatal("expected failure")
 	}
 	if mock.calls.Load() != 1 {
-		t.Errorf("expected 1 call for non-retryable error, got %d", mock.calls.Load())
+		t.Errorf("expected exactly 1 call (Bifrost handles retries), got %d", mock.calls.Load())
+	}
+	if result.Error == nil || *result.Error == "" {
+		t.Error("expected non-empty error message from gateway")
 	}
 }
 
-func TestCallSingleModel_AllRetriesExhausted(t *testing.T) {
-	// All 3 attempts return 500.
-	mock := errorMock(&APIError{HTTPStatusCode: 500, Message: "server error"})
-	clients := clientsWith(mock, nil, nil)
+// ── Bifrost-specific registry tests ──────────────────────────────────────────
 
-	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
+func TestCallSingleModel_LlamaGroqRemoved(t *testing.T) {
+	result := callSingleModel(context.Background(), clientsWith(successMock("irrelevant")), "llama-groq", simpleReq("hi"))
 
 	if result.Success {
-		t.Fatal("expected failure after all retries")
+		t.Fatal("expected failure for removed model")
 	}
-	if mock.calls.Load() != 3 {
-		t.Errorf("expected 3 attempts, got %d", mock.calls.Load())
-	}
-	if result.Error == nil || *result.Error != "Provider internal error — all retries exhausted" {
-		t.Errorf("error message: got %v", result.Error)
+	if result.Error == nil || *result.Error != "unknown model: llama-groq" {
+		t.Errorf("error: got %v", result.Error)
 	}
 }
 
-func TestCallSingleModel_StopsRetryOnContextCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestCallSingleModel_ClaudeSonnetRegistered(t *testing.T) {
+	mock := successMock("I am Claude")
+	result := callSingleModel(context.Background(), clientsWith(mock), "claude-sonnet-4-6", simpleReq("hello"))
 
-	callCount := &atomic.Int32{}
-	mock := &mockProvider{results: []callResult{
-		{err: &APIError{HTTPStatusCode: 500, Message: "err"}},
-	}}
-	_ = callCount
-
-	// Cancel after first call.
-	originalMock := &cancelOnNthCall{provider: mock, cancelAfter: 1, cancel: cancel}
-	clients := clientsWith(originalMock, nil, nil)
-
-	result := callSingleModel(ctx, clients, "gpt-4o-mini", simpleReq("hi"))
-
-	if result.Success {
-		t.Fatal("expected failure after context cancel")
+	if !result.Success {
+		t.Fatalf("expected success for claude-sonnet-4-6, got: %v", result.Error)
 	}
-	// Should not have made more than 1-2 calls before stopping.
-	if originalMock.calls.Load() > 2 {
-		t.Errorf("too many calls after context cancel: %d", originalMock.calls.Load())
+	if result.Response == nil || *result.Response != "I am Claude" {
+		t.Errorf("response: got %v", result.Response)
 	}
 }
 
-// cancelOnNthCall cancels the context after the Nth call.
-type cancelOnNthCall struct {
-	provider    Provider
-	cancelAfter int32
-	cancel      context.CancelFunc
-	calls       atomic.Int32
+func TestCallSingleModel_GeminiFlashRegistered(t *testing.T) {
+	mock := successMock("I am Gemini")
+	result := callSingleModel(context.Background(), clientsWith(mock), "gemini-2.5-flash", simpleReq("hello"))
+
+	if !result.Success {
+		t.Fatalf("expected success for gemini-2.5-flash, got: %v", result.Error)
+	}
+	if result.Response == nil || *result.Response != "I am Gemini" {
+		t.Errorf("response: got %v", result.Response)
+	}
 }
 
-func (c *cancelOnNthCall) Call(ctx context.Context, req *chatRequest) (*chatResponse, error) {
-	n := c.calls.Add(1)
-	resp, err := c.provider.Call(ctx, req)
-	if n >= c.cancelAfter {
-		c.cancel()
+func TestBifrostModelID_HasProviderPrefix(t *testing.T) {
+	for friendlyName, bifrostID := range registry {
+		if !strings.Contains(bifrostID, "/") {
+			t.Errorf("model %q has Bifrost ID %q without provider prefix (expected format: provider/model-id)", friendlyName, bifrostID)
+		}
 	}
-	return resp, err
+}
+
+func TestAllModelsUseSameGateway(t *testing.T) {
+	for modelName := range registry {
+		mock := successMock("ok")
+		result := callSingleModel(context.Background(), clientsWith(mock), modelName, simpleReq("hi"))
+		if !result.Success {
+			t.Errorf("model %q failed with nil gateway error; all models should route through clients.Gateway: %v", modelName, result.Error)
+		}
+	}
+}
+
+func TestCallSingleModel_ZeroTokensFromGateway(t *testing.T) {
+	// Bifrost may return 0 token counts for some models — result should still be Success.
+	mock := &mockProvider{results: []callResult{{
+		resp: &chatResponse{
+			Choices: []chatChoice{{Message: chatMessage{Role: "assistant", Content: "hello"}}},
+			Usage:   chatUsage{PromptTokens: 0, CompletionTokens: 0},
+		},
+	}}}
+
+	result := callSingleModel(context.Background(), clientsWith(mock), "gpt-4o-mini", simpleReq("hi"))
+
+	if !result.Success {
+		t.Fatalf("expected success, got: %v", result.Error)
+	}
+	if result.TotalTokens != 0 {
+		t.Errorf("total tokens: got %d, want 0", result.TotalTokens)
+	}
+	if result.CostUSD != 0.0 {
+		t.Errorf("cost: got %f, want 0.0", result.CostUSD)
+	}
 }
 
 // ── buildMessages ─────────────────────────────────────────────────────────────
@@ -296,16 +283,14 @@ func TestBuildMessages_UsesConversationHistory(t *testing.T) {
 }
 
 func TestBuildMessages_HistoryOnlyForCorrectModel(t *testing.T) {
-	// History exists for gemini-flash but we're building for gpt-4o-mini.
 	req := &types.RunRequest{
 		Prompt: "fallback prompt",
 		ModelConversations: map[string][]types.Message{
-			"gemini-flash": {{Role: "user", Content: "gemini history"}},
+			"claude-sonnet-4-6": {{Role: "user", Content: "claude history"}},
 		},
 	}
 	msgs := buildMessages("gpt-4o-mini", req)
 
-	// Should fall back to single-turn prompt, not use gemini's history.
 	if len(msgs) != 1 || msgs[0].Content != "fallback prompt" {
 		t.Errorf("should fall back to prompt for model with no history: %+v", msgs)
 	}
@@ -346,23 +331,5 @@ func TestBuildMessages_NonStringContentStringified(t *testing.T) {
 	}
 	if msgs[0].Content == "" {
 		t.Error("non-string content should be stringified, not empty")
-	}
-}
-
-// ── isRetryable ───────────────────────────────────────────────────────────────
-
-func TestIsRetryable(t *testing.T) {
-	retryable := []int{429, 500, 503}
-	for _, code := range retryable {
-		if !isRetryable(code) {
-			t.Errorf("expected %d to be retryable", code)
-		}
-	}
-
-	notRetryable := []int{200, 400, 401, 403, 404, 422}
-	for _, code := range notRetryable {
-		if isRetryable(code) {
-			t.Errorf("expected %d to NOT be retryable", code)
-		}
 	}
 }

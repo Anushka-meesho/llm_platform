@@ -8,7 +8,8 @@ import {
   cn,
 } from '@meesho/merlin-ui-tailwind';
 import type { TSessionSummary, TSessionDetail } from '../types';
-import { MODELS } from '../types';
+import { MODELS, MODEL_LABELS } from '../types';
+import type { TModel } from '../types';
 
 type TSidebarProps = {
   selectedModels: string[];
@@ -113,7 +114,7 @@ const Sidebar = ({
               onChange={({ checked }) => handleModelChange(model, checked)}
               label={
                 <Typography variant="body" size="3" className="text-primary-text">
-                  {model}
+                  {MODEL_LABELS[model as TModel] ?? model}
                 </Typography>
               }
             />

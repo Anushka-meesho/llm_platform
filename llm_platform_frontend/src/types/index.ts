@@ -31,6 +31,8 @@ export type TModelResult = {
   cost_usd: number;
   success: boolean;
   error: string | null;
+  context_window: number;
+  max_output_tokens: number;
 };
 
 export type TRunResponse = {
@@ -66,6 +68,8 @@ export type TTurnResult = {
   cost_usd: number;
   success: boolean;
   error: string | null;
+  rating?: number | null;
+  note?: string | null;
 };
 
 export type TSessionTurn = {
@@ -97,9 +101,40 @@ export type TAssistantUIMessage = {
   total_tokens: number;
   cost_usd: number;
   success: boolean;
+  run_id: string;
+  session_id: string;
+  rating?: number | null;
+  note?: string | null;
 };
 
 export type TUIMessage = TUserUIMessage | TAssistantUIMessage;
 
-export const MODELS = ['gpt-4o-mini', 'llama-groq', 'gemini-flash'] as const;
+export const MODELS = ['gpt-4o-mini', 'gpt-4o', 'gemini-2.5-flash', 'gemini-2.5-pro', 'claude-sonnet-4-6'] as const;
 export type TModel = (typeof MODELS)[number];
+
+export const MODEL_LABELS: Record<TModel, string> = {
+  'gpt-4o-mini':       'GPT-4o Mini',
+  'gpt-4o':            'GPT-4o',
+  'gemini-2.5-flash':  'Gemini 2.5 Flash',
+  'gemini-2.5-pro':    'Gemini 2.5 Pro',
+  'claude-sonnet-4-6': 'Claude Sonnet 4.6',
+};
+
+export type TRatingRequest = {
+  run_id: string;
+  model: string;
+  session_id: string;
+  rating: number;
+  note: string;
+};
+
+export type TLeaderboardEntry = {
+  model: string;
+  avg_score: number;
+  rating_count: number;
+};
+
+export type TLeaderboardResponse = {
+  session_id: string;
+  entries: TLeaderboardEntry[];
+};

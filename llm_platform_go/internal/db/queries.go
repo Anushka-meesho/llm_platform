@@ -75,7 +75,7 @@ func GetSession(db *sql.DB, sessionID string) ([]types.RunRow, error) {
 	rows, err := db.Query(`
 		SELECT id, run_id, session_id, prompt, system_prompt, model, response,
 		       latency_ms, input_tokens, output_tokens, total_tokens,
-		       cost_usd, success, error, created_at
+		       cost_usd, success, error, created_at, rating, note
 		FROM runs
 		WHERE session_id = ?
 		ORDER BY created_at ASC`, sessionID)
@@ -94,6 +94,7 @@ func GetSession(db *sql.DB, sessionID string) ([]types.RunRow, error) {
 			&r.Model, &r.Response,
 			&r.LatencyMs, &r.InputTokens, &r.OutputTokens, &r.TotalTokens,
 			&r.CostUSD, &successInt, &r.Error, &createdAtStr,
+			&r.Rating, &r.Note,
 		)
 		if err != nil {
 			return nil, err
@@ -103,6 +104,51 @@ func GetSession(db *sql.DB, sessionID string) ([]types.RunRow, error) {
 		result = append(result, r)
 	}
 	return result, rows.Err()
+}
+
+// UpsertRating saves a 1–5 star rating and optional note for a specific (run_id, model, session_id) row.
+func UpsertRating(db *sql.DB, runID, model, sessionID string, rating int, note string) error {
+	res, err := db.Exec(
+		"UPDATE runs SET rating = ?, note = ? WHERE run_id = ? AND model = ? AND session_id = ?",
+		rating, note, runID, model, sessionID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no run found for run_id=%s model=%s session_id=%s", runID, model, sessionID)
+	}
+	return nil
+}
+
+// GetLeaderboard returns average scores per model for a session, ordered by avg score desc.
+func GetLeaderboard(db *sql.DB, sessionID string) ([]types.LeaderboardEntry, error) {
+	rows, err := db.Query(`
+		SELECT model,
+		       AVG(CAST(rating AS REAL)) AS avg_score,
+		       COUNT(rating)             AS rating_count
+		FROM runs
+		WHERE session_id = ? AND rating IS NOT NULL
+		GROUP BY model
+		ORDER BY avg_score DESC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []types.LeaderboardEntry
+	for rows.Next() {
+		var e types.LeaderboardEntry
+		if err := rows.Scan(&e.Model, &e.AvgScore, &e.RatingCount); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	if entries == nil {
+		entries = []types.LeaderboardEntry{}
+	}
+	return entries, rows.Err()
 }
 
 // DeleteSessions removes all runs belonging to the given session IDs.

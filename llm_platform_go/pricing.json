@@ -1,6 +1,7 @@
 {
-  "gpt-4o-mini":   { "input_per_1m": 0.150, "output_per_1m": 0.600 },
-  "llama-groq":    { "input_per_1m": 0.050, "output_per_1m": 0.080 },
-  "gemini-flash":  { "input_per_1m": 0.075, "output_per_1m": 0.300 },
-  "claude-sonnet": { "input_per_1m": 3.000, "output_per_1m": 15.000 }
+  "gpt-4o-mini":       { "input_per_1m": 0.150, "output_per_1m": 0.600,  "context_window": 128000,  "max_output_tokens": 16384 },
+  "gpt-4o":            { "input_per_1m": 2.500, "output_per_1m": 10.000, "context_window": 128000,  "max_output_tokens": 16384 },
+  "gemini-2.5-flash":  { "input_per_1m": 0.150, "output_per_1m": 0.600,  "context_window": 1048576, "max_output_tokens": 65536  },
+  "gemini-2.5-pro":    { "input_per_1m": 1.250, "output_per_1m": 10.000, "context_window": 1048576, "max_output_tokens": 65536  },
+  "claude-sonnet-4-6": { "input_per_1m": 3.000, "output_per_1m": 15.000, "context_window": 200000,  "max_output_tokens": 64000  }
 }

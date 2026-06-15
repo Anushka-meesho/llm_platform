@@ -20,3 +20,11 @@ type RunRequest struct {
 type DeleteSessionsRequest struct {
 	SessionIDs []string `json:"session_ids"`
 }
+
+type RatingRequest struct {
+	RunID     string `json:"run_id"`
+	Model     string `json:"model"`
+	SessionID string `json:"session_id"`
+	Rating    int    `json:"rating"` // 1–5
+	Note      string `json:"note"`
+}

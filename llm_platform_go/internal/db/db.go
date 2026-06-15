@@ -51,5 +51,12 @@ func Migrate(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+
+	// Additive migrations — SQLite has no ADD COLUMN IF NOT EXISTS, so ignore
+	// "duplicate column name" errors on repeated startups.
+	db.Exec("ALTER TABLE runs ADD COLUMN rating INTEGER")
+	db.Exec("ALTER TABLE runs ADD COLUMN note TEXT")
+	db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_run_id_model ON runs(run_id, model)")
+
 	return nil
 }

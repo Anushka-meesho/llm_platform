@@ -9,8 +9,10 @@ import (
 
 // Rate holds per-provider token pricing. Exported so tests can inject directly.
 type Rate struct {
-	InputPer1M  float64 `json:"input_per_1m"`
-	OutputPer1M float64 `json:"output_per_1m"`
+	InputPer1M      float64 `json:"input_per_1m"`
+	OutputPer1M     float64 `json:"output_per_1m"`
+	ContextWindow   int     `json:"context_window"`
+	MaxOutputTokens int     `json:"max_output_tokens"`
 }
 
 var pricingTable map[string]Rate
@@ -31,6 +33,35 @@ func LoadPricing(path string) error {
 func LoadPricingFromMap(m map[string]Rate) error {
 	pricingTable = m
 	return nil
+}
+
+// GetMaxOutputTokens returns the model's maximum allowed output tokens.
+// Returns 0 for unknown models.
+func GetMaxOutputTokens(model string) int {
+	r, ok := pricingTable[model]
+	if !ok {
+		return 0
+	}
+	return r.MaxOutputTokens
+}
+
+// GetContextWindow returns the model's maximum context window in tokens.
+// Returns 0 for unknown models.
+func GetContextWindow(model string) int {
+	r, ok := pricingTable[model]
+	if !ok {
+		return 0
+	}
+	return r.ContextWindow
+}
+
+// GetAllRates returns a copy of the full pricing table (model name → Rate).
+func GetAllRates() map[string]Rate {
+	out := make(map[string]Rate, len(pricingTable))
+	for k, v := range pricingTable {
+		out[k] = v
+	}
+	return out
 }
 
 // CalculateCost returns the estimated USD cost for one model call.

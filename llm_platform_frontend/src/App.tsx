@@ -1,7 +1,9 @@
 import { useEffect, useCallback, useState } from 'react';
-import { Typography, cn } from '@meesho/merlin-ui-tailwind';
+import { cn } from '@meesho/merlin-ui-tailwind';
 import { useChat } from './hooks/useChat';
 import { useSessions } from './hooks/useSessions';
+import { api } from './api/client';
+import { setLiveRates } from './utils/tokens';
 import Sidebar from './components/Sidebar';
 import ChatArea from './components/ChatArea';
 import SystemPromptBar from './components/SystemPromptBar';
@@ -15,6 +17,10 @@ const App = () => {
   useEffect(() => {
     sessions.fetchPage(1);
   }, [sessions.fetchPage]);
+
+  useEffect(() => {
+    api.fetchPricing().then(setLiveRates).catch(() => { /* silently use hardcoded fallbacks */ });
+  }, []);
 
   const handleSubmit = useCallback(
     async (text: string, files: File[]) => {
@@ -67,13 +73,13 @@ const App = () => {
           conversations={chat.conversations}
           selectedModels={chat.selectedModels}
           isLoading={chat.isLoading}
+          sessionId={chat.sessionId}
+          contextUsage={chat.contextUsage}
         />
 
         {chat.error && (
-          <div className="px-4 py-2 bg-error-bg border-t border-solid border-error-border">
-            <Typography variant="body" size="3" className="text-error-text">
-              {chat.error}
-            </Typography>
+          <div className="px-4 py-2 bg-red-950 border-t border-red-800 text-red-300 text-sm">
+            ⚠️ {chat.error}
           </div>
         )}
 
@@ -90,6 +96,7 @@ const App = () => {
           conversations={chat.conversations}
           maxOutputTokens={chat.maxOutputTokens}
           setMaxOutputTokens={chat.setMaxOutputTokens}
+          contextUsage={chat.contextUsage}
         />
       </div>
     </div>

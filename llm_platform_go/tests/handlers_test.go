@@ -1,11 +1,13 @@
 package tests
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,7 +86,7 @@ func TestRunEndpointInvalidJSON(t *testing.T) {
 
 func TestRunEndpointReturnsShape(t *testing.T) {
 	srv, _ := newTestServer(t)
-	// With nil clients, each model call will fail — but the response shape is still correct.
+	// With nil gateway, each model call will fail — but the SSE stream shape is still correct.
 	body := `{"prompt":"hello","models":["gpt-4o-mini"]}`
 	resp, err := http.Post(srv.URL+"/run", "application/json", bytes.NewBufferString(body))
 	if err != nil {
@@ -93,19 +95,48 @@ func TestRunEndpointReturnsShape(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type: got %q, want text/event-stream", ct)
+	}
 
-	var result types.RunResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("decode response: %v", err)
+	// Parse SSE events from the stream.
+	var runID string
+	var results []types.ModelResultResponse
+	var eventType, data string
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			eventType = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data = strings.TrimPrefix(line, "data: ")
+		case line == "" && eventType != "":
+			switch eventType {
+			case "meta":
+				var m struct {
+					RunID string `json:"run_id"`
+				}
+				json.Unmarshal([]byte(data), &m) //nolint:errcheck
+				runID = m.RunID
+			case "result":
+				var r types.ModelResultResponse
+				json.Unmarshal([]byte(data), &r) //nolint:errcheck
+				results = append(results, r)
+			}
+			eventType, data = "", ""
+		}
 	}
-	if result.RunID == "" {
-		t.Error("run_id should not be empty")
+
+	if runID == "" {
+		t.Error("meta event run_id should not be empty")
 	}
-	if result.Prompt != "hello" {
-		t.Errorf("prompt: got %q, want %q", result.Prompt, "hello")
+	if len(results) != 1 {
+		t.Errorf("result events: got %d, want 1", len(results))
 	}
-	if len(result.Results) != 1 {
-		t.Errorf("results len: got %d, want 1", len(result.Results))
+	if len(results) > 0 && results[0].Model != "gpt-4o-mini" {
+		t.Errorf("model: got %q, want gpt-4o-mini", results[0].Model)
 	}
 }
 

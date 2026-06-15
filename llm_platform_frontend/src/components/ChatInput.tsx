@@ -1,7 +1,9 @@
-import { useState, useRef, useCallback, useMemo } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { Button, TextArea, Spinner } from '@meesho/merlin-ui-tailwind';
-import type { TUIMessage } from '../types';
-import { countTokens, estimateCost, formatCost } from '../utils/tokens';
+import type { TUIMessage, TModel } from '../types';
+import { MODEL_LABELS } from '../types';
+import type { TContextUsage } from '../hooks/useChat';
+import { countTokens, estimateCost, formatCost, getContextWindow, getMaxOutputTokens, isApproximateTokenizer } from '../utils/tokens';
 
 type TChatInputProps = {
   onSubmit: (text: string, files: File[]) => Promise<void>;
@@ -11,7 +13,14 @@ type TChatInputProps = {
   conversations: Record<string, TUIMessage[]>;
   maxOutputTokens: number;
   setMaxOutputTokens: (n: number) => void;
+  contextUsage: TContextUsage;
 };
+
+function fmtCtx(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return `${n}`;
+}
 
 const ChatInput = ({
   onSubmit,
@@ -21,11 +30,13 @@ const ChatInput = ({
   conversations,
   maxOutputTokens,
   setMaxOutputTokens,
+  contextUsage,
 }: TChatInputProps) => {
   const [text, setText] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [showBudget, setShowBudget] = useState(false);
+  const [showContext, setShowContext] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = useCallback((selected: FileList | null) => {
@@ -65,20 +76,25 @@ const ChatInput = ({
     [handleSubmit],
   );
 
+  const effectiveMax = useMemo(() => {
+    const limits = selectedModels.map((m) => getMaxOutputTokens(m)).filter((n) => n > 0);
+    return limits.length > 0 ? Math.min(...limits) : 32000;
+  }, [selectedModels]);
+
   const handleMaxTokensChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const val = parseInt(e.target.value);
-      if (!isNaN(val) && val > 0) setMaxOutputTokens(val);
+      if (!isNaN(val) && val > 0) setMaxOutputTokens(Math.min(val, effectiveMax));
     },
-    [setMaxOutputTokens],
+    [setMaxOutputTokens, effectiveMax],
   );
 
   const estimates = useMemo(() => {
-    const systemTok = countTokens(systemPrompt);
-    const msgTok = countTokens(text);
     return selectedModels.map((model) => {
+      const systemTok = countTokens(systemPrompt, model);
+      const msgTok = countTokens(text, model);
       const historyTok = (conversations[model] ?? []).reduce(
-        (acc, msg) => acc + countTokens(msg.content),
+        (acc, msg) => acc + countTokens(msg.content, model),
         0,
       );
       const inputTokens = systemTok + historyTok + msgTok;
@@ -93,6 +109,38 @@ const ChatInput = ({
   );
 
   const repInputTokens = estimates[0]?.inputTokens ?? 0;
+
+  useEffect(() => {
+    if (maxOutputTokens > effectiveMax) setMaxOutputTokens(effectiveMax);
+  }, [effectiveMax, maxOutputTokens, setMaxOutputTokens]);
+
+  const contextRows = useMemo(
+    () =>
+      selectedModels
+        .map((m) => {
+          const used = contextUsage[m]?.used ?? 0;
+          const win =
+            (contextUsage[m]?.window ?? 0) > 0
+              ? contextUsage[m]!.window
+              : getContextWindow(m);
+          const remaining = win > 0 ? Math.max(0, win - used) : 0;
+          const pct = win > 0 ? Math.min(100, Math.round((used / win) * 100)) : 0;
+          const safeMax = Math.max(1, remaining - 500);
+          return { model: m, used, win, remaining, pct, safeMax };
+        })
+        .filter((r) => r.win > 0),
+    [selectedModels, contextUsage],
+  );
+
+  const leastRemaining = useMemo(
+    () =>
+      contextRows.length > 0
+        ? contextRows.reduce((a, b) => (a.remaining < b.remaining ? a : b))
+        : null,
+    [contextRows],
+  );
+
+  const overLimit = leastRemaining ? maxOutputTokens > leastRemaining.safeMax : false;
 
   return (
     <div className="border-t border-solid border-primary-border bg-primary-bg px-4 py-3">
@@ -160,19 +208,108 @@ const ChatInput = ({
       </div>
 
       <div className="flex items-center gap-3">
+        {/* Max tokens + context window hover */}
         <div className="flex items-center gap-1.5 flex-shrink-0">
           <span className="text-xs text-secondary-text whitespace-nowrap">Max output tokens:</span>
           <input
             type="number"
             min={1}
-            max={32000}
+            max={effectiveMax}
             value={maxOutputTokens}
             onChange={handleMaxTokensChange}
             disabled={isLoading}
             className="w-20 px-1.5 py-0.5 text-xs rounded border border-solid border-primary-border bg-secondary-bg text-primary-text focus:outline-none focus:border-interactive-border disabled:opacity-50"
           />
+
+          {leastRemaining && (
+            <div
+              className="relative"
+              onMouseEnter={() => setShowContext(true)}
+              onMouseLeave={() => setShowContext(false)}
+            >
+              <span
+                className={`text-xs cursor-default select-none whitespace-nowrap ${
+                  overLimit ? 'text-amber-400' : 'text-tertiary-text'
+                }`}
+              >
+                {fmtCtx(leastRemaining.remaining)} ctx left
+                {overLimit && (
+                  <button
+                    type="button"
+                    onClick={() => setMaxOutputTokens(leastRemaining.safeMax)}
+                    className="ml-1.5 underline cursor-pointer bg-transparent border-0 text-amber-400 text-xs p-0"
+                  >
+                    use {leastRemaining.safeMax}
+                  </button>
+                )}
+              </span>
+
+              {showContext && contextRows.length > 0 && (
+                <div className="absolute bottom-full mb-2 left-0 bg-primary-bg border border-solid border-primary-border rounded-lg shadow-lg p-3 z-50 min-w-[320px]">
+                  <div className="text-xs font-semibold text-secondary-text tracking-widest mb-2 uppercase">
+                    Context Window
+                  </div>
+                  <div className="space-y-2.5">
+                    {contextRows.map(({ model, used, win, remaining, pct }) => (
+                      <div key={model}>
+                        <div className="flex items-center justify-between gap-2 text-xs mb-1">
+                          <span className="text-primary-text font-medium">{MODEL_LABELS[model as TModel] ?? model}</span>
+                          <span
+                            className={`tabular-nums ${
+                              pct >= 90
+                                ? 'text-red-400'
+                                : pct >= 75
+                                  ? 'text-amber-400'
+                                  : 'text-secondary-text'
+                            }`}
+                          >
+                            {pct}%
+                          </span>
+                        </div>
+                        <div className="w-full h-1.5 bg-secondary-bg rounded-full overflow-hidden mb-1">
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${
+                              pct >= 90
+                                ? 'bg-red-500'
+                                : pct >= 75
+                                  ? 'bg-amber-400'
+                                  : 'bg-interactive-border'
+                            }`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-tertiary-text tabular-nums">
+                          <span>{fmtCtx(used)} used</span>
+                          <span>{fmtCtx(remaining)} remaining</span>
+                          <span className="text-secondary-text">{fmtCtx(win)} total</span>
+                        </div>
+                        {getMaxOutputTokens(model) > 0 && (
+                          <div className="text-[10px] text-tertiary-text mt-0.5">
+                            Max output:{' '}
+                            <span
+                              className={
+                                maxOutputTokens > getMaxOutputTokens(model)
+                                  ? 'text-amber-400'
+                                  : 'text-secondary-text'
+                              }
+                            >
+                              {fmtCtx(getMaxOutputTokens(model))} tokens
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-tertiary-text mt-2.5 leading-relaxed border-t border-solid border-primary-border pt-2">
+                    Usage reflects last response's full context fill (history + output).
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
+        {/* Token budget estimate */}
         <div
           className="flex-1 relative flex justify-center"
           onMouseEnter={() => setShowBudget(true)}
@@ -190,8 +327,8 @@ const ChatInput = ({
               <div className="space-y-1.5">
                 {estimates.map(({ model, inputTokens, cost }) => (
                   <div key={model} className="flex items-center justify-between gap-3 text-xs">
-                    <span className="text-primary-text">{model}</span>
-                    <span className="text-secondary-text tabular-nums">{inputTokens} tok</span>
+                    <span className="text-primary-text">{MODEL_LABELS[model as TModel] ?? model}</span>
+                    <span className="text-secondary-text tabular-nums">{isApproximateTokenizer(model) ? '~' : ''}{inputTokens} tok</span>
                     <span className="text-secondary-text tabular-nums font-medium">{formatCost(cost)}</span>
                   </div>
                 ))}
@@ -201,7 +338,7 @@ const ChatInput = ({
                 </div>
               </div>
               <p className="text-xs text-tertiary-text mt-2 leading-relaxed">
-                Approximate — input tokens via cl100k_base · output cost estimated from max tokens setting.
+                GPT: exact (cl100k_base) · Claude &amp; Gemini (~): approximate · output cost from max tokens setting.
               </p>
             </div>
           )}

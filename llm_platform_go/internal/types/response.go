@@ -3,15 +3,17 @@ package types
 import "time"
 
 type ModelResultResponse struct {
-	Model        string  `json:"model"`
-	Response     *string `json:"response"`      // null on failure
-	LatencyMs    int     `json:"latency_ms"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	TotalTokens  int     `json:"total_tokens"`
-	CostUSD      float64 `json:"cost_usd"`
-	Success      bool    `json:"success"`
-	Error        *string `json:"error"` // null on success
+	Model           string  `json:"model"`
+	Response        *string `json:"response"`          // null on failure
+	LatencyMs       int     `json:"latency_ms"`
+	InputTokens     int     `json:"input_tokens"`
+	OutputTokens    int     `json:"output_tokens"`
+	TotalTokens     int     `json:"total_tokens"`
+	CostUSD         float64 `json:"cost_usd"`
+	Success         bool    `json:"success"`
+	Error           *string `json:"error"`             // null on success
+	ContextWindow   int     `json:"context_window"`
+	MaxOutputTokens int     `json:"max_output_tokens"`
 }
 
 type RunResponse struct {
@@ -49,6 +51,8 @@ type TurnResult struct {
 	CostUSD      float64 `json:"cost_usd"`
 	Success      bool    `json:"success"`
 	Error        *string `json:"error"`
+	Rating       *int    `json:"rating"`
+	Note         *string `json:"note"`
 }
 
 type SessionTurn struct {
@@ -69,6 +73,17 @@ type DeleteSessionsResponse struct {
 	SessionIDs   []string `json:"session_ids"`
 }
 
+type LeaderboardEntry struct {
+	Model       string  `json:"model"`
+	AvgScore    float64 `json:"avg_score"`
+	RatingCount int     `json:"rating_count"`
+}
+
+type LeaderboardResponse struct {
+	SessionID string             `json:"session_id"`
+	Entries   []LeaderboardEntry `json:"entries"`
+}
+
 // RunRow is the internal DB representation — one row in the runs table.
 type RunRow struct {
 	ID           int
@@ -86,4 +101,6 @@ type RunRow struct {
 	Success      bool
 	Error        *string
 	CreatedAt    time.Time
+	Rating       *int
+	Note         *string
 }

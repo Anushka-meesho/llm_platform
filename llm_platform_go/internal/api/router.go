@@ -25,9 +25,13 @@ func NewRouter(db *sql.DB, clients *llm.Clients) http.Handler {
 	}))
 
 	r.Get("/health", h.HealthCheck)
+	r.Get("/models", h.ModelsCheck)
+	r.Get("/pricing", h.GetPricing)
 	r.Post("/run", h.RunEndpoint)
+	r.Post("/ratings", h.SaveRating)
 	r.Get("/sessions", h.ListSessions)
 	r.Get("/sessions/{session_id}", h.GetSession)
+	r.Get("/sessions/{session_id}/leaderboard", h.GetLeaderboard)
 	r.Delete("/sessions", h.DeleteSessions)
 
 	return r

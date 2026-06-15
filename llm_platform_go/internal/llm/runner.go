@@ -2,61 +2,58 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"llm_platform_go/internal/types"
 )
 
-// providerConfig maps a friendly model name to its actual model ID and which provider to use.
-type providerConfig struct {
-	modelID  string
-	clientFn func(*Clients) Provider
+// registry maps friendly model names to their Bifrost model IDs (provider/model-id format).
+var registry = map[string]string{
+	"gpt-4o-mini":       "openai/gpt-4o-mini",
+	"gpt-4o":            "openai/gpt-4o",
+	"gemini-2.5-flash":  "vertex/gemini-2.5-flash",
+	"gemini-2.5-pro":    "vertex/gemini-2.5-pro-preview-06-05",
+	"claude-sonnet-4-6": "anthropic/claude-sonnet-4-6",
 }
 
-// registry is the single source of truth for provider routing.
-// To swap Groq for Claude: replace the "llama-groq" entry with a claude providerConfig
-// and add an anthropicProvider implementation in client.go.
-var registry = map[string]providerConfig{
-	"gpt-4o-mini":  {"gpt-4o-mini", func(c *Clients) Provider { return c.OpenAI }},
-	"llama-groq":   {"llama-3.3-70b-versatile", func(c *Clients) Provider { return c.Groq }},
-	"gemini-flash": {"gemini-2.0-flash", func(c *Clients) Provider { return c.Gemini }},
+// RegisteredModels returns a copy of the model registry for logging/inspection.
+func RegisteredModels() map[string]string {
+	out := make(map[string]string, len(registry))
+	for k, v := range registry {
+		out[k] = v
+	}
+	return out
 }
 
-// RunAll fans out to all requested models concurrently and returns results in
-// first-come-first-served order (fastest model appears first).
-func RunAll(ctx context.Context, clients *Clients, req *types.RunRequest) *RunResult {
+// StreamAll fans out to all requested models concurrently. The caller must
+// read exactly count results from the returned channel (arrival order = fastest first).
+func StreamAll(ctx context.Context, clients *Clients, req *types.RunRequest) (<-chan ModelResult, int) {
 	models := req.Models
 	if len(models) == 0 {
 		models = DefaultModels
 	}
 
-	// Buffered channel — goroutines never block on send.
 	ch := make(chan ModelResult, len(models))
-
 	for _, name := range models {
 		go func(modelName string) {
 			ch <- callSingleModel(ctx, clients, modelName, req)
 		}(name)
 	}
-
-	results := make([]ModelResult, 0, len(models))
-	for range models {
-		results = append(results, <-ch) // arrival order = fastest first
-	}
-
-	return &RunResult{Prompt: req.Prompt, Results: results}
+	return ch, len(models)
 }
 
-// callSingleModel calls one provider and always returns a ModelResult — never panics.
+// callSingleModel calls the Bifrost gateway for one model and always returns a ModelResult.
 func callSingleModel(ctx context.Context, clients *Clients, modelName string, req *types.RunRequest) ModelResult {
 	start := time.Now()
 
-	cfg, ok := registry[modelName]
+	bifrostModelID, ok := registry[modelName]
 	if !ok {
 		return errResult(modelName, start, fmt.Sprintf("unknown model: %s", modelName))
+	}
+
+	if clients.Gateway == nil {
+		return errResult(modelName, start, "LLM client not configured")
 	}
 
 	temp := float32(0.7)
@@ -64,53 +61,37 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 		temp = float32(*req.Temperature)
 	}
 
-	messages := buildMessages(modelName, req)
-	provider := cfg.clientFn(clients)
-	if provider == nil {
-		return errResult(modelName, start, "LLM client not configured")
-	}
-
 	maxTok := 1000
 	if req.MaxTokens != nil {
 		maxTok = *req.MaxTokens
 	}
+	if modelMax := GetMaxOutputTokens(modelName); modelMax > 0 && maxTok > modelMax {
+		maxTok = modelMax
+	}
 
 	apiReq := chatRequest{
-		Model:       cfg.modelID,
-		Messages:    messages,
+		Model:       bifrostModelID,
+		Messages:    buildMessages(modelName, req),
 		MaxTokens:   maxTok,
 		Temperature: temp,
 	}
 
-	var resp *chatResponse
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = provider.Call(ctx, &apiReq)
-		if err == nil {
-			break
-		}
-		if ctx.Err() != nil {
-			break // context cancelled or timed out — do not retry
-		}
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && isRetryable(apiErr.HTTPStatusCode) {
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
-			continue
-		}
-		break // non-retryable error
-	}
+	const attemptTimeout = 10 * time.Second
+	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+	resp, err := clients.Gateway.Call(attemptCtx, &apiReq)
+	cancel()
 
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	if err != nil {
-		return errResult(modelName, start, classifyError(err))
+		return errResult(modelName, start, err.Error())
 	}
 	if len(resp.Choices) == 0 {
 		return errResult(modelName, start, "empty response from model")
 	}
 
-	text := resp.Choices[0].Message.Content
-	if text == "" {
+	text, ok := resp.Choices[0].Message.Content.(string)
+	if !ok || text == "" {
 		return errResult(modelName, start, "model returned empty content")
 	}
 	inTok := resp.Usage.PromptTokens
@@ -118,14 +99,16 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 	cost := CalculateCost(modelName, inTok, outTok)
 
 	return ModelResult{
-		Model:        modelName,
-		Response:     &text,
-		LatencyMs:    latencyMs,
-		InputTokens:  inTok,
-		OutputTokens: outTok,
-		TotalTokens:  inTok + outTok,
-		CostUSD:      cost,
-		Success:      true,
+		Model:           modelName,
+		Response:        &text,
+		LatencyMs:       latencyMs,
+		InputTokens:     inTok,
+		OutputTokens:    outTok,
+		TotalTokens:     inTok + outTok,
+		CostUSD:         cost,
+		Success:         true,
+		ContextWindow:   GetContextWindow(modelName),
+		MaxOutputTokens: GetMaxOutputTokens(modelName),
 	}
 }
 
@@ -140,14 +123,7 @@ func buildMessages(modelName string, req *types.RunRequest) []chatMessage {
 
 	if hist, ok := req.ModelConversations[modelName]; ok && len(hist) > 0 {
 		for _, m := range hist {
-			content := ""
-			switch v := m.Content.(type) {
-			case string:
-				content = v
-			default:
-				content = fmt.Sprintf("%v", v)
-			}
-			msgs = append(msgs, chatMessage{Role: m.Role, Content: content})
+			msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
 		}
 	} else {
 		msgs = append(msgs, chatMessage{Role: "user", Content: req.Prompt})
@@ -156,51 +132,38 @@ func buildMessages(modelName string, req *types.RunRequest) []chatMessage {
 	return msgs
 }
 
-// classifyError maps API and network errors to human-readable messages.
-func classifyError(err error) string {
-	// Context errors — check before API errors
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "Request timed out"
-	}
-	if errors.Is(err, context.Canceled) {
-		return "Request cancelled"
-	}
-
-	// Network errors
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		if netErr.Timeout() {
-			return "Request timed out"
-		}
-		return "Network error — check connectivity"
-	}
-
-	// API errors
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.HTTPStatusCode {
-		case 400:
-			return fmt.Sprintf("Bad request: %s", apiErr.Message)
-		case 401:
-			return "Auth failed — check API key"
-		case 404:
-			return fmt.Sprintf("Model or endpoint not found: %s", apiErr.Message)
-		case 429:
-			return "Rate limit hit — all retries exhausted"
-		case 500:
-			return "Provider internal error — all retries exhausted"
-		case 503:
-			return "Service unavailable — all retries exhausted"
-		}
-		return fmt.Sprintf("API error %d: %s", apiErr.HTTPStatusCode, apiErr.Message)
-	}
-
-	return fmt.Sprintf("Unexpected error: %v", err)
+// ModelCheckResult is the per-model result returned by CheckModels.
+type ModelCheckResult struct {
+	Name    string `json:"name"`
+	ModelID string `json:"model_id"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
 }
 
-// isRetryable returns true for transient HTTP status codes worth retrying.
-func isRetryable(status int) bool {
-	return status == 429 || status == 500 || status == 503
+// CheckModels probes every registered model with a minimal 1-token request
+// and returns which ones the gateway accepts.
+func CheckModels(ctx context.Context, clients *Clients) []ModelCheckResult {
+	ch := make(chan ModelCheckResult, len(registry))
+	for name := range registry {
+		go func(name string) {
+			maxTok := 1
+			res := callSingleModel(ctx, clients, name, &types.RunRequest{
+				Prompt:    "hi",
+				MaxTokens: &maxTok,
+			})
+			mcr := ModelCheckResult{Name: name, ModelID: registry[name], OK: res.Success}
+			if !res.Success && res.Error != nil {
+				mcr.Error = *res.Error
+			}
+			ch <- mcr
+		}(name)
+	}
+
+	results := make([]ModelCheckResult, 0, len(registry))
+	for range registry {
+		results = append(results, <-ch)
+	}
+	return results
 }
 
 func errResult(model string, start time.Time, msg string) ModelResult {

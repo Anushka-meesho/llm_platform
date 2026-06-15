@@ -36,6 +36,11 @@ func main() {
 	}
 
 	clients := llm.BuildClients(cfg)
+
+	for name, id := range llm.RegisteredModels() {
+		log.Printf("registered model: %s → %s", name, id)
+	}
+
 	router := api.NewRouter(database, clients)
 
 	addr := ":" + cfg.Port

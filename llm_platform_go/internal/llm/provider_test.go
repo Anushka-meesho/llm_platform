@@ -7,10 +7,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 func okResponse(content string, promptTok, completionTok int) chatResponse {
 	return chatResponse{
@@ -19,24 +20,24 @@ func okResponse(content string, promptTok, completionTok int) chatResponse {
 	}
 }
 
-func newProvider(srv *httptest.Server, key string) *openAICompatProvider {
-	return &openAICompatProvider{
-		baseURL: srv.URL,
-		apiKey:  key,
-		client:  srv.Client(),
+func newProvider(srv *httptest.Server, vk string) *bifrostProvider {
+	return &bifrostProvider{
+		baseURL:    srv.URL,
+		virtualKey: vk,
+		client:     srv.Client(),
 	}
 }
 
 func minimalReq() *chatRequest {
 	return &chatRequest{
-		Model:       "gpt-4o-mini",
+		Model:       "openai/gpt-4o-mini",
 		Messages:    []chatMessage{{Role: "user", Content: "hello"}},
 		MaxTokens:   100,
 		Temperature: 0.7,
 	}
 }
 
-// ── openAICompatProvider.Call ─────────────────────────────────────────────────
+// ── basic success and request forwarding ──────────────────────────────────────
 
 func TestProvider_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +45,7 @@ func TestProvider_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := newProvider(srv, "test-key").Call(context.Background(), minimalReq())
+	resp, err := newProvider(srv, "test-vk").Call(context.Background(), minimalReq())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -56,25 +57,6 @@ func TestProvider_Success(t *testing.T) {
 	}
 }
 
-func TestProvider_CorrectHeaders(t *testing.T) {
-	var gotAuth, gotContentType string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		gotContentType = r.Header.Get("Content-Type")
-		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
-	}))
-	defer srv.Close()
-
-	newProvider(srv, "sk-secret").Call(context.Background(), minimalReq()) //nolint:errcheck
-
-	if gotAuth != "Bearer sk-secret" {
-		t.Errorf("Authorization: got %q, want %q", gotAuth, "Bearer sk-secret")
-	}
-	if gotContentType != "application/json" {
-		t.Errorf("Content-Type: got %q, want %q", gotContentType, "application/json")
-	}
-}
-
 func TestProvider_CorrectEndpointPath(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,10 +65,81 @@ func TestProvider_CorrectEndpointPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	newProvider(srv, "key").Call(context.Background(), minimalReq()) //nolint:errcheck
+	newProvider(srv, "vk").Call(context.Background(), minimalReq()) //nolint:errcheck
 
-	if gotPath != "/chat/completions" {
-		t.Errorf("path: got %q, want /chat/completions", gotPath)
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path: got %q, want /v1/chat/completions", gotPath)
+	}
+}
+
+func TestBifrost_TrailingSlashURL(t *testing.T) {
+	// Verify that a baseURL without trailing slash never produces double-slash paths.
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	// baseURL has no trailing slash (as trimmed by config.Load).
+	p := &bifrostProvider{baseURL: srv.URL, virtualKey: "vk", client: srv.Client()}
+	p.Call(context.Background(), minimalReq()) //nolint:errcheck
+
+	if strings.Contains(gotPath, "//") {
+		t.Errorf("path contains double slash: %q", gotPath)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path: got %q, want /v1/chat/completions", gotPath)
+	}
+}
+
+func TestBifrost_EmptyVirtualKey(t *testing.T) {
+	// An empty virtual key should still send the header (as empty string), not panic.
+	var gotVK string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotVK = r.Header.Get("x-bf-vk")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+	}))
+	defer srv.Close()
+
+	p := &bifrostProvider{baseURL: srv.URL, virtualKey: "", client: srv.Client()}
+	_, err := p.Call(context.Background(), minimalReq())
+	// Should return an APIError (401), not a panic.
+	if err == nil {
+		t.Fatal("expected error for empty virtual key")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T", err)
+	}
+	if apiErr.HTTPStatusCode != 401 {
+		t.Errorf("status: got %d, want 401", apiErr.HTTPStatusCode)
+	}
+	if gotVK != "" {
+		t.Errorf("x-bf-vk should be empty string, got %q", gotVK)
+	}
+}
+
+func TestBifrost_ZeroTokenUsage(t *testing.T) {
+	// Some gateway responses omit usage or return 0 tokens — should succeed, cost=0.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(chatResponse{
+			Choices: []chatChoice{{Message: chatMessage{Role: "assistant", Content: "hi"}}},
+			Usage:   chatUsage{PromptTokens: 0, CompletionTokens: 0},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := newProvider(srv, "vk").Call(context.Background(), minimalReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 {
+		t.Errorf("expected zero usage, got %+v", resp.Usage)
+	}
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content != "hi" {
+		t.Errorf("expected content 'hi', got %v", resp.Choices)
 	}
 }
 
@@ -99,12 +152,12 @@ func TestProvider_RequestBodyForwarded(t *testing.T) {
 	defer srv.Close()
 
 	req := &chatRequest{
-		Model:       "llama-3.3-70b-versatile",
+		Model:       "groq/llama-3.3-70b-versatile",
 		Messages:    []chatMessage{{Role: "user", Content: "test"}},
 		MaxTokens:   512,
 		Temperature: 0.5,
 	}
-	newProvider(srv, "key").Call(context.Background(), req) //nolint:errcheck
+	newProvider(srv, "vk").Call(context.Background(), req) //nolint:errcheck
 
 	if decoded.Model != req.Model {
 		t.Errorf("model: got %q, want %q", decoded.Model, req.Model)
@@ -117,6 +170,101 @@ func TestProvider_RequestBodyForwarded(t *testing.T) {
 	}
 }
 
+// ── Bifrost-specific header contract ──────────────────────────────────────────
+
+func TestBifrost_VirtualKeyHeaderSent(t *testing.T) {
+	var gotVK string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotVK = r.Header.Get("x-bf-vk")
+		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	newProvider(srv, "my-virtual-key").Call(context.Background(), minimalReq()) //nolint:errcheck
+
+	if gotVK != "my-virtual-key" {
+		t.Errorf("x-bf-vk: got %q, want %q", gotVK, "my-virtual-key")
+	}
+}
+
+func TestBifrost_NoAuthorizationHeader(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	newProvider(srv, "vk").Call(context.Background(), minimalReq()) //nolint:errcheck
+
+	if gotAuth != "" {
+		t.Errorf("Authorization header should be absent, got %q", gotAuth)
+	}
+}
+
+func TestBifrost_ModelIDForwardedWithPrefix(t *testing.T) {
+	var decoded chatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&decoded) //nolint:errcheck
+		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	req := &chatRequest{
+		Model:    "openai/gpt-4o-mini",
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+	}
+	newProvider(srv, "vk").Call(context.Background(), req) //nolint:errcheck
+
+	if !strings.Contains(decoded.Model, "/") {
+		t.Errorf("model ID should contain provider prefix, got %q", decoded.Model)
+	}
+	if decoded.Model != "openai/gpt-4o-mini" {
+		t.Errorf("model: got %q, want openai/gpt-4o-mini", decoded.Model)
+	}
+}
+
+func TestBifrost_ContentTypeHeader(t *testing.T) {
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		json.NewEncoder(w).Encode(okResponse("ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	newProvider(srv, "vk").Call(context.Background(), minimalReq()) //nolint:errcheck
+
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", gotContentType)
+	}
+}
+
+// ── error handling ────────────────────────────────────────────────────────────
+
+func TestBifrost_GatewayErrorPropagated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":{"message":"upstream down"}}`))
+	}))
+	defer srv.Close()
+
+	_, err := newProvider(srv, "vk").Call(context.Background(), minimalReq())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.HTTPStatusCode != 500 {
+		t.Errorf("status: got %d, want 500", apiErr.HTTPStatusCode)
+	}
+	if apiErr.Message != "upstream down" {
+		t.Errorf("message: got %q, want %q", apiErr.Message, "upstream down")
+	}
+}
+
 func TestProvider_APIErrorWithJSONBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -124,7 +272,7 @@ func TestProvider_APIErrorWithJSONBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newProvider(srv, "key").Call(context.Background(), minimalReq())
+	_, err := newProvider(srv, "vk").Call(context.Background(), minimalReq())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -144,11 +292,10 @@ func TestProvider_APIErrorWithJSONBody(t *testing.T) {
 func TestProvider_APIErrorEmptyBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		// no body
 	}))
 	defer srv.Close()
 
-	_, err := newProvider(srv, "key").Call(context.Background(), minimalReq())
+	_, err := newProvider(srv, "vk").Call(context.Background(), minimalReq())
 
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
@@ -157,27 +304,8 @@ func TestProvider_APIErrorEmptyBody(t *testing.T) {
 	if apiErr.HTTPStatusCode != 500 {
 		t.Errorf("status: got %d, want 500", apiErr.HTTPStatusCode)
 	}
-	// falls back to http.StatusText
 	if apiErr.Message == "" {
 		t.Error("expected non-empty fallback message")
-	}
-}
-
-func TestProvider_APIError401(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
-	}))
-	defer srv.Close()
-
-	_, err := newProvider(srv, "bad-key").Call(context.Background(), minimalReq())
-
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("expected *APIError, got %T", err)
-	}
-	if apiErr.HTTPStatusCode != 401 {
-		t.Errorf("status: got %d, want 401", apiErr.HTTPStatusCode)
 	}
 }
 
@@ -188,7 +316,7 @@ func TestProvider_MalformedResponseBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newProvider(srv, "key").Call(context.Background(), minimalReq())
+	_, err := newProvider(srv, "vk").Call(context.Background(), minimalReq())
 	if err == nil {
 		t.Fatal("expected error for malformed JSON response, got nil")
 	}
@@ -196,15 +324,14 @@ func TestProvider_MalformedResponseBody(t *testing.T) {
 
 func TestProvider_ContextCancelled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// block until client disconnects
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()
 
-	_, err := newProvider(srv, "key").Call(ctx, minimalReq())
+	_, err := newProvider(srv, "vk").Call(ctx, minimalReq())
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
 	}
@@ -219,95 +346,9 @@ func TestProvider_ContextTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10)
 	defer cancel()
 
-	_, err := newProvider(srv, "key").Call(ctx, minimalReq())
+	_, err := newProvider(srv, "vk").Call(ctx, minimalReq())
 	if err == nil {
 		t.Fatal("expected error for timed-out context, got nil")
-	}
-}
-
-// ── classifyError ─────────────────────────────────────────────────────────────
-
-func TestClassifyError_DeadlineExceeded(t *testing.T) {
-	got := classifyError(context.DeadlineExceeded)
-	if got != "Request timed out" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_Canceled(t *testing.T) {
-	got := classifyError(context.Canceled)
-	if got != "Request cancelled" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_NetworkTimeout(t *testing.T) {
-	got := classifyError(&net.OpError{Op: "dial", Err: &timeoutError{}})
-	if got != "Request timed out" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_NetworkNonTimeout(t *testing.T) {
-	got := classifyError(&net.OpError{Op: "dial", Err: errors.New("connection refused")})
-	if got != "Network error — check connectivity" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError400(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 400, Message: "bad input"})
-	if got != "Bad request: bad input" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError401(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 401, Message: "unauthorized"})
-	if got != "Auth failed — check API key" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError404(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 404, Message: "no such model"})
-	if got != "Model or endpoint not found: no such model" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError429(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 429, Message: "rate limit"})
-	if got != "Rate limit hit — all retries exhausted" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError500(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 500, Message: "internal"})
-	if got != "Provider internal error — all retries exhausted" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIError503(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 503, Message: "down"})
-	if got != "Service unavailable — all retries exhausted" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_APIErrorOther(t *testing.T) {
-	got := classifyError(&APIError{HTTPStatusCode: 422, Message: "unprocessable"})
-	if got != "API error 422: unprocessable" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestClassifyError_Unexpected(t *testing.T) {
-	got := classifyError(errors.New("something weird"))
-	if got != "Unexpected error: something weird" {
-		t.Errorf("got %q", got)
 	}
 }
 
@@ -317,3 +358,6 @@ type timeoutError struct{}
 func (e *timeoutError) Error() string   { return "timeout" }
 func (e *timeoutError) Timeout() bool   { return true }
 func (e *timeoutError) Temporary() bool { return true }
+
+// Ensure timeoutError satisfies net.Error (compile-time check).
+var _ net.Error = (*timeoutError)(nil)
