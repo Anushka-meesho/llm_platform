@@ -4,14 +4,17 @@
 
 The platform is a **task-keyed LLM prediction service** plus a **Studio** for authoring/versioning prompts and a **playground** for comparing models. A "task" bundles a prompt template, input/output JSON Schemas, a model routing chain (primary + fallbacks), sampling params, a daily budget, and cache settings. Callers invoke a task by id; the platform renders the prompt, routes to a model (with fallback + circuit breaking), validates output, caches, meters cost, and records every run.
 
+There are **three deployables**: the Go backend (single binary), the **Studio** frontend (`llm_platform_frontend`, :5173) for teams that *operate* the platform, and the **client portal** (`llm_platform_client`, :5174) for teams that *call* it (catalog + live Try-it predict against `/v1/tasks/*`, authenticated as a service token — see §11). The superseded Python prototype `llm_platform_v0` is out of scope.
+
 ---
 
 ## 1. System architecture
 
 ```mermaid
 flowchart LR
-  subgraph Client["Frontend (React + Vite)"]
-    UI["Compare / Studio / Versions / Estimate / Dashboard"]
+  subgraph Client["Frontends (React + Vite)"]
+    UI["Studio :5173\nCompare / Tasks / Versions / Estimate / Dashboard"]
+    CP["Client portal :5174\nCatalog / Try-it (svc token)"]
   end
 
   subgraph API["Go API (chi router)"]
@@ -38,6 +41,7 @@ flowchart LR
   end
 
   UI -->|"cookie-auth JSON"| MW --> H
+  CP -->|"Bearer svc-token JSON (/v1 only)"| MW
   H --> EP
   H <--> STORE
   STORE <--> DB
@@ -184,6 +188,10 @@ All errors are `{"detail": "<message>"}` with the HTTP status carrying the meani
 - Returns: `{page,page_size,total_sessions,total_pages,sessions:[{session_id,first_prompt,turn_count,created_at}]}`
 
 **`GET /sessions/{session_id}`** — full conversation: `{session_id, turns:[{run_id,prompt,system_prompt,created_at,results:[…]}]}` · 404 if missing.
+
+**`GET /sessions/{session_id}/leaderboard`** — per-session model leaderboard from manual ratings.
+- Returns: `{session_id, entries:[{model, avg_score, rating_count}]}`, ordered by `avg_score` desc.
+- Averages the 1–5★ `feedback` rows for the session, scoped to the calling user. Because a fan-out writes one `runs` row per model under a single `run_id`, the query selects the session's `run_id`s in a subquery and groups `feedback` by model — counting each rating exactly once (a naive `run_id` join would multiply each rating by the number of models in the run).
 
 **`DELETE /sessions`** — `{session_ids:[…]}` → `{deleted_count, session_ids}`.
 
@@ -383,7 +391,7 @@ Single-page app gated by `/auth/me` (spinner → login → app). Navigation live
 
 | Page | What a user does |
 |---|---|
-| **Compare** (playground) | Pick 2–N models, enter prompt/system prompt (+ images), tune temperature/max tokens, see side-by-side responses with latency/tokens/cost, rate 1–5★, browse/load/delete sessions |
+| **Compare** (playground) | Pick 2–N models, enter prompt/system prompt (+ images), tune temperature/max tokens, see side-by-side responses (one scrolling `ModelColumn` per model) with latency/tokens/cost, rate 1–5★, browse/load/delete sessions, open the **🏆 Leaderboard** modal (avg ★ per model for the session, via `GET /sessions/{id}/leaderboard`; disabled until a session exists) |
 | **Tasks (Studio)** | Browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model (client-measured round-trip latency); view/compare/deploy version history |
 | **Versions** | Dedicated version browser per task: paginated history, compare two versions, deploy (approver/admin), delete (admin) |
 | **Estimate** | Pre-flight token + cost calculator (single or batch) across all models, before spending anything |
@@ -393,14 +401,32 @@ Single-page app gated by `/auth/me` (spinner → login → app). Navigation live
 
 **Client RBAC** (`src/auth/permissions.ts`) mirrors the backend table and hides/disables controls (save draft, deploy, delete) by role — the backend remains the source of truth and enforces every check. Callers without `view_prompt` never receive prompt text.
 
-**Notable components/utils**: `SchemaEditor` (dual visual/raw JSON Schema editor), `VersionHistory` (reused by Studio + Versions), `MessageBubble` (response + rating), `useChat`/`useSessions` hooks, `tokens.ts` (tiktoken counting + cost), `schema.ts` (JSON Schema ↔ field list).
+**Notable components/utils**: `SchemaEditor` (dual visual/raw JSON Schema editor), `VersionHistory` (reused by Studio + Versions), `ChatArea`/`ModelColumn`/`MessageBubble` (Compare column layout + response + rating), `LeaderboardModal` (per-session model ranking), `useChat`/`useSessions` hooks, `tokens.ts` (tiktoken counting + cost), `schema.ts` (JSON Schema ↔ field list).
+
+### Client portal (`llm_platform_client/`, :5174)
+
+A **second, consumer-facing** React app for teams that *call* the platform (vs. the Studio above, which is for teams that *operate* it). It talks **only** to the product API — `/v1/tasks/*` — plus `/health` and `/pricing`, and never to the playground/Studio routes.
+
+- **No login.** Every request carries a long-lived **service JWT** in `Authorization: Bearer`, exactly like a machine caller (e.g. CIS). A working demo token for `svc:demo-client` (signed with the dev `JWT_SECRET`, expires 2036) is baked into `src/auth/token.ts`; `VITE_API_TOKEN` overrides it. The token is decoded client-side **for display only** (`decodePrincipal`) — the backend validates the signature on every request. With no role claim it resolves to the `caller` role (read + predict, prompt text redacted).
+- **Catalog** (`CatalogPage`) — every registered task as a callable API product; inactive tasks are listed but flagged (predict returns 409). The catalog auto-refreshes on window focus and every 30s (so a Studio deploy shows up).
+- **Task detail** (`TaskDetailPage`) — the I/O contract (input/output JSON Schemas), a live **Try it** panel that hits the real `POST /v1/tasks/{id}/predict` (coerces field inputs to the schema type; shows `output_valid`, fallback/degraded/cached badges, model/provider, usage, cost, latency, `task_run_id`; surfaces a 429 budget error with the `Retry-After` window), a 30-day usage chart (all callers), and copy-paste **curl** integration snippets + a copy-token button.
+- **API client** (`src/api/client.ts`): `listTasks`, `getTask`, `predict` (returns `{result, degraded}` reading the `X-Platform-Degraded` header), `getRun`, `taskStats`, `pricing`. `ApiError` carries the status and parsed `Retry-After`. Built with plain Tailwind (no Merlin dependency); proxies `/v1`, `/health`, `/pricing` to `:8000`. Its `types.ts` is a subset mirror of the Go contracts — keep in sync with the Studio's `types/index.ts`.
 
 ---
 
 ## 12. Running locally
 
+**All at once** — `./dev.sh` (from the repo root) reads `dev.yaml` and runs all three servers detached (nohup, surviving the shell), each pinned to its port (freed first), with pids + logs under `.dev/`:
+
+- `./dev.sh` — restart everything (default); `./dev.sh start|stop|restart [name]` for one service.
+- `./dev.sh status` — show what's listening; `./dev.sh logs <name>` — tail a service's log.
+- Backend port is injected as `PORT=<port>` (env); the two Vite apps get `--port <port> --strictPort` (flag).
+
+**By hand:**
 - **Backend**: `cd llm_platform_go && go run ./cmd/server` (listens on `:8000`; needs ≥1 provider key in `.env`).
-- **Frontend**: `cd llm_platform_frontend && npm run dev` (Vite on `:5173`, proxies API to `:8000`).
+- **Frontend (Studio)**: `cd llm_platform_frontend && npm run dev` (Vite on `:5173`, proxies API to `:8000`).
+- **Client portal**: `cd llm_platform_client && npm run dev` (Vite on `:5174`, proxies `/v1`, `/health`, `/pricing` to `:8000`).
+- **Service token** (for the portal or a machine caller): `cd llm_platform_go && go run ./cmd/issue-token -sub svc:my-team -email my-team@svc.local -role caller -ttl 8760h`.
 - **Tests**: `cd llm_platform_go && go test ./...` (add `-race` for the concurrency paths).
 
 ---

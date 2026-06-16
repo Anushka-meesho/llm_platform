@@ -1,7 +1,9 @@
 # LLM Platform — Complete Repository Guide
 
-**Last updated:** 2026-06-12 (end of Phase 1)
-**Scope:** `llm_platform_go` (backend) + `llm_platform_frontend` (UI). The Python `llm_platform_v0` is superseded and excluded.
+**Last updated:** 2026-06-16
+**Scope:** `llm_platform_go` (backend) + `llm_platform_frontend` (operator Studio UI) +
+`llm_platform_client` (consumer-facing client portal). The Python `llm_platform_v0` is
+superseded and excluded.
 
 ---
 
@@ -28,7 +30,12 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 - **Prediction cache (Redis):** per-task opt-in exact-match cache — key pins prompt version + rendered prompt + model + params + schema; hits are zero-cost `cached:true` responses (pulled forward from Phase 3.3)
 - Demo SSO + swappable user store, JWT cookie auth
 - Multi-model playground (Compare UI), pre-call cost estimation, 1–5★ feedback
+- **Per-session model leaderboard:** `GET /sessions/{id}/leaderboard` averages the manual
+  1–5★ ratings per model within a Compare session (Leaderboard modal) — the manual
+  precursor to the automated eval layer
 - Per-task + per-model + daily cost dashboard
+- **Client portal** (`llm_platform_client`, :5174): consumer-facing catalog + live Try-it
+  predict panel, authenticated as a baked-in `svc:demo-client` service token (no login)
 
 Planning docs: `docs/gap-analysis-roadmap.md` (gap analysis vs. the design doc),
 `docs/phase-workflow.md` (execution plan for Phases 1–4),
@@ -41,6 +48,8 @@ deployment, mapped to the seam that contains it).
 
 ```
 llm_platform/
+├── dev.sh / dev.yaml              # local dev orchestrator: runs all 3 servers detached
+│                                  #   (./dev.sh restart|start|stop|status|logs); pids+logs in .dev/
 ├── docs/                          # planning + this guide
 ├── llm_platform_go/               # Go backend (single binary)
 │   ├── cmd/server/main.go         # boot sequence
@@ -63,9 +72,11 @@ llm_platform/
 │   └── src/
 │       ├── api/client.ts          # typed fetch wrapper (cookie credentials)
 │       ├── auth/                  # AuthContext provider + useAuth hook
-│       ├── components/            # AppShell, LoginScreen, Sidebar, Chat*, StarRating…
+│       ├── components/            # AppShell, LoginScreen, Sidebar, ChatArea, ModelColumn,
+│       │                          #   ChatInput, MessageBubble, StarRating, LeaderboardModal,
+│       │                          #   SchemaEditor, VersionHistory, SystemPromptBar
 │       ├── hooks/                 # useChat (Compare state), useSessions
-│       ├── pages/                 # ComparePage, TasksPage, EstimatePage, DashboardPage
+│       ├── pages/                 # ComparePage, TasksPage, VersionsPage, EstimatePage, DashboardPage
 │       ├── types/index.ts         # API contract mirror
 │       └── utils/tokens.ts        # js-tiktoken counting + pricing-fed cost estimation
 ├── llm_platform_client/           # Client portal (:5174) — consumer-facing, /v1 API only
@@ -392,6 +403,7 @@ matrix in §3.3; the Studio playground rows below are open to any authenticated 
 | `GET /pricing` | Pricing table for client-side estimation |
 | `POST /run` | Playground fan-out (Compare UI). Rows stamped `task_id=playground` |
 | `GET/DELETE /sessions`, `GET /sessions/{id}` | Playground history (user-scoped) |
+| `GET /sessions/{id}/leaderboard` | Per-session model leaderboard: avg manual ★ per model (`{session_id, entries:[{model, avg_score, rating_count}]}`), ordered by score. User-scoped; the SQL selects the session's `run_id`s in a subquery so each `feedback` row counts once (a fan-out stores one `runs` row per model under one `run_id`, so a naive join inflates) |
 | `POST /feedback {run_id, model, rating}` | 1–5★ upsert |
 | `GET /dashboard` | Per-user usage: totals, by_task, by_model, daily |
 | `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
@@ -476,8 +488,13 @@ which also fetches `/pricing` once and feeds `setPricing`):
   `ChatInput`/`SystemPromptBar`) — N-model side-by-side multi-turn chat, image attach,
   temperature/max-token controls, session history, per-response latency/tokens/cost
   metadata and `StarRating` (POST /feedback keyed by the `run_id` threaded through
-  `useChat` state). This is the future Prompt Studio "sample test panel". **Its API
-  contract (`/run`, `/sessions`) must not leak into `/v1/tasks/*`.**
+  `useChat` state). `ChatArea` renders one `ModelColumn` per selected model (each
+  column independently scrolls + shows a typing spinner) plus a **🏆 Leaderboard**
+  button (disabled until a session exists) that opens `LeaderboardModal` —
+  `GET /sessions/{id}/leaderboard`, ranked avg ★ per model with a tie callout,
+  framed as the manual precursor to the eval layer. This is the future Prompt Studio
+  "sample test panel". **Its API contract (`/run`, `/sessions`) must not leak into
+  `/v1/tasks/*`.**
 - **Estimate** (`EstimatePage`) — single + batch (blank-line/`---` separated) prompts ×
   model multi-select × expected output tokens → per-model token/cost table + totals.
   Client-side only: `countTokens` (cl100k_base, stated approximation) + `estimateCost`
@@ -492,6 +509,19 @@ response type changes.
 ---
 
 ## 5. Running & Testing
+
+**One-shot dev orchestrator** — `./dev.sh` (config in `dev.yaml`) runs all three servers
+detached (nohup), each pinned to its port (the port is freed first), with pids + logs under
+`.dev/`:
+
+```bash
+./dev.sh            # restart everything (backend :8000, frontend :5173, client :5174)
+./dev.sh status     # show what's listening
+./dev.sh logs backend   # tail one service's log
+./dev.sh stop [name]    # stop all, or one service
+```
+
+Or run each by hand:
 
 ```bash
 # Backend (loads .env; needs ≥1 provider key)
@@ -518,6 +548,13 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   `newTestServerWithClients` injects fake providers.
 - `auth_feedback_test.go` — demo store, token round-trip, login flow, feedback +
   dashboard aggregates, per-user isolation.
+- `rbac_test.go` — the full role × permission matrix (`TestRBACMatrix`) and that a
+  token with no role claim resolves to `caller` (`TestDefaultRoleForTokenWithoutClaim`).
+- `prompt_redaction_test.go` — callers without `task:view_prompt` get
+  `prompt_template`/`system_prompt` blanked on task + version reads.
+- `delete_version_test.go` — version delete is admin-only and 409s on the active version.
+- `schema_update_test.go` — PUT merge semantics for schemas, incl. `"input_schema": null`
+  clearing one.
 - `tasks_test.go` — registry CRUD, prompt-version bump rules, schema/template
   validation, fenced-output parsing, YAML seed + re-seed version bump.
 - `predict_test.go` — full predict pipeline against a fake OpenAI-compatible server:
