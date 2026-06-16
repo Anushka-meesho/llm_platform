@@ -320,17 +320,24 @@ func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 }
 
 // GetLeaderboard returns the average manual rating per model within a session,
-// ordered by average score desc. Ratings live in the feedback table, so it
-// joins feedback to runs and scopes to the requesting user's session (mirroring
-// GetSession's user-scoping).
+// ordered by average score desc. Ratings live in the feedback table (one row
+// per run_id+model+user, upserted on re-rate), so the current value always
+// reflects the latest rating.
+//
+// A playground run stores one runs row PER model under a single run_id, so a
+// join on run_id alone would match every model's row and multiply each rating
+// by the number of models in that run (inflating the count and weighting the
+// average). We instead select the session's run_ids in a subquery and count
+// each feedback row exactly once.
 func GetLeaderboard(db *sql.DB, userID, sessionID string) ([]types.LeaderboardEntry, error) {
 	rows, err := db.Query(`
 		SELECT f.model,
 		       AVG(CAST(f.rating AS REAL)) AS avg_score,
-		       COUNT(f.rating)            AS rating_count
+		       COUNT(*)                    AS rating_count
 		FROM feedback f
-		JOIN runs r ON r.run_id = f.run_id
-		WHERE r.session_id = ? AND r.user_id = ?
+		WHERE f.run_id IN (
+		        SELECT run_id FROM runs WHERE session_id = ? AND user_id = ?
+		      )
 		GROUP BY f.model
 		ORDER BY avg_score DESC`, sessionID, userID)
 	if err != nil {
