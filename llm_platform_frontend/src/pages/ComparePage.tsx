@@ -68,6 +68,7 @@ const ComparePage = () => {
           conversations={chat.conversations}
           selectedModels={chat.selectedModels}
           isLoading={chat.isLoading}
+          sessionId={chat.sessionId}
         />
 
         {chat.error && (

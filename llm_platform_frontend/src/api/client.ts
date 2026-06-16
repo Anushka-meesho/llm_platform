@@ -10,6 +10,7 @@ import type {
   TPromptVersion,
   TPredictResult,
   TTaskStatsDetail,
+  TLeaderboardResponse,
 } from '../types';
 
 const BASE = '';
@@ -76,6 +77,9 @@ export const api = {
     ),
 
   getSession: (id: string) => fetchJSON<TSessionDetail>(`${BASE}/sessions/${id}`),
+
+  getLeaderboard: (sessionId: string) =>
+    fetchJSON<TLeaderboardResponse>(`${BASE}/sessions/${sessionId}/leaderboard`),
 
   deleteSessions: (ids: string[]) =>
     fetchJSON<{ deleted_count: number }>(`${BASE}/sessions`, {

@@ -69,6 +69,18 @@ type DeleteSessionsResponse struct {
 	SessionIDs   []string `json:"session_ids"`
 }
 
+// LeaderboardEntry is one model's average manual rating within a session.
+type LeaderboardEntry struct {
+	Model       string  `json:"model"`
+	AvgScore    float64 `json:"avg_score"`
+	RatingCount int     `json:"rating_count"`
+}
+
+type LeaderboardResponse struct {
+	SessionID string             `json:"session_id"`
+	Entries   []LeaderboardEntry `json:"entries"`
+}
+
 // RunRow is the internal DB representation — one row in the runs table.
 type RunRow struct {
 	ID           int

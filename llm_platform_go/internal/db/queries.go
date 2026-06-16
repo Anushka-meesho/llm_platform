@@ -319,6 +319,36 @@ func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 	return result, rows.Err()
 }
 
+// GetLeaderboard returns the average manual rating per model within a session,
+// ordered by average score desc. Ratings live in the feedback table, so it
+// joins feedback to runs and scopes to the requesting user's session (mirroring
+// GetSession's user-scoping).
+func GetLeaderboard(db *sql.DB, userID, sessionID string) ([]types.LeaderboardEntry, error) {
+	rows, err := db.Query(`
+		SELECT f.model,
+		       AVG(CAST(f.rating AS REAL)) AS avg_score,
+		       COUNT(f.rating)            AS rating_count
+		FROM feedback f
+		JOIN runs r ON r.run_id = f.run_id
+		WHERE r.session_id = ? AND r.user_id = ?
+		GROUP BY f.model
+		ORDER BY avg_score DESC`, sessionID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := []types.LeaderboardEntry{}
+	for rows.Next() {
+		var e types.LeaderboardEntry
+		if err := rows.Scan(&e.Model, &e.AvgScore, &e.RatingCount); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
 // DeleteSessions removes the given sessions, scoped to one user so a user can
 // only delete their own sessions.
 func DeleteSessions(db *sql.DB, userID string, sessionIDs []string) (int64, error) {

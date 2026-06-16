@@ -156,6 +156,19 @@ export type TModel = (typeof MODELS)[number];
 // would fan out 19 paid calls per prompt; users opt in to more.
 export const DEFAULT_COMPARE_MODELS: TModel[] = ['gpt-4o-mini', 'llama-groq', 'gemini-flash'];
 
+// ── Leaderboard (manual per-model rating within a session) ───────────────────
+
+export type TLeaderboardEntry = {
+  model: string;
+  avg_score: number;
+  rating_count: number;
+};
+
+export type TLeaderboardResponse = {
+  session_id: string;
+  entries: TLeaderboardEntry[];
+};
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 export type TUser = {

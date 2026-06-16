@@ -74,6 +74,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.Post("/run", h.RunEndpoint)
 		pr.Get("/sessions", h.ListSessions)
 		pr.Get("/sessions/{session_id}", h.GetSession)
+		pr.Get("/sessions/{session_id}/leaderboard", h.GetLeaderboard)
 		pr.Delete("/sessions", h.DeleteSessions)
 		pr.Post("/feedback", h.Feedback)
 		pr.Get("/dashboard", h.Dashboard)

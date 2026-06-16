@@ -256,6 +256,24 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /sessions/{session_id}/leaderboard
+func (h *Handler) GetLeaderboard(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	sessionID := chi.URLParam(r, "session_id")
+	entries, err := db.GetLeaderboard(h.DB, user.Subject, sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, types.LeaderboardResponse{
+		SessionID: sessionID,
+		Entries:   entries,
+	})
+}
+
 // DELETE /sessions
 func (h *Handler) DeleteSessions(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
