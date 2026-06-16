@@ -24,6 +24,14 @@ type Config struct {
 	GeminiBaseURL    string
 	AnthropicBaseURL string
 
+	// Meesho internal LLM gateway (OpenAI-compatible wire, but authenticated
+	// with an x-bf-vk virtual-key header instead of Bearer). MeeshoGatewayVK is
+	// the virtual key — insert it via the MEESHO_GATEWAY_VK env var (or .env).
+	// Empty key → the gateway's models fail at call time with an auth error,
+	// never a boot failure, same as any other unconfigured provider.
+	MeeshoGatewayBaseURL string
+	MeeshoGatewayVK      string
+
 	// Auth — the demo SSO seam. JWTSecret signs the session token issued after
 	// a (demo) login; AuthCookieName controls where the browser stores it.
 	// In production the real SSO would mint equivalent tokens; only the user
@@ -60,6 +68,9 @@ func Load() (*Config, error) {
 		GeminiBaseURL:    getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"),
 		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
 
+		MeeshoGatewayBaseURL: getEnvOrDefault("MEESHO_GATEWAY_BASE_URL", "http://llm-gateway.prd.meesho.int/v1"),
+		MeeshoGatewayVK:      os.Getenv("MEESHO_GATEWAY_VK"),
+
 		JWTSecret:      getEnvOrDefault("JWT_SECRET", "dev-insecure-secret-change-me"),
 		AuthCookieName: getEnvOrDefault("AUTH_COOKIE_NAME", "llm_platform_token"),
 		AuthIssuer:     getEnvOrDefault("AUTH_ISSUER", "llm-platform-demo"),
@@ -84,8 +95,8 @@ func Load() (*Config, error) {
 	// is configured. Models whose key is missing simply fail at call time (the
 	// runner reports a per-model auth error). Only require at least one, so a
 	// totally unconfigured server still fails loudly.
-	if cfg.OpenAIKey == "" && cfg.GroqKey == "" && cfg.GeminiKey == "" && cfg.AnthropicKey == "" {
-		return nil, fmt.Errorf("no provider API keys set: configure at least one of OPENAI_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY")
+	if cfg.OpenAIKey == "" && cfg.GroqKey == "" && cfg.GeminiKey == "" && cfg.AnthropicKey == "" && cfg.MeeshoGatewayVK == "" {
+		return nil, fmt.Errorf("no provider API keys set: configure at least one of OPENAI_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, MEESHO_GATEWAY_VK")
 	}
 
 	return cfg, nil
@@ -106,6 +117,9 @@ func (c *Config) MissingProviderKeys() []string {
 	}
 	if c.AnthropicKey == "" {
 		missing = append(missing, "ANTHROPIC_API_KEY")
+	}
+	if c.MeeshoGatewayVK == "" {
+		missing = append(missing, "MEESHO_GATEWAY_VK")
 	}
 	return missing
 }

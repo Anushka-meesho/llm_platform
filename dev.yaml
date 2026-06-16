@@ -1,0 +1,27 @@
+# dev.yaml — local dev server definitions.
+# Edit ports/commands here; `./dev.sh restart` applies them.
+#
+# Per service:
+#   dir       working directory (relative to repo root)
+#   port      port to run on (freed before start; enforced on the process)
+#   port_mode how the port is applied to the command:
+#               env  → exported as PORT=<port>      (the Go backend reads PORT)
+#               flag → appended as `-- --port <port> --strictPort` (Vite apps)
+#               none → not injected (command pins its own port)
+#   cmd       the command to launch
+services:
+  backend:
+    dir: llm_platform_go
+    port: 8000
+    port_mode: env
+    cmd: go run ./cmd/server
+  frontend:
+    dir: llm_platform_frontend
+    port: 5173
+    port_mode: flag
+    cmd: npm run dev
+  client:
+    dir: llm_platform_client
+    port: 5174
+    port_mode: flag
+    cmd: npm run dev

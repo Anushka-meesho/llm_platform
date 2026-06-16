@@ -10,6 +10,9 @@ import { MODELS, MODEL_GROUPS } from '../types';
 import { api } from '../api/client';
 import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
+import SchemaEditor, { type SchemaEditorState } from '../components/SchemaEditor';
+import VersionHistory from '../components/VersionHistory';
+import { stableStringify } from '../utils/schema';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 
 // TasksPage is the Prompt Studio: browse registered tasks, edit prompts as
@@ -104,12 +107,12 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
   const { user } = useAuth();
   const canWrite = can(user?.role, 'task:write');
   const canDeploy = can(user?.role, 'task:deploy');
+  const canDelete = can(user?.role, 'task:delete');
   const [versions, setVersions] = useState<TPromptVersion[]>([]);
   const [stats, setStats] = useState<TTaskStatsDetail | null>(null);
   const [draft, setDraft] = useState(task.prompt_template);
   const [draftSystem, setDraftSystem] = useState(task.system_prompt ?? '');
   const [note, setNote] = useState('');
-  const [compareVersion, setCompareVersion] = useState<TPromptVersion | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
@@ -140,20 +143,6 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
       await loadVersions();
     } catch (e) {
       setFlash(e instanceof Error ? e.message : 'Save failed');
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const deploy = async (version: number) => {
-    if (!window.confirm(`Deploy v${version}? Production traffic switches immediately.`)) return;
-    setBusy(`deploy-${version}`);
-    try {
-      await api.deployVersion(task.id, version);
-      setFlash(`v${version} is now live.`);
-      await Promise.all([loadVersions(), onChanged()]);
-    } catch (e) {
-      setFlash(e instanceof Error ? e.message : 'Deploy failed');
     } finally {
       setBusy(null);
     }
@@ -209,6 +198,9 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
       {/* Model routing */}
       <ModelSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
+      {/* Input / output schema */}
+      <SchemaSection key={task.id} task={task} onChanged={onChanged} setFlash={setFlash} canWrite={canWrite} />
+
       {/* Prompt editor */}
       <Section title="Prompt editor">
         <Typography variant="body" size="1" className="text-tertiary-text mb-1">
@@ -252,61 +244,162 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
 
       {/* Version history */}
       <Section title="Version history">
-        <div className="flex flex-col gap-1">
-          {versions.map((v) => (
-            <div
-              key={v.version}
-              className="flex items-center gap-3 px-3 py-2 rounded-md border border-solid border-tertiary-border"
-            >
-              <Typography variant="body" size="3" className="text-primary-text font-medium w-12">
-                v{v.version}
-              </Typography>
-              <Typography variant="body" size="1" className="text-tertiary-text flex-1 truncate">
-                {v.active ? '● live — ' : ''}
-                {v.note || v.prompt_template.slice(0, 60)}
-              </Typography>
-              <Typography variant="body" size="1" className="text-tertiary-text">
-                {v.created_at.slice(0, 10)}
-              </Typography>
-              <Button
-                variant="ghost"
-                size="s"
-                onClick={() => setCompareVersion(compareVersion?.version === v.version ? null : v)}
-              >
-                {compareVersion?.version === v.version ? 'Hide' : 'View'}
-              </Button>
-              {!v.active && canDeploy && (
-                <Button
-                  variant="outline"
-                  size="s"
-                  disabled={busy !== null}
-                  onClick={() => deploy(v.version)}
-                >
-                  {busy === `deploy-${v.version}` ? 'Deploying…' : 'Deploy'}
-                </Button>
-              )}
-            </div>
-          ))}
-        </div>
-
-        {compareVersion && (
-          <div className="grid grid-cols-2 gap-3 mt-3">
-            <PromptBlock
-              title={`v${compareVersion.version}${compareVersion.active ? ' (live)' : ''}`}
-              system={compareVersion.system_prompt}
-              prompt={compareVersion.prompt_template}
-            />
-            <PromptBlock
-              title={`v${task.prompt_version} (live)`}
-              system={task.system_prompt ?? ''}
-              prompt={task.prompt_template}
-            />
-          </div>
-        )}
+        <VersionHistory
+          taskId={task.id}
+          versions={versions}
+          activeVersion={task.prompt_version}
+          livePrompt={task.prompt_template}
+          liveSystem={task.system_prompt ?? ''}
+          canDeploy={canDeploy}
+          canDelete={canDelete}
+          onReload={loadVersions}
+          onActiveChanged={onChanged}
+        />
       </Section>
     </div>
   );
 };
+
+// ── Schema editor ─────────────────────────────────────────────────────────────
+
+const hasSchema = (s?: Record<string, unknown>) => !!s && Object.keys(s).length > 0;
+const EMPTY_OBJECT_SCHEMA = { type: 'object', properties: {} };
+
+// SchemaSection edits a task's input and output JSON Schemas. Each schema can be
+// toggled off entirely (free-form input / raw-text output) or edited via the
+// visual field editor / JSON. Both schemas save in one PUT; the backend
+// re-validates and rejects (422) anything that won't compile, so the editor's
+// client-side checks are a convenience, not the gate. Authoring is gated on the
+// same task:write permission as the prompt editor (readOnly when absent).
+const SchemaSection = ({
+  task,
+  onChanged,
+  setFlash,
+  canWrite,
+}: {
+  task: TTask;
+  onChanged: () => Promise<void>;
+  setFlash: (msg: string) => void;
+  canWrite: boolean;
+}) => {
+  const [inputEnabled, setInputEnabled] = useState(hasSchema(task.input_schema));
+  const [outputEnabled, setOutputEnabled] = useState(hasSchema(task.output_schema));
+  const [input, setInput] = useState<SchemaEditorState>({
+    schema: task.input_schema ?? EMPTY_OBJECT_SCHEMA,
+    valid: true,
+  });
+  const [output, setOutput] = useState<SchemaEditorState>({
+    schema: task.output_schema ?? EMPTY_OBJECT_SCHEMA,
+    valid: true,
+  });
+  const [saving, setSaving] = useState(false);
+
+  const currentInput = inputEnabled ? input.schema : null;
+  const currentOutput = outputEnabled ? output.schema : null;
+  const originalInput = hasSchema(task.input_schema) ? task.input_schema! : null;
+  const originalOutput = hasSchema(task.output_schema) ? task.output_schema! : null;
+
+  const dirty =
+    stableStringify(currentInput) !== stableStringify(originalInput) ||
+    stableStringify(currentOutput) !== stableStringify(originalOutput);
+  const invalid = (inputEnabled && !input.valid) || (outputEnabled && !output.valid);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const patch: Record<string, unknown> = {
+        input_schema: inputEnabled ? input.schema : null,
+        output_schema: outputEnabled ? output.schema : null,
+      };
+      await api.updateTask(task.id, patch as Partial<TTask>);
+      setFlash('Schemas saved.');
+      await onChanged();
+    } catch (e) {
+      setFlash(e instanceof Error ? e.message : 'Schema save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Input & output schema">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <SchemaPane
+          title="Input schema"
+          hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Off = free-form."
+          enabled={inputEnabled}
+          onToggle={setInputEnabled}
+          canWrite={canWrite}
+        >
+          <SchemaEditor
+            initial={input.schema}
+            readOnly={!canWrite}
+            onChange={setInput}
+          />
+        </SchemaPane>
+        <SchemaPane
+          title="Output schema"
+          hint="Validates model output. Off = raw text output (no output_valid flag)."
+          enabled={outputEnabled}
+          onToggle={setOutputEnabled}
+          canWrite={canWrite}
+        >
+          <SchemaEditor
+            initial={output.schema}
+            readOnly={!canWrite}
+            onChange={setOutput}
+          />
+        </SchemaPane>
+      </div>
+      {canWrite && (
+        <div className="flex items-center gap-3 mt-3">
+          <Button variant="primary" size="s" disabled={!dirty || invalid || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save schemas'}
+          </Button>
+          {invalid && (
+            <Typography variant="body" size="1" className="text-error-text">
+              Fix the highlighted errors before saving.
+            </Typography>
+          )}
+          {dirty && !invalid && (
+            <Typography variant="body" size="1" className="text-tertiary-text">
+              Unsaved changes — takes effect on the next predict.
+            </Typography>
+          )}
+        </div>
+      )}
+    </Section>
+  );
+};
+
+const SchemaPane = ({
+  title,
+  hint,
+  enabled,
+  onToggle,
+  canWrite,
+  children,
+}: {
+  title: string;
+  hint: string;
+  enabled: boolean;
+  onToggle: (v: boolean) => void;
+  canWrite: boolean;
+  children: ReactNode;
+}) => (
+  <div className="border border-solid border-tertiary-border rounded-md p-3 flex flex-col gap-2">
+    <label className="flex items-center gap-2 select-none">
+      <input type="checkbox" checked={enabled} disabled={!canWrite} onChange={(e) => onToggle(e.target.checked)} />
+      <Typography variant="body" size="2" className="text-primary-text font-medium">
+        {title}
+      </Typography>
+    </label>
+    <Typography variant="body" size="1" className="text-tertiary-text">
+      {hint}
+    </Typography>
+    {enabled && children}
+  </div>
+);
 
 // ── Model routing ─────────────────────────────────────────────────────────────
 
@@ -475,6 +568,10 @@ const TestPanel = ({ task, versions }: { task: TTask; versions: TPromptVersion[]
   const [values, setValues] = useState<Record<string, string>>({});
   const [version, setVersion] = useState<number>(0); // 0 = active
   const [result, setResult] = useState<TPredictResult | null>(null);
+  // Round-trip latency measured on the client: from the Run click to the moment
+  // the prediction lands here (includes network + server time, what the user
+  // actually waits), shown instead of the server-reported latency_ms.
+  const [clientLatencyMs, setClientLatencyMs] = useState<number | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -482,12 +579,15 @@ const TestPanel = ({ task, versions }: { task: TTask; versions: TPromptVersion[]
     setRunning(true);
     setErr(null);
     setResult(null);
+    setClientLatencyMs(null);
+    const start = performance.now();
     try {
       const inputs: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(values)) {
         if (v !== '') inputs[k] = v;
       }
       const res = await api.testTask(task.id, inputs, version > 0 ? { version } : undefined);
+      setClientLatencyMs(Math.round(performance.now() - start));
       setResult(res);
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Test failed');
@@ -558,7 +658,7 @@ const TestPanel = ({ task, versions }: { task: TTask; versions: TPromptVersion[]
             </Badge>
             {result.fallback_used && <Badge ok={false}>fallback used</Badge>}
             <Typography variant="body" size="1" className="text-tertiary-text">
-              v{result.prompt_version} · {result.model} · {result.latency_ms}ms ·{' '}
+              v{result.prompt_version} · {result.model} · {clientLatencyMs ?? result.latency_ms}ms ·{' '}
               {result.usage.total_tokens} tok · {formatCost(result.usage.cost_usd)}
             </Typography>
           </div>
@@ -604,20 +704,6 @@ const Badge = ({ ok, children }: { ok: boolean; children: ReactNode }) => (
   >
     {children}
   </span>
-);
-
-const PromptBlock = ({ title, system, prompt }: { title: string; system: string; prompt: string }) => (
-  <div className="border border-solid border-tertiary-border rounded-md overflow-hidden">
-    <div className="bg-secondary-bg px-3 py-1.5">
-      <Typography variant="body" size="1" className="text-primary-text font-semi-bold">
-        {title}
-      </Typography>
-    </div>
-    <pre className="m-0 px-3 py-2 text-xs text-primary-text whitespace-pre-wrap">
-      {system ? `[system]\n${system}\n\n` : ''}
-      {prompt}
-    </pre>
-  </div>
 );
 
 export default TasksPage;

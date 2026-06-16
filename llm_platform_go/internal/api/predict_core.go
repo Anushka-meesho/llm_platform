@@ -79,42 +79,70 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	}
 	messages = append(messages, llm.ChatMessage{Role: "user", Content: prompt})
 
-	// Prediction cache lookup. The key pins everything that determined the
-	// output at call time: deployed prompt version, the fully rendered prompt
-	// (template + every input/context value), system prompt, primary model,
-	// sampling params, and output schema — identical request state or no hit.
-	// Studio overrides bypass the cache entirely.
-	cacheable := opts.useCache && h.Cache != nil && task.CacheEnabled &&
-		opts.overrideModel == "" && opts.overrideVersion == nil
-	var cacheKey string
-	if cacheable {
-		cacheKey = cache.Key(cache.KeyInputs{
-			TaskID:         task.ID,
-			PromptVersion:  promptVersion,
-			Model:          task.Model,
-			SystemPrompt:   renderTask.SystemPrompt,
-			RenderedPrompt: prompt,
-			Temperature:    task.Temperature,
-			MaxTokens:      task.MaxTokens,
-			OutputSchema:   string(task.OutputSchema),
-		})
-		if raw, ok := h.Cache.Get(ctx, cacheKey); ok {
-			var entry cache.Entry
-			if err := json.Unmarshal(raw, &entry); err == nil {
-				return h.serveCached(task, prompt, renderTask.SystemPrompt,
-					promptVersion, user, &entry), nil
-			}
-		}
-	}
-
 	// Model chain: explicit override (Studio), or primary + fallbacks.
 	models := append([]string{task.Model}, task.FallbackModels...)
 	if opts.overrideModel != "" {
 		models = []string{opts.overrideModel}
 	}
 
-	result := llm.CallWithFallback(ctx, h.Clients, models, messages,
-		float32(task.Temperature), task.MaxTokens)
+	// Prediction cache (single level, keyed per model). The key pins the
+	// deployed prompt version, fully rendered prompt, system prompt, sampling
+	// params, output schema, and the routing key that produced the answer — but
+	// NOT the fallback chain. Routing is live configuration (tasks.Store), read
+	// fresh on every prediction, so a chain edit changes which model runs, not
+	// which cache entry is consulted.
+	//
+	// The per-model cache is consulted *during* the fallback walk, as the router
+	// reaches each model (modelLookup below). A model's cached answer is used
+	// only when this request actually reached it (every higher-priority model
+	// was tried live and failed), so a recovered primary is always called rather
+	// than shadowed by a stale lower-priority entry. Studio overrides bypass
+	// caching entirely.
+	cacheable := opts.useCache && h.Cache != nil && task.CacheEnabled &&
+		opts.overrideModel == "" && opts.overrideVersion == nil
+	base := cache.KeyInputs{
+		TaskID:         task.ID,
+		PromptVersion:  promptVersion,
+		SystemPrompt:   renderTask.SystemPrompt,
+		RenderedPrompt: prompt,
+		Temperature:    task.Temperature,
+		MaxTokens:      task.MaxTokens,
+		OutputSchema:   string(task.OutputSchema),
+	}
+	modelKey := func(model string) string { ki := base; ki.Model = model; return cache.Key(ki) }
+
+	// modelLookup is the per-model cache hook handed to the fallback walk. On a
+	// hit it captures the entry (for serveCached below, which needs the parsed
+	// output/validity) and returns a stop signal so the walk halts at this model.
+	var hitEntry *cache.Entry
+	var modelLookup llm.ModelCacheLookup
+	if cacheable {
+		modelLookup = func(model string) (llm.ModelResult, bool) {
+			raw, ok := h.Cache.Get(ctx, modelKey(model))
+			if !ok {
+				return llm.ModelResult{}, false
+			}
+			var entry cache.Entry
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				return llm.ModelResult{}, false
+			}
+			hitEntry = &entry
+			resp := entry.RawResponse
+			return llm.ModelResult{
+				Model: entry.Model, Provider: entry.Provider,
+				Response: &resp, Success: true,
+			}, true
+		}
+	}
+
+	result := llm.CallWithFallbackCached(ctx, h.Clients, models, messages,
+		float32(task.Temperature), task.MaxTokens, modelLookup)
+
+	// A per-model cache hit during the walk short-circuits the rest of the
+	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
+	if hitEntry != nil {
+		return h.serveCached(task, prompt, renderTask.SystemPrompt, promptVersion, user, hitEntry), nil
+	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
 	var output json.RawMessage
@@ -128,11 +156,11 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
-	// Cache fill — only clean outcomes: primary model served it (a fallback
-	// answer must not be replayed once the primary recovers) and the output
-	// passed schema validation (or the task has no schema).
-	if cacheable && result.Success && !result.FallbackUsed && !result.Degraded &&
-		result.Response != nil && (outputValid == nil || *outputValid) {
+	// Cache fill — any clean success (schema valid or no schema). Failures and
+	// schema-invalid outputs are never cached. One entry, keyed on the serving
+	// model, at the task's TTL.
+	if cacheable && result.Success && result.Response != nil &&
+		(outputValid == nil || *outputValid) {
 		entry := cache.Entry{
 			Model:        result.Model,
 			Provider:     result.Provider,
@@ -145,11 +173,11 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 			CachedAt:     time.Now().UTC(),
 		}
 		if b, err := json.Marshal(entry); err == nil {
-			ttl := time.Duration(task.CacheTTLSeconds) * time.Second
-			if ttl <= 0 {
-				ttl = cache.DefaultTTL
+			modelTTL := time.Duration(task.CacheTTLSeconds) * time.Second
+			if modelTTL <= 0 {
+				modelTTL = cache.DefaultTTL
 			}
-			h.Cache.Set(ctx, cacheKey, b, ttl)
+			h.Cache.Set(ctx, modelKey(result.Model), b, modelTTL)
 		}
 	}
 
@@ -205,11 +233,16 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
+	// A cached answer from a non-primary model is still a degraded/fallback
+	// outcome — keep the fallback_used + X-Platform-Degraded contract honest.
+	fellBack := entry.Model != task.Model
 	result := llm.ModelResult{
-		Model:    entry.Model,
-		Provider: entry.Provider,
-		Response: &response,
-		Success:  true,
+		Model:        entry.Model,
+		Provider:     entry.Provider,
+		Response:     &response,
+		Success:      true,
+		FallbackUsed: fellBack,
+		Degraded:     fellBack,
 	}
 
 	runID := uuid.New().String()

@@ -33,19 +33,30 @@ type cachedTask struct {
 type Store struct {
 	db *sql.DB
 
-	mu    sync.RWMutex
-	cache map[string]cachedTask
+	// editMu coordinates config edits with reads. Every write to a task's
+	// config or version history holds it exclusively for the whole critical
+	// section; every read (Get) holds it shared. So a prediction reading routing
+	// while an edit is in flight blocks until the edit commits, then sees the
+	// new config — readers never observe a half-applied edit, and never keep
+	// serving a stale chain once an edit has started. Edits are rare and reads
+	// are frequent-but-shared, so the contention cost lands only during an edit.
+	editMu sync.RWMutex
+
+	// cacheMu guards only the in-memory config map and is never held across I/O.
+	cacheMu sync.Mutex
+	cache   map[string]cachedTask
 }
 
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, cache: map[string]cachedTask{}}
 }
 
-// invalidate drops a task from the config cache after any write to it.
+// invalidate drops a task from the config cache after any write to it. Callers
+// already hold editMu exclusively; this guards the map alone.
 func (s *Store) invalidate(id string) {
-	s.mu.Lock()
+	s.cacheMu.Lock()
 	delete(s.cache, id)
-	s.mu.Unlock()
+	s.cacheMu.Unlock()
 }
 
 const taskColumns = `id, name, description, input_schema, output_schema,
@@ -55,6 +66,13 @@ const taskColumns = `id, name, description, input_schema, output_schema,
 
 // Create inserts a new task. Fails if the id already exists.
 func (s *Store) Create(t *Task) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	return s.createLocked(t)
+}
+
+// createLocked is Create's body; callers must already hold editMu exclusively.
+func (s *Store) createLocked(t *Task) error {
 	t.applyDefaults()
 	if err := t.Validate(); err != nil {
 		return err
@@ -85,13 +103,24 @@ func (s *Store) Create(t *Task) error {
 
 // Get returns one task by id, or ErrNotFound. Served from the config cache
 // when fresh — the prediction hot path must not pay a DB read per request.
+// Held under editMu (shared): a read concurrent with a config edit waits for
+// that edit to commit, then sees the new config.
 func (s *Store) Get(id string) (*Task, error) {
-	s.mu.RLock()
+	s.editMu.RLock()
+	defer s.editMu.RUnlock()
+	return s.getRaw(id)
+}
+
+// getRaw is the cache-or-DB read without the editMu gate. Edits call it while
+// already holding editMu exclusively (calling Get there would deadlock).
+func (s *Store) getRaw(id string) (*Task, error) {
+	s.cacheMu.Lock()
 	if c, ok := s.cache[id]; ok && time.Since(c.fetchedAt) < configCacheTTL {
-		s.mu.RUnlock()
-		return c.task, nil
+		t := c.task
+		s.cacheMu.Unlock()
+		return t, nil
 	}
-	s.mu.RUnlock()
+	s.cacheMu.Unlock()
 
 	row := s.db.QueryRow(`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id)
 	t, err := scanTask(row)
@@ -102,9 +131,9 @@ func (s *Store) Get(id string) (*Task, error) {
 		return nil, err
 	}
 
-	s.mu.Lock()
+	s.cacheMu.Lock()
 	s.cache[id] = cachedTask{task: t, fetchedAt: time.Now()}
-	s.mu.Unlock()
+	s.cacheMu.Unlock()
 	return t, nil
 }
 
@@ -130,7 +159,14 @@ func (s *Store) List() ([]*Task, error) {
 // Update overwrites a task's mutable fields. If the prompt (template or system
 // prompt) changed, the prompt version is bumped so runs attribute correctly.
 func (s *Store) Update(t *Task) error {
-	existing, err := s.Get(t.ID)
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	return s.updateLocked(t)
+}
+
+// updateLocked is Update's body; callers must already hold editMu exclusively.
+func (s *Store) updateLocked(t *Task) error {
+	existing, err := s.getRaw(t.ID)
 	if err != nil {
 		return err
 	}
@@ -185,18 +221,31 @@ func (s *Store) Update(t *Task) error {
 }
 
 // Upsert creates the task if absent, otherwise updates it. Used by YAML seeding.
-// YAML configs don't model activation state, so re-seeding preserves whatever
-// active flag the task currently has (a fresh create starts active).
+//
+// For an existing task the YAML seed must not clobber state that's owned at
+// runtime, so re-seeding preserves:
+//   - the active flag (YAML doesn't model activation; a fresh create is active);
+//   - the model routing — model + fallback chain. Routing is operational config
+//     tuned live via the API, so the YAML value seeds it only at first creation
+//     and never overwrites a saved chain. It then persists across restarts until
+//     someone changes it through the API.
+//
+// Prompt/schema edits in YAML do still re-apply on restart (the onboarding
+// contract: edit the prompt, restart, version bumps).
 func (s *Store) Upsert(t *Task) error {
-	existing, err := s.Get(t.ID)
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	existing, err := s.getRaw(t.ID)
 	if errors.Is(err, ErrNotFound) {
-		return s.Create(t)
+		return s.createLocked(t)
 	}
 	if err != nil {
 		return err
 	}
 	t.Active = existing.Active
-	return s.Update(t)
+	t.Model = existing.Model
+	t.FallbackModels = existing.FallbackModels
+	return s.updateLocked(t)
 }
 
 // ── scanning helpers ─────────────────────────────────────────────────────────
@@ -263,10 +312,24 @@ func fmtTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
+// timeLayouts are the formats parseTime accepts. We write the space-separated
+// form via fmtTime, but the modernc.org/sqlite driver recognizes DATETIME
+// columns and round-trips them as RFC3339 ("2006-01-02T15:04:05Z") when scanned
+// into a string — so a value we stored as "2006-01-02 15:04:05" comes back in
+// RFC3339. parseTime must accept both or every version/run timestamp reads as
+// the zero time (which surfaced in the UI as "0001-01-01").
+var timeLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+}
+
 func parseTime(s string) time.Time {
-	t, err := time.Parse("2006-01-02 15:04:05", s)
-	if err != nil {
-		return time.Time{}
+	for _, layout := range timeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
 	}
-	return t.UTC()
+	return time.Time{}
 }

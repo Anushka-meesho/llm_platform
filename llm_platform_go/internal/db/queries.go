@@ -358,14 +358,25 @@ func boolToInt(b bool) int {
 }
 
 func parseTime(s string) time.Time {
-	// SQLite stores DATETIME as "2006-01-02 15:04:05"
-	t, err := time.Parse("2006-01-02 15:04:05", s)
-	if err != nil {
-		// Fallback: try with fractional seconds
-		t, err = time.Parse("2006-01-02 15:04:05.999999999", s)
-		if err != nil {
-			return time.Time{}
+	// We store DATETIME as "2006-01-02 15:04:05", but the modernc.org/sqlite
+	// driver round-trips DATETIME columns through time.Time and re-emits them as
+	// RFC3339 when scanned into a string — so accept both forms or timestamps
+	// read back as the zero time.
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	var t time.Time
+	var err error
+	for _, layout := range layouts {
+		if t, err = time.Parse(layout, s); err == nil {
+			break
 		}
+	}
+	if err != nil {
+		return time.Time{}
 	}
 	// Report as UTC to keep consistent with Python's UTC default.
 	return time.Date(t.Year(), t.Month(), t.Day(),

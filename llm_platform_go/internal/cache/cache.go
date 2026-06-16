@@ -10,7 +10,9 @@
 //   - the fully rendered prompt (which already encodes the template AND every
 //     caller input / context value rendered into it)
 //   - the system prompt
-//   - the primary model routing key
+//   - the model routing key (per model: each model in a task's fallback chain
+//     caches under its own key, consulted as the fallback walk reaches that
+//     model — never as a pre-call shortcut past a higher-priority model)
 //   - temperature and max_tokens (sampling parameters change outputs)
 //   - the output schema (it determines how the response is parsed/validated)
 //
@@ -39,11 +41,14 @@ type Cache interface {
 }
 
 // KeyInputs is everything that must be identical for two predictions to share
-// a cache entry.
+// a cache entry. The cache is keyed per model — the single routing key that
+// actually produced the answer — never on the fallback chain. The chain is
+// live configuration (read fresh from tasks.Store on every prediction), so a
+// routing edit changes which model runs, not which cache entry is consulted.
 type KeyInputs struct {
 	TaskID         string  `json:"task_id"`
 	PromptVersion  int     `json:"prompt_version"`
-	Model          string  `json:"model"` // primary routing key
+	Model          string  `json:"model"` // the routing key that produced the answer
 	SystemPrompt   string  `json:"system_prompt"`
 	RenderedPrompt string  `json:"rendered_prompt"` // template + all inputs/context
 	Temperature    float64 `json:"temperature"`
@@ -74,5 +79,6 @@ type Entry struct {
 	CachedAt     time.Time       `json:"cached_at"`
 }
 
-// DefaultTTL applies when a task enables caching without an explicit TTL.
+// DefaultTTL applies when a task enables caching without an explicit TTL —
+// kept long, since "model X said Y for prompt P" is a stable fact.
 const DefaultTTL = 24 * time.Hour

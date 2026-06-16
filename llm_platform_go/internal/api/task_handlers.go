@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -34,16 +36,28 @@ func (h *Handler) CreateTask(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/tasks
 func (h *Handler) ListTasks(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	list, err := h.Tasks.List()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": list})
+	out := make([]*tasks.Task, len(list))
+	for i, t := range list {
+		out[i] = redactedTask(user, t)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": out})
 }
 
 // GET /v1/tasks/{task_id}
 func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	t, err := h.Tasks.Get(chi.URLParam(r, "task_id"))
 	if errors.Is(err, tasks.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "task not found")
@@ -53,7 +67,7 @@ func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	writeJSON(w, http.StatusOK, redactedTask(user, t))
 }
 
 // PUT /v1/tasks/{task_id} — merge semantics: fields present in the body
@@ -70,17 +84,48 @@ func (h *Handler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the raw body once so we can both merge it over the current state and
+	// detect explicit JSON nulls (merge-decoding alone can't distinguish an
+	// absent key from a null one — and for the schema fields "null" means
+	// "remove this schema", which a json.RawMessage would otherwise store
+	// literally and then fail to compile).
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "could not read request body: "+err.Error())
+		return
+	}
+
 	t := *existing // start from current state; body overwrites what it carries
-	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+	if err := json.Unmarshal(body, &t); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
 		return
 	}
+
+	// Explicit nulls clear the optional JSON-Schema fields (free-form input /
+	// raw-text output). Without this an "input_schema": null would survive as
+	// the literal bytes `null` and break Validate.
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(body, &present); err == nil {
+		if isJSONNull(present["input_schema"]) {
+			t.InputSchema = nil
+		}
+		if isJSONNull(present["output_schema"]) {
+			t.OutputSchema = nil
+		}
+	}
+
 	t.ID = existing.ID
 	if err := h.Tasks.Update(&t); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+// isJSONNull reports whether a raw JSON value is present and literally null
+// (as opposed to absent, which decodes to a nil/empty RawMessage).
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 // ── Prediction ───────────────────────────────────────────────────────────────

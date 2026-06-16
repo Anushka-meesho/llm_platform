@@ -101,8 +101,10 @@ llm_platform/
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | Provider keys; at least one required |
+| `OPENAI_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | Provider keys; at least one of these or `MEESHO_GATEWAY_VK` required |
 | `OPENAI_BASE_URL` / `GROQ_BASE_URL` / `GEMINI_BASE_URL` / `ANTHROPIC_BASE_URL` | public APIs | Provider base URLs — override for proxies/gateways/self-hosted (Anthropic empty = SDK default) |
+| `MEESHO_GATEWAY_VK` | — | Virtual key for the Meesho internal LLM gateway (sent as the `x-bf-vk` header); powers the `meesho-gemini-2.5-flash` model |
+| `MEESHO_GATEWAY_BASE_URL` | `http://llm-gateway.prd.meesho.int/v1` | Meesho gateway base URL (OpenAI-compatible `/chat/completions`) |
 | `DB_PATH` | `./llm_platform.db` | SQLite file |
 | `PORT` | `8000` | HTTP port |
 | `PRICING_PATH` | `./pricing.json` | Cost table |
@@ -130,17 +132,25 @@ missing (Phase 1) is a way to mint long-lived service principals distinct from U
 
 **Role-based authorization (`internal/auth/rbac.go`).** The PFS User Journey separates a
 prompt **creator** (authors/iterates), an **approver** (owns the publish gate — Gate 2),
-and a service **caller** (only invokes predict). RBAC encodes that as four capabilities —
+and a service **caller** (only invokes predict). RBAC encodes that as six capabilities —
 `task:read`, `task:predict`, `task:write` (create/update/draft/test/shadow), `task:deploy`
-(the publish gate, deliberately split from `task:write`) — mapped to five roles:
+(the publish gate, deliberately split from `task:write`), `task:delete` (destructive, e.g.
+pruning prompt versions — admin-only), and `task:view_prompt` (see the prompt text itself —
+withheld from callers, who integrate against the task contract and "never touch prompts" per
+the PFS) — mapped to five roles:
 
-| Role | read | predict | write | deploy |
-|---|---|---|---|---|
-| `admin` | ✓ | ✓ | ✓ | ✓ |
-| `creator` | ✓ | ✓ | ✓ | — |
-| `approver` | ✓ | ✓ | — | ✓ |
-| `caller` | ✓ | ✓ | — | — |
-| `viewer` | ✓ | — | — | — |
+| Role | read | predict | write | deploy | delete | view_prompt |
+|---|---|---|---|---|---|---|
+| `admin` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `creator` | ✓ | ✓ | ✓ | — | — | ✓ |
+| `approver` | ✓ | ✓ | — | ✓ | — | ✓ |
+| `caller` | ✓ | ✓ | — | — | — | — |
+| `viewer` | ✓ | — | — | — | — | ✓ |
+
+**Prompt redaction:** a caller (anyone without `task:view_prompt`) gets task config, schemas,
+and its own run outputs, but `GET /v1/tasks`, `GET /v1/tasks/{id}`, and
+`GET /v1/tasks/{id}/versions` blank the `prompt_template` / `system_prompt` fields
+(`redactedTask` copies the cached task so the shared config-cache entry is never mutated).
 
 The role rides **inside the signed JWT** (`Claims.Role`), so the gateway authorizes from the
 token alone — no per-request identity-store lookup (hot path stays DB-free). A token with no
@@ -229,7 +239,7 @@ provider is nil when `ANTHROPIC_API_KEY` is unset → standard "LLM client not
 configured" per-call error.
 
 **Routing registry** (`runner.go`): friendly key → concrete model ID + provider
-attribution + client + flags. **19 models across 4 providers**, registered
+attribution + client + flags. **20 models across 5 providers**, registered
 whether or not the provider's key is configured (missing key = graceful
 per-call error, never a boot failure):
 - **OpenAI:** `gpt-5.1`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano` (reasoning wire:
@@ -240,6 +250,9 @@ per-call error, never a boot failure):
   `gemini-2.5-flash-lite`, `gemini-flash` (2.0)
 - **Anthropic (native):** `claude-fable-5`, `claude-opus-4-8`,
   `claude-sonnet-4-6`, `claude-haiku-4-5`
+- **Meesho gateway:** `meesho-gemini-2.5-flash` (model id `vertex/gemini-2.5-flash`)
+  — OpenAI-compatible endpoint authenticated with the `x-bf-vk` virtual-key header
+  instead of Bearer (`openAICompatProvider.authHeader`)
 
 Helpers: `ProviderName(model)`, `KnownModel(model)`, `AllModels()` (sorted keys —
 backs `/health` `models_available`; `DefaultModels` stays the small /run
@@ -280,17 +293,31 @@ arrival order (fastest first).
 
 **Prediction cache** (`internal/cache`): per-task opt-in exact-match cache
 (Redis in production, in-process memory for dev, off when unconfigured — `Cache`
-interface is the seam). Key = SHA-256 over *everything that determined the
-output at call time*: task id, **deployed prompt version**, the **fully
-rendered prompt** (template + every input/context value), system prompt,
-primary model key, temperature, max_tokens, and output schema — so deploys,
-model/param changes, and schema edits all invalidate implicitly; entries age
-out via per-task TTL (default 24h). Only **clean production predicts** are
-cached: primary model served it (never a fallback answer), output schema valid,
-`useCache` set only by `Predict` (Studio test + shadow always run fresh). A hit
-returns `cached:true` with **zero usage/cost** (budget gate unaffected), writes
-a `cache_hit=1` run row, and skips the provider entirely. Cache errors are
-misses — Redis going down degrades performance, never predictions.
+interface is the seam). Every key is a SHA-256 over *what determined the output*:
+task id, **deployed prompt version**, the **fully rendered prompt** (template +
+every input/context value), system prompt, temperature, max_tokens, and output
+schema — so deploys, param changes, and schema edits all invalidate implicitly.
+The cache is **two-level**, both written on a clean predict:
+
+1. **Chain-level** — key also pins the **whole fallback structure**
+   (`[primary, ...fallbacks]`). Checked **first**: if the chain is identical to
+   when it was cached, this hits directly. Short TTL (`cache.ChainTTL`, 60s) —
+   it may hold a degraded (fallback-served) answer, so it re-evaluates often.
+2. **Per-model** — key pins a single **model routing key**. Looked up only when
+   the chain-level entry misses (the fallback structure changed, or it expired):
+   the lookup walks the chain and serves the first model with a cached answer.
+   Long TTL (the per-task setting or `DefaultTTL` 24h) — "model X said Y for
+   prompt P" is stable regardless of chain composition.
+
+Fill writes both: the chain entry (whatever model served — **including a
+fallback**) and a per-model entry (under the serving model). A cached answer
+from a non-primary model is still reported `fallback_used` / `X-Platform-
+Degraded`. Only **clean production predicts** are cached: success + output
+schema valid (or no schema), `useCache` set only by `Predict` (Studio test +
+shadow always run fresh); failures and schema-invalid outputs are never cached.
+A hit returns `cached:true` with **zero usage/cost** (budget gate unaffected),
+writes a `cache_hit=1` run row, and skips the provider entirely. Cache errors
+are misses — Redis going down degrades performance, never predictions.
 
 **Pricing** (`pricing.go` + `pricing.json`): `{model: {input_per_1m, output_per_1m}}`.
 `CalculateCost` rounds to 6 decimals; unknown models cost 0. `PricingTable()` backs
@@ -303,6 +330,14 @@ SQLite via `modernc.org/sqlite` (pure Go, no cgo). WAL mode, `busy_timeout=5000`
 `CREATE TABLE IF NOT EXISTS` + guarded `ALTER TABLE ADD COLUMN` (ignore "duplicate
 column") — existing DBs upgrade in place on boot. Follow this pattern for all future
 schema changes.
+
+**Timestamp parsing gotcha:** we write `DATETIME` columns as `"2006-01-02 15:04:05"`
+(`fmtTime`), but the `modernc.org/sqlite` driver recognizes `DATETIME`/`TIMESTAMP`
+columns and round-trips them through `time.Time`, so a value scanned back into a Go
+`string` comes out as **RFC3339** (`"2006-01-02T15:04:05Z"`). `parseTime` (in both
+`internal/tasks/store.go` and `internal/db/queries.go`) therefore tries RFC3339 layouts
+**and** the space-separated form — accepting only one made every version/run timestamp
+read back as the zero time (which surfaced in the UI as `0001-01-01`).
 
 **`runs`** — one row per model call (the trace store):
 
@@ -359,10 +394,11 @@ matrix in §3.3; the Studio playground rows below are open to any authenticated 
 | `GET/DELETE /sessions`, `GET /sessions/{id}` | Playground history (user-scoped) |
 | `POST /feedback {run_id, model, rating}` | 1–5★ upsert |
 | `GET /dashboard` | Per-user usage: totals, by_task, by_model, daily |
-| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. PUT has **merge semantics** — absent fields keep current values |
+| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
 | `POST /v1/tasks/{id}/predict {inputs}` | **The product endpoint** (see below) |
 | `GET /v1/tasks/runs/{run_id}` | Poll a run (becomes async-result fetch in Phase 3) |
 | `GET/POST /v1/tasks/{id}/versions` | Prompt history / save a draft (not activated) |
+| `DELETE /v1/tasks/{id}/versions/{version}` | Prune a prompt version. **admin-only** (`task:delete`); **409** for the active version (deploy another first) |
 | `POST /v1/tasks/{id}/deploy {version}` | Activate a version (Phase 2 eval gate slots here) |
 | `POST /v1/tasks/{id}/test {inputs, version?, model?}` | Run pipeline as `is_test` with prompt/model overrides — Studio test panel |
 | `GET /v1/tasks/{id}/stats?days=N` | Task-scoped totals + daily series, all callers |
@@ -412,16 +448,30 @@ spinner → `LoginScreen` (one-click demo users from `/auth/demo-users`) → `Ap
 client (`src/api/client.ts`) sends `credentials: 'include'` on every call and throws
 typed `ApiError{status}`.
 
-**Pages** (top-nav in `AppShell` — `compare | tasks | estimate | dashboard` — which
-also fetches `/pricing` once and feeds `setPricing`):
+**Pages** (top-nav in `AppShell` — `compare | tasks | versions | estimate | dashboard` —
+which also fetches `/pricing` once and feeds `setPricing`):
 - **Tasks / Studio** (`TasksPage`) — master/detail over the registry. Per task: config
   summary + 30-day usage strip, **model-routing chain editor** (ordered list,
   position 0 = primary; add models from the registry, drag rows to reorder,
-  remove; saves `{model, fallback_models}` via PUT merge), prompt editor with
-  token/cost estimate, **save draft → test (schema-generated input form,
-  version/model overrides, validity badge) → deploy (confirm)**, version
-  history with side-by-side compare. The edit→test→deploy loop runs entirely
-  in the browser.
+  remove; saves `{model, fallback_models}` via PUT merge), **schema editor**
+  (`components/SchemaEditor` + `utils/schema.ts`) — per-schema enable toggle
+  plus a visual **Fields** mode (name / type / required / description, enum for
+  strings, element type for arrays) and a **JSON** mode that round-trips with it
+  and is the escape hatch for anything the field view can't represent (the
+  converter returns null and forces JSON mode rather than dropping data); both
+  schemas save in one PUT, prompt editor with token/cost estimate, **save draft →
+  test (schema-generated input form, version/model overrides, validity badge) →
+  deploy (confirm)**, version history (the reusable `components/VersionHistory`
+  — paginated "show N at a time", side-by-side compare vs the live prompt,
+  deploy, and **admin-only delete** of inactive versions). The
+  edit→test→deploy loop runs entirely in the browser. **All write/deploy/delete
+  actions are role-gated** (`auth/permissions.ts` mirrors the backend matrix —
+  UI gating only; the gateway enforces): non-creators see disabled editors + a
+  read-only banner, only approver/admin see Deploy, only admin sees Delete.
+- **Versions** (`VersionsPage`) — a dedicated, task-agnostic home for prompt
+  history: pick a task on the left, manage its versions on the right via the same
+  `VersionHistory` component the Studio task detail embeds (identical compare /
+  deploy / delete / pagination behaviour).
 - **Compare** (`ComparePage` + `useChat`/`useSessions` + `Sidebar`/`ChatArea`/
   `ChatInput`/`SystemPromptBar`) — N-model side-by-side multi-turn chat, image attach,
   temperature/max-token controls, session history, per-response latency/tokens/cost

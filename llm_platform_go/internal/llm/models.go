@@ -18,9 +18,15 @@ type ModelResult struct {
 	FallbackUsed bool    // served by a model other than the requested primary
 	Degraded     bool    // fallback used, or every model in the chain failed
 
-	// infraFailure marks provider-infrastructure errors (5xx/429/network) as
-	// opposed to config errors — drives fallback advancement and the breaker.
+	// infraFailure marks provider-infrastructure errors (5xx/429/network/timeout)
+	// — drives the circuit breaker.
 	infraFailure bool
+	// fallbackEligible marks errors that should advance the fallback chain to
+	// the next model: infra failures AND provider-config failures (401/403/404,
+	// open circuit, provider not configured) that are specific to one provider
+	// and may not afflict the next. A 400/422 content error is NOT eligible —
+	// the request itself is bad and would fail the same way downstream.
+	fallbackEligible bool
 }
 
 // RunResult aggregates all model results from one /run call.

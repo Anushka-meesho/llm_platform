@@ -7,8 +7,11 @@ description: >
   Extract structured product attributes from a listing's title, description,
   and category. First real task on the platform (CIS prefill shadow target).
 
-model: llama-groq # swap to gemini-flash when the Gemini key is configured
-fallback_models: [gpt-4o-mini] # stored now; fallback execution lands in Phase 1
+# Routing seeds the task only at first creation; after that it's owned at
+# runtime (edit via the API/UI) and survives restarts. Editing model /
+# fallback_models here has no effect on an already-created task.
+model: llama-groq
+fallback_models: [gpt-4o-mini]
 temperature: 0.1
 max_tokens: 800
 daily_budget_usd: 50 # stored now; enforcement lands in Phase 1

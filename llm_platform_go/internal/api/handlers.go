@@ -53,6 +53,21 @@ func requireUser(w http.ResponseWriter, r *http.Request) (*auth.User, bool) {
 	return u, true
 }
 
+// redactedTask returns a task view safe for the given user. Principals without
+// task:view_prompt (service callers) get the prompt template and system prompt
+// blanked — they integrate against the task contract (schemas + metadata), not
+// the prompt internals. Returns a copy so the shared config-cache entry is never
+// mutated; callers with the permission get the original untouched.
+func redactedTask(user *auth.User, t *tasks.Task) *tasks.Task {
+	if user == nil || user.Can(auth.PermTaskViewPrompt) {
+		return t
+	}
+	cp := *t
+	cp.PromptTemplate = ""
+	cp.SystemPrompt = ""
+	return &cp
+}
+
 // POST /run
 func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)

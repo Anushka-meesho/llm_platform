@@ -20,3 +20,9 @@ llm_platform_go/llm_platform_go
 
 # Logs
 *.log
+
+# local dev orchestration (dev.sh)
+.dev/
+
+# Word design docs — kept locally, not tracked/published
+*.docx

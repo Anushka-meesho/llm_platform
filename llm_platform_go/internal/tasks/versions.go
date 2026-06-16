@@ -75,6 +75,32 @@ func (s *Store) ListVersions(taskID string) ([]PromptVersion, error) {
 	return out, rows.Err()
 }
 
+// ErrVersionActive is returned when a caller tries to delete the live version.
+var ErrVersionActive = errors.New("cannot delete the active prompt version")
+
+// DeleteVersion removes a prompt version from the history. The active version
+// (the task's live prompt) can't be deleted — deploy a different version first.
+func (s *Store) DeleteVersion(taskID string, version int) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	task, err := s.getRaw(taskID)
+	if err != nil {
+		return err
+	}
+	if version == task.PromptVersion {
+		return ErrVersionActive
+	}
+	res, err := s.db.Exec(
+		`DELETE FROM prompt_versions WHERE task_id = ? AND version = ?`, taskID, version)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionNotFound
+	}
+	return nil
+}
+
 // GetVersion returns one specific version.
 func (s *Store) GetVersion(taskID string, version int) (*PromptVersion, error) {
 	row := s.db.QueryRow(`
@@ -98,7 +124,9 @@ func (s *Store) GetVersion(taskID string, version int) (*PromptVersion, error) {
 // SaveDraft records a new prompt version WITHOUT activating it. Returns the
 // assigned version number (max existing + 1, so drafts and deploys never collide).
 func (s *Store) SaveDraft(taskID, tmpl, sys, note, by string) (int, error) {
-	if _, err := s.Get(taskID); err != nil {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	if _, err := s.getRaw(taskID); err != nil {
 		return 0, err
 	}
 	if tmpl == "" {
@@ -125,6 +153,8 @@ func (s *Store) SaveDraft(taskID, tmpl, sys, note, by string) (int, error) {
 // NOTE (Phase 2): the eval quality gate slots in here — refuse to deploy a
 // version whose eval run is missing or below the task's thresholds.
 func (s *Store) Deploy(taskID string, version int) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 	v, err := s.GetVersion(taskID, version)
 	if err != nil {
 		return err

@@ -124,6 +124,13 @@ export const api = {
       jsonPost({ version }),
     ),
 
+  // Admin-only server-side (task:delete). Refused (409) for the active version.
+  deleteVersion: (id: string, version: number) =>
+    fetchJSON<{ task_id: string; version: number; status: string }>(
+      `${BASE}/v1/tasks/${id}/versions/${version}`,
+      { method: 'DELETE' },
+    ),
+
   testTask: (
     id: string,
     inputs: Record<string, unknown>,

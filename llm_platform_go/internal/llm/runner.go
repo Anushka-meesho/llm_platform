@@ -27,6 +27,7 @@ var (
 	groqC      = func(c *Clients) Provider { return c.Groq }
 	geminiC    = func(c *Clients) Provider { return c.Gemini }
 	anthropicC = func(c *Clients) Provider { return c.Anthropic }
+	meeshoC    = func(c *Clients) Provider { return c.Meesho }
 )
 
 // registry is the single source of truth for provider routing. Every entry is
@@ -53,6 +54,9 @@ var registry = map[string]providerConfig{
 	"gemini-2.5-flash":      {modelID: "gemini-2.5-flash", provider: "gemini", clientFn: geminiC},
 	"gemini-2.5-flash-lite": {modelID: "gemini-2.5-flash-lite", provider: "gemini", clientFn: geminiC},
 	"gemini-flash":          {modelID: "gemini-2.0-flash", provider: "gemini", clientFn: geminiC},
+
+	// ── Meesho internal gateway (OpenAI-compatible, x-bf-vk virtual key) ─────
+	"meesho-gemini-2.5-flash": {modelID: "vertex/gemini-2.5-flash", provider: "meesho-gateway", clientFn: meeshoC},
 
 	// ── Anthropic (native Messages API — anthropic.go) ──────────────────────
 	"claude-fable-5":    {modelID: "claude-fable-5", provider: "anthropic", clientFn: anthropicC},
@@ -135,13 +139,16 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 
 	provider := cfg.clientFn(clients)
 	if provider == nil {
-		return errResult(modelName, start, "LLM client not configured")
+		r := errResult(modelName, start, "LLM client not configured")
+		r.fallbackEligible = true // unconfigured provider → try the next model
+		return r
 	}
 
 	// Circuit breaker: fail fast while the provider's circuit is open.
 	if !defaultBreakers.Allow(cfg.provider) {
 		r := errResult(modelName, start, "provider circuit open — recent failures, retry shortly")
-		r.infraFailure = true // open circuit counts as infra trouble for fallback
+		r.infraFailure = true     // open circuit counts as infra trouble
+		r.fallbackEligible = true // and advances the fallback chain
 		return r
 	}
 
@@ -189,6 +196,7 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 	if err != nil {
 		r := errResult(modelName, start, classifyError(err))
 		r.infraFailure = isInfraFailure(err)
+		r.fallbackEligible = shouldFallback(err)
 		return r
 	}
 	if len(resp.Choices) == 0 {

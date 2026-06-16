@@ -29,6 +29,16 @@ const (
 	// production. Deliberately distinct from PermTaskWrite so authoring and
 	// publishing can be held by different people.
 	PermTaskDeploy Permission = "task:deploy"
+	// PermTaskDelete — destructive removal (e.g. pruning prompt versions).
+	// Admin-only: it's irreversible and isn't part of the normal author/publish
+	// loop.
+	PermTaskDelete Permission = "task:delete"
+	// PermTaskViewPrompt — see the prompt text itself (template + system prompt
+	// + version history bodies). Held by everyone who works ON tasks; withheld
+	// from service callers, who integrate against the task contract (schema +
+	// metadata) and per the PFS "never touch prompts". A caller still gets task
+	// config, schemas, and its own outputs — just not the prompt internals.
+	PermTaskViewPrompt Permission = "task:view_prompt"
 )
 
 // Defined roles.
@@ -48,11 +58,11 @@ const (
 const DefaultRole = RoleCaller
 
 var rolePermissions = map[string]map[Permission]bool{
-	RoleAdmin:    {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskDeploy: true},
-	RoleCreator:  {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true},
-	RoleApprover: {PermTaskRead: true, PermTaskPredict: true, PermTaskDeploy: true},
+	RoleAdmin:    {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskDeploy: true, PermTaskDelete: true, PermTaskViewPrompt: true},
+	RoleCreator:  {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskViewPrompt: true},
+	RoleApprover: {PermTaskRead: true, PermTaskPredict: true, PermTaskDeploy: true, PermTaskViewPrompt: true},
 	RoleCaller:   {PermTaskRead: true, PermTaskPredict: true},
-	RoleViewer:   {PermTaskRead: true},
+	RoleViewer:   {PermTaskRead: true, PermTaskViewPrompt: true},
 }
 
 // KnownRole reports whether role is a defined role. Used to validate the

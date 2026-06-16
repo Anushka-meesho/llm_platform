@@ -85,6 +85,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		predict := RequirePermission(auth.PermTaskPredict)
 		write := RequirePermission(auth.PermTaskWrite)
 		deploy := RequirePermission(auth.PermTaskDeploy)
+		del := RequirePermission(auth.PermTaskDelete)
 
 		// Task-keyed product API (design doc §4). Note: /v1/tasks/runs/{run_id}
 		// is registered before /v1/tasks/{task_id} routes so "runs" doesn't
@@ -99,6 +100,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		// Prompt registry + Studio (Phase 1).
 		pr.With(read).Get("/v1/tasks/{task_id}/versions", h.ListPromptVersions)
 		pr.With(write).Post("/v1/tasks/{task_id}/versions", h.SaveDraftVersion)
+		pr.With(del).Delete("/v1/tasks/{task_id}/versions/{version}", h.DeleteVersion)
 		pr.With(deploy).Post("/v1/tasks/{task_id}/deploy", h.DeployVersion)
 		pr.With(write).Post("/v1/tasks/{task_id}/test", h.TestTask)
 		pr.With(read).Get("/v1/tasks/{task_id}/stats", h.TaskStats)

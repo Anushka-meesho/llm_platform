@@ -121,6 +121,16 @@ func badRequestServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+func authFailureServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestCallWithFallback(t *testing.T) {
 	ResetBreakers()
 	t.Cleanup(ResetBreakers)
@@ -154,6 +164,27 @@ func TestCallWithFallback(t *testing.T) {
 			[]string{"gpt-4o-mini", "llama-groq"}, msgs, 0.1, 100)
 		if !r.Success || r.FallbackUsed || r.Degraded || r.Model != "gpt-4o-mini" {
 			t.Errorf("unexpected: %+v", r)
+		}
+	})
+
+	t.Run("primary auth failure (401) falls back", func(t *testing.T) {
+		// The reported bug: a misconfigured primary (bad/missing API key → 401)
+		// must advance to a working fallback provider.
+		ResetBreakers()
+		bad := authFailureServer(t)
+		ok := okServer(t, "served-by-fallback")
+		clients := &Clients{
+			OpenAI: NewOpenAICompatProvider(bad.URL, ""),    // primary gpt-4o-mini → 401
+			Gemini: NewOpenAICompatProvider(ok.URL, "k"),    // fallback gemini → ok
+		}
+		r := CallWithFallback(context.Background(), clients,
+			[]string{"gpt-4o-mini", "gemini-flash"}, msgs, 0.1, 100)
+		if !r.Success {
+			t.Fatalf("expected success via fallback after 401, got error: %v", r.Error)
+		}
+		if r.Model != "gemini-flash" || !r.FallbackUsed || !r.Degraded {
+			t.Errorf("401 should advance the chain: model=%s fallback=%v degraded=%v",
+				r.Model, r.FallbackUsed, r.Degraded)
 		}
 	})
 

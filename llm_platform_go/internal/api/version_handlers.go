@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/tasks"
 
@@ -28,6 +29,10 @@ func (h *Handler) resolveTask(w http.ResponseWriter, r *http.Request) (*tasks.Ta
 
 // GET /v1/tasks/{task_id}/versions — prompt history, newest first.
 func (h *Handler) ListPromptVersions(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
 	task, ok := h.resolveTask(w, r)
 	if !ok {
 		return
@@ -36,6 +41,14 @@ func (h *Handler) ListPromptVersions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
 		return
+	}
+	// Callers (no task:view_prompt) get version metadata but not the prompt
+	// bodies. ListVersions returns by-value rows, so blanking here is safe.
+	if !user.Can(auth.PermTaskViewPrompt) {
+		for i := range versions {
+			versions[i].PromptTemplate = ""
+			versions[i].SystemPrompt = ""
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"task_id":        task.ID,
@@ -111,6 +124,36 @@ func (h *Handler) DeployVersion(w http.ResponseWriter, r *http.Request) {
 		"active_version": req.Version,
 		"status":         "deployed",
 	})
+}
+
+// DELETE /v1/tasks/{task_id}/versions/{version}
+// Removes a prompt version from the history. Admin-only (gated by the router).
+// The active version can't be deleted — deploy a different one first.
+func (h *Handler) DeleteVersion(w http.ResponseWriter, r *http.Request) {
+	task, ok := h.resolveTask(w, r)
+	if !ok {
+		return
+	}
+	version, err := strconv.Atoi(chi.URLParam(r, "version"))
+	if err != nil || version <= 0 {
+		writeError(w, http.StatusUnprocessableEntity, "version must be a positive integer")
+		return
+	}
+
+	switch err := h.Tasks.DeleteVersion(task.ID, version); {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"task_id": task.ID,
+			"version": version,
+			"status":  "deleted",
+		})
+	case errors.Is(err, tasks.ErrVersionNotFound):
+		writeError(w, http.StatusNotFound, "version not found")
+	case errors.Is(err, tasks.ErrVersionActive):
+		writeError(w, http.StatusConflict, "cannot delete the active version — deploy another version first")
+	default:
+		writeError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+	}
 }
 
 // POST /v1/tasks/{task_id}/test {inputs, version?, model?}

@@ -72,7 +72,11 @@ type errorBody struct {
 type openAICompatProvider struct {
 	baseURL string
 	apiKey  string
-	client  *http.Client
+	// authHeader, when set, carries apiKey verbatim under this header name
+	// (e.g. the Meesho gateway's "x-bf-vk" virtual key). When empty the standard
+	// "Authorization: Bearer <apiKey>" is used.
+	authHeader string
+	client     *http.Client
 }
 
 func (p *openAICompatProvider) Call(ctx context.Context, req *chatRequest) (*chatResponse, error) {
@@ -86,7 +90,11 @@ func (p *openAICompatProvider) Call(ctx context.Context, req *chatRequest) (*cha
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	if p.authHeader != "" {
+		httpReq.Header.Set(p.authHeader, p.apiKey)
+	} else {
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -132,6 +140,7 @@ type Clients struct {
 	Groq      Provider
 	Gemini    Provider
 	Anthropic Provider // native Messages API (anthropic.go), not OpenAI-compatible
+	Meesho    Provider // Meesho internal gateway (OpenAI-compatible, x-bf-vk auth)
 }
 
 func BuildClients(cfg *config.Config) *Clients {
@@ -161,5 +170,11 @@ func BuildClients(cfg *config.Config) *Clients {
 			client:  sharedHTTPClient,
 		},
 		Anthropic: anthropicProvider,
+		Meesho: &openAICompatProvider{
+			baseURL:    cfg.MeeshoGatewayBaseURL,
+			apiKey:     cfg.MeeshoGatewayVK,
+			authHeader: "x-bf-vk",
+			client:     sharedHTTPClient,
+		},
 	}
 }

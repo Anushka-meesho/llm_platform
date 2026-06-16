@@ -141,6 +141,10 @@ export const MODEL_GROUPS = [
     provider: 'Anthropic',
     models: ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
   },
+  {
+    provider: 'Meesho Gateway',
+    models: ['meesho-gemini-2.5-flash'],
+  },
 ] as const;
 
 // Flat list in registry order — derived from the groups so the two can never

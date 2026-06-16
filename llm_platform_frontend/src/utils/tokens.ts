@@ -36,6 +36,7 @@ const FALLBACK_PRICING: Record<string, Rate> = {
   'gemini-2.5-flash':      { inputPer1M: 0.30,  outputPer1M: 2.50 },
   'gemini-2.5-flash-lite': { inputPer1M: 0.10,  outputPer1M: 0.40 },
   'gemini-flash':          { inputPer1M: 0.075, outputPer1M: 0.30 },
+  'meesho-gemini-2.5-flash': { inputPer1M: 0.30, outputPer1M: 2.50 },
   'claude-fable-5':        { inputPer1M: 10.0,  outputPer1M: 50.0 },
   'claude-opus-4-8':       { inputPer1M: 5.0,   outputPer1M: 25.0 },
   'claude-sonnet-4-6':     { inputPer1M: 3.0,   outputPer1M: 15.0 },

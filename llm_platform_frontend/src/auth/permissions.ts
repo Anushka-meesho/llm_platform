@@ -3,14 +3,20 @@
 // the Studio UI hide or disable actions the current role can't perform, so a
 // user never clicks a button that would 403.
 
-export type Permission = 'task:read' | 'task:predict' | 'task:write' | 'task:deploy';
+export type Permission =
+  | 'task:read'
+  | 'task:predict'
+  | 'task:write'
+  | 'task:deploy'
+  | 'task:delete'
+  | 'task:view_prompt';
 
 const ROLE_PERMISSIONS: Record<string, Permission[]> = {
-  admin: ['task:read', 'task:predict', 'task:write', 'task:deploy'],
-  creator: ['task:read', 'task:predict', 'task:write'],
-  approver: ['task:read', 'task:predict', 'task:deploy'],
+  admin: ['task:read', 'task:predict', 'task:write', 'task:deploy', 'task:delete', 'task:view_prompt'],
+  creator: ['task:read', 'task:predict', 'task:write', 'task:view_prompt'],
+  approver: ['task:read', 'task:predict', 'task:deploy', 'task:view_prompt'],
   caller: ['task:read', 'task:predict'],
-  viewer: ['task:read'],
+  viewer: ['task:read', 'task:view_prompt'],
 };
 
 // Tokens with no role claim resolve to the least-privilege caller role,
