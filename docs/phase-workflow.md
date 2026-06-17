@@ -23,7 +23,8 @@ Platform. Read `docs/repo-guide.md` first (complete current state) and
 4. Keep the Compare UI working unchanged — it is the regression canary for auth,
    sessions, and the playground task path.
 
-**Baseline already delivered (Phase 0, done):** task registry + YAML seeding +
+**Baseline already delivered (Phase 0, done):** task registry (DB-resident, authored via
+the Studio API/UI) +
 `/v1/tasks/{id}/predict` with input/output schema enforcement + task-keyed runs
 (`task_id`, `prompt_version`, `provider`, `fallback_used`, `cache_hit` columns) +
 per-task dashboard + playground stamped as a task + `llm.CallModel` single execution
@@ -92,7 +93,7 @@ versions first-class:
 
 - Migration: `prompt_versions` table — `(task_id, version, prompt_template,
   system_prompt, created_by, created_at, note)`, unique `(task_id, version)`.
-- `tasks.Store`: on every prompt change (API or YAML re-seed), also append to
+- `tasks.Store`: on every prompt change (via the API), also append to
   `prompt_versions`; backfill version 1 rows for existing tasks at migrate time.
 - New endpoints: `GET /v1/tasks/{id}/versions` (history),
   `POST /v1/tasks/{id}/versions` (save draft without activating),
@@ -103,7 +104,7 @@ versions first-class:
   `session_id='studio-test'` marker; pick one and keep dashboards filtered). This backs
   the Studio test panel.
 - **Accept:** edit → versions accumulate; deploy switches `prompt_version` on new runs;
-  YAML re-seed keeps working; history endpoint returns ordered versions.
+  history endpoint returns ordered versions.
 
 ### 1.5 Thin Studio UI (custom, in the existing React app)
 
@@ -159,8 +160,8 @@ tooling:
 
 **Implementation notes for Phase 2 (deviations/learnings):**
 - `PUT /v1/tasks/{id}` uses merge semantics (absent fields keep current values).
-- `Upsert` preserves the `active` flag on YAML re-seed (was a live bug: restart
-  deactivated tasks; regression-tested in `TestLoadYAMLDir`).
+- Tasks are DB-resident and authored via `POST /v1/tasks` (the earlier YAML seed layer
+  was removed); `DELETE /v1/tasks/{id}` is admin-only and protects the `playground` task.
 - Version numbers always advance past drafts (`max(prompt_versions)+1`).
 - Shadow scoring is field-level **exact** match (case-sensitive, numeric-exact) —
   the Phase 2 eval scorers should add normalized/threshold variants.
@@ -307,8 +308,8 @@ prediction demonstrably uses taxonomy context; CIS removes Gemini code (their si
 - **Custom DS models:** `llm.Provider` impl for internal model endpoints
   (`NewOpenAICompatProvider` already covers vLLM-style); registry entries via config
   instead of code.
-- **New teams:** onboarding = a YAML in `tasks.d/` + roles + dataset. Document the
-  contract (repo-guide §3.5) as the onboarding doc.
+- **New teams:** onboarding = create a task in the Studio (`POST /v1/tasks`, creator/admin)
+  + roles + dataset. Document the task contract (repo-guide §3.5) as the onboarding doc.
 - **Native Anthropic provider** when Claude models are added (non-OpenAI wire format —
   implement `Provider` directly).
 - **Postgres migration** when QPS demands it: `internal/db` + `tasks.Store` are the

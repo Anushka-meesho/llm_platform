@@ -128,6 +128,23 @@ func isJSONNull(raw json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
+// DELETE /v1/tasks/{task_id} — permanently remove a task and its prompt
+// history. Gated by task:delete (admin only) at the route. Irreversible.
+func (h *Handler) DeleteTask(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "task_id")
+	err := h.Tasks.Delete(id)
+	switch {
+	case errors.Is(err, tasks.ErrNotFound):
+		writeError(w, http.StatusNotFound, "task not found")
+	case errors.Is(err, tasks.ErrCannotDeletePlayground):
+		writeError(w, http.StatusConflict, err.Error())
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"task_id": id, "status": "deleted"})
+	}
+}
+
 // ── Prediction ───────────────────────────────────────────────────────────────
 
 type predictRequest struct {
@@ -142,19 +159,20 @@ type predictUsage struct {
 }
 
 type predictResponse struct {
-	TaskRunID     string          `json:"task_run_id"`
-	TaskID        string          `json:"task_id"`
-	PromptVersion int             `json:"prompt_version"`
-	Model         string          `json:"model"`
-	Provider      string          `json:"provider"`
-	Output        json.RawMessage `json:"output"`       // parsed JSON when output schema validates; null otherwise
-	OutputValid   *bool           `json:"output_valid"` // null when task has no output schema
-	RawResponse   *string         `json:"raw_response"`
-	Error         *string         `json:"error"`
-	FallbackUsed  bool            `json:"fallback_used"`
-	Cached        bool            `json:"cached"` // served from the prediction cache (zero cost)
-	Usage         predictUsage    `json:"usage"`
-	LatencyMs     int             `json:"latency_ms"`
+	TaskRunID        string          `json:"task_run_id"`
+	TaskID           string          `json:"task_id"`
+	PromptVersion    int             `json:"prompt_version"`
+	Model            string          `json:"model"`
+	Provider         string          `json:"provider"`
+	Output           json.RawMessage `json:"output"`       // parsed JSON when output schema validates; null otherwise
+	OutputValid      *bool           `json:"output_valid"` // null when task has no output schema
+	RawResponse      *string         `json:"raw_response"`
+	Error            *string         `json:"error"`
+	FallbackUsed     bool            `json:"fallback_used"`
+	Cached           bool            `json:"cached"` // served from the prediction cache (zero cost)
+	Usage            predictUsage    `json:"usage"`
+	LatencyMs        int             `json:"latency_ms"`         // winning model's call time
+	GatewayLatencyMs int             `json:"gateway_latency_ms"` // end-to-end platform wall-clock (fallback walk + validation + overhead)
 }
 
 // POST /v1/tasks/{task_id}/predict — the platform's core endpoint:

@@ -108,12 +108,26 @@ export const api = {
 
   getTask: (id: string) => fetchJSON<TTask>(`${BASE}/v1/tasks/${id}`),
 
+  // Author a new task (task:write — creator/admin). The server validates the
+  // id slug, schemas, prompt template, and model, then activates it and seeds
+  // prompt version 1. The DB is the source of truth — this is the only way new
+  // tasks come into existence now that YAML seeding is gone.
+  createTask: (task: Partial<TTask>) =>
+    fetchJSON<TTask>(`${BASE}/v1/tasks`, jsonPost(task)),
+
   // PUT has merge semantics server-side: only the fields present in `patch`
   // change; everything else keeps its current value.
   updateTask: (id: string, patch: Partial<TTask>) =>
     fetchJSON<TTask>(`${BASE}/v1/tasks/${id}`, {
       ...jsonPost(patch),
       method: 'PUT',
+    }),
+
+  // Permanently delete a task and its prompt history (task:delete — admin only,
+  // 403 otherwise; 409 for the built-in playground task). Irreversible.
+  deleteTask: (id: string) =>
+    fetchJSON<{ task_id: string; status: string }>(`${BASE}/v1/tasks/${id}`, {
+      method: 'DELETE',
     }),
 
   listVersions: (id: string) =>

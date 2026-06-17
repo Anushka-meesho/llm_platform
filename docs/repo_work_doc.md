@@ -227,10 +227,11 @@ The full **Task object** (returned by create/get/update/list):
 
 | Method · Path | Perm | Accepts | Returns / notes |
 |---|---|---|---|
-| `POST /v1/tasks` | write | full Task body (`id` slug `[a-z0-9-]{2,64}`, `name`, `prompt_template`, `model` required) | `201` Task · `422` validation (bad slug, unknown model, bad schema/template, temp∉[0,2]) |
+| `POST /v1/tasks` | write | full Task body (`id` slug `[a-z0-9-]{2,64}`, `name`, `prompt_template`, `model` required) | `201` Task · `422` validation (bad slug, unknown model, bad schema/template, temp∉[0,2]). **Tasks are authored here** — there is no file/YAML seeding (see §8) |
 | `GET /v1/tasks` | read | — | `{tasks:[…]}` (prompts blanked without `view_prompt`) |
 | `GET /v1/tasks/{task_id}` | read | — | Task · `404` |
 | `PUT /v1/tasks/{task_id}` | write | **partial** patch (only present fields change; `input_schema:null` removes it) | updated Task · routing changes here. Prompt change bumps `prompt_version` |
+| `DELETE /v1/tasks/{task_id}` | delete | — | `{task_id,status:"deleted"}` · **admin-only** (`task:delete`). Removes the task + its prompt-version history (run rows kept for audit). `404` unknown · `409` for the built-in `playground` task |
 | `POST /v1/tasks/{task_id}/predict` | predict | `{inputs:{…}}` | predict response (below) · `409` inactive · `429` budget · `502` chain failed |
 | `GET /v1/tasks/runs/{run_id}` | read | — | `{run_id,task_id,prompt_version,provider,created_at,results:[…]}` |
 | `GET /v1/tasks/{task_id}/versions` | read | — | `{task_id,active_version,versions:[{version,prompt_template,system_prompt,note,created_by,created_at,active}]}` |
@@ -249,11 +250,15 @@ The full **Task object** (returned by create/get/update/list):
   fallback_used,          // served by a non-primary model
   cached,                 // served from the prediction cache (zero cost)
   usage:{input_tokens,output_tokens,total_tokens,cost_usd},
-  latency_ms }
+  latency_ms,             // the winning model's call time only
+  gateway_latency_ms }    // end-to-end platform wall-clock: validation +
+                          // the whole fallback walk (incl. failed attempts) +
+                          // output validation + cache work. Always ≥ latency_ms;
+                          // the gap is the gateway's own overhead + losing models
 ```
 Header `X-Platform-Degraded: true` is set when a fallback served it or the chain failed.
 
-**Multimodal inputs**: `inputs` may include an `image` (single string) and/or `images` (array of strings) field — base64 data URLs (`data:image/jpeg;base64,…`) or image URLs — when the task declares them. They are attached to the user message as `image_url` blocks for vision models (not rendered into the prompt text), key the cache, and are persisted on the run row. The live `attribute-extraction` task declares both (see §8).
+**Multimodal inputs**: `inputs` may include an `image` (single string) and/or `images` (array of strings) field — base64 data URLs (`data:image/jpeg;base64,…`) or image URLs — when the task declares them. They are attached to the user message as `image_url` blocks for vision models (not rendered into the prompt text), key the cache, and are persisted on the run row. The backend accepts **both** keys for backward compatibility, but the live `attribute-extraction` task now declares only `images` (one-or-many); the client portal renders a single image picker for it (see §8).
 
 ### 5.4 Shadow comparison harness
 
@@ -371,15 +376,17 @@ stateDiagram-v2
 ### Task config & validation
 Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, `fallback_models nil→[]`. Validation: slug id, known model(s), `name`/`prompt_template`/`model` required, `temperature∈[0,2]`, `max_tokens>0`, `cache_ttl_seconds≥0`, schemas must compile, template must parse.
 
-### YAML seeding & routing persistence
-- `tasks.d/*.yaml` files are **upserted** at startup (the onboarding contract). `SeedPlayground` adds a built-in free-form playground task (idempotent).
-- **Routing persistence**: for an *existing* task, the YAML re-seed **preserves** the live `model`/`fallback_models` (and the `active` flag) — routing is seeded only at first creation and thereafter owned at runtime via the API/UI, surviving restarts until someone changes it. Prompt/schema edits in YAML *do* re-apply on restart (and bump the version).
+### Task lifecycle & source of truth
+- **The DB is the single source of truth for tasks.** There is no file/YAML seeding layer — tasks are created, edited, and deleted at runtime through the Studio (`POST/PUT/DELETE /v1/tasks`) and persist in the `tasks` table.
+- **Authoring** (`POST /v1/tasks`, `task:write` → creator/admin): the Studio's *New task* form supplies every field that used to live in a config file (id, name, description, schemas, prompt, model + fallbacks, sampling, budget, cache). The backend validates the slug, schemas, template, and model, activates the task, and seeds prompt version 1.
+- **Deletion** (`DELETE /v1/tasks/{id}`, `task:delete` → admin only): removes the task and its prompt-version history; run rows are kept for audit. The built-in `playground` task is protected (`409`).
+- **Startup seeding** is limited to `SeedPlayground`, which idempotently creates the built-in free-form playground task the Compare UI's `/run` attributes to. A fresh database therefore starts with only that task.
 
 ### Prompt rendering & validation
 - **Render**: Go `text/template` (`{{.field}}`, `{{if .field}}…{{end}}`), compiled templates cached by content hash, `missingkey=error` (referencing an undeclared key fails loudly). Declared input fields are pre-seeded so optional fields work with `{{if}}`.
 - **Input validation**: against `input_schema` (JSON Schema) when present; otherwise any input is accepted.
 - **Output validation**: strips a wrapping markdown code fence, then validates against `output_schema`; returns the cleaned JSON. No schema → raw text, no validation.
-- **Image inputs**: an `image` (string) and/or `images` (array of strings) input field carries base64 data URLs or image URLs. These are **not** rendered into the prompt text (the template only gates on them, e.g. `{{if .images}}…{{end}}`); they're attached to the user message as `image_url` vision blocks. The live `attribute-extraction` task declares both (model `gemini-2.5-flash`, vision; `max_tokens: 2048` so Gemini's hidden "thinking" tokens don't truncate the JSON).
+- **Image inputs**: an `image` (string) and/or `images` (array of strings) input field carries base64 data URLs or image URLs. These are **not** rendered into the prompt text (the template only gates on them, e.g. `{{if .images}}…{{end}}`); they're attached to the user message as `image_url` vision blocks. The backend still accepts both keys, but the live `attribute-extraction` task declares only `images` (one-or-many; model `gemini-2.5-flash`, vision; `max_tokens: 2048` so Gemini's hidden "thinking" tokens don't truncate the JSON). The client portal renders one image picker for it — thumbnails with a corner ✕ and a click-to-zoom lightbox that also offers removal.
 
 ### Prompt version lifecycle
 
@@ -424,7 +431,6 @@ flowchart LR
 | `PORT` | `8000` | HTTP port |
 | `DB_PATH` | `./llm_platform.db` | SQLite file |
 | `PRICING_PATH` | `./pricing.json` | cost table |
-| `TASKS_DIR` | `./tasks.d` | YAML task configs to seed |
 | `OPENAI_API_KEY` / `_BASE_URL` | — / `api.openai.com/v1` | OpenAI |
 | `GROQ_API_KEY` / `_BASE_URL` | — / `api.groq.com/openai/v1` | Groq |
 | `GEMINI_API_KEY` / `_BASE_URL` | — / Gemini OpenAI-compat endpoint | Gemini |
@@ -454,7 +460,7 @@ Single-page app gated by `/auth/me` (spinner → login → app). Navigation live
 | Page | What a user does |
 |---|---|
 | **Compare** (playground) | Pick 2–N models, enter prompt/system prompt (+ images), tune temperature/max tokens, see side-by-side responses (one scrolling `ModelColumn` per model) with latency/tokens/cost, rate 1–5★, browse/load/delete sessions, open the **🏆 Leaderboard** modal (avg ★ per model for the session, via `GET /sessions/{id}/leaderboard`; disabled until a session exists) |
-| **Tasks (Studio)** | Browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model (client-measured round-trip latency); view/compare/deploy version history |
+| **Tasks (Studio)** | **Create a task** (creator/admin — a *New task* form covering id/name/description, model + fallback chain, sampling, budget, cache, prompt, and input/output schemas); browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model (client-measured round-trip latency); view/compare/deploy version history; **delete a task** (admin only) |
 | **Versions** | Dedicated version browser per task: paginated history, compare two versions, deploy (approver/admin), delete (admin) |
 | **Estimate** | Pre-flight token + cost calculator (single or batch) across all models, before spending anything |
 | **Dashboard** | Totals (runs/tokens/spend), per-task and per-model breakdowns, daily spend trend, ratings, success rates |
@@ -463,7 +469,7 @@ Single-page app gated by `/auth/me` (spinner → login → app). Navigation live
 
 The **History** and **Health** tabs render only when `user.role === 'admin'` (the backend `RequireAdmin` is the real gate; the nav check just hides them). **API client** (`src/api/client.ts`): one method per endpoint above — including the admin `adminRuns`/`adminRun`/`adminRunModels` and `modelHealth`/`modelHealthEvents`/`resetModelHealth` — all with `credentials:'include'`; an `ApiError` carries the HTTP status so a `401` can trigger re-auth.
 
-**Client RBAC** (`src/auth/permissions.ts`) mirrors the backend table and hides/disables controls (save draft, deploy, delete) by role — the backend remains the source of truth and enforces every check. Callers without `view_prompt` never receive prompt text.
+**Client RBAC** (`src/auth/permissions.ts`) mirrors the backend table and hides/disables controls by role — create task & save draft (`task:write` → creator/admin), deploy (`task:deploy` → approver/admin), delete task & prune versions (`task:delete` → admin only). The backend remains the source of truth and enforces every check. Callers without `view_prompt` never receive prompt text.
 
 **Notable components/utils**: `SchemaEditor` (dual visual/raw JSON Schema editor), `VersionHistory` (reused by Studio + Versions), `ChatArea`/`ModelColumn`/`MessageBubble` (Compare column layout + response + rating), `LeaderboardModal` (per-session model ranking), `useChat`/`useSessions` hooks, `tokens.ts` (tiktoken counting + cost), `schema.ts` (JSON Schema ↔ field list).
 
@@ -473,7 +479,7 @@ A **second, consumer-facing** React app for teams that *call* the platform (vs. 
 
 - **No login.** Every request carries a long-lived **service JWT** in `Authorization: Bearer`, exactly like a machine caller (e.g. CIS). A working demo token for `svc:demo-client` (signed with the dev `JWT_SECRET`, expires 2036) is baked into `src/auth/token.ts`; `VITE_API_TOKEN` overrides it. The token is decoded client-side **for display only** (`decodePrincipal`) — the backend validates the signature on every request. With no role claim it resolves to the `caller` role (read + predict, prompt text redacted).
 - **Catalog** (`CatalogPage`) — every registered task as a callable API product; inactive tasks are listed but flagged (predict returns 409). The catalog auto-refreshes on window focus and every 30s (so a Studio deploy shows up).
-- **Task detail** (`TaskDetailPage`) — the I/O contract (input/output JSON Schemas), a live **Try it** panel that hits the real `POST /v1/tasks/{id}/predict` (coerces field inputs to the schema type; shows `output_valid`, fallback/degraded/cached badges, model/provider, usage, cost, latency, `task_run_id`; surfaces a 429 budget error with the `Retry-After` window), a 30-day usage chart (all callers), and copy-paste **curl** integration snippets + a copy-token button. **Image fields** render a file picker with inline previews — a single picker for a string `image` field, or a **multi-file picker** (removable preview grid) for an array `images` field — read into base64 data URLs and sent with the predict request.
+- **Task detail** (`TaskDetailPage`) — the I/O contract (input/output JSON Schemas), a live **Try it** panel that hits the real `POST /v1/tasks/{id}/predict` (coerces field inputs to the schema type; shows `output_valid`, fallback/degraded/cached badges, model/provider, usage, cost, `task_run_id`; surfaces a 429 budget error with the `Retry-After` window), a 30-day usage chart (all callers), and copy-paste **curl** integration snippets + a copy-token button. The result card shows **two latencies** — `{gateway_latency_ms}ms gateway / {latency_ms}ms model` plus the computed `(+Nms overhead)` (gateway − model). **Image fields** render a single unified picker (`ImagePicker`) for both string (`image`) and array (`images`) fields — a removable thumbnail grid where each tile has a corner ✕ and opens a click-to-zoom lightbox with its own Remove button; files are read into base64 data URLs and sent with the predict request.
 - **API client** (`src/api/client.ts`): `listTasks`, `getTask`, `predict` (returns `{result, degraded}` reading the `X-Platform-Degraded` header), `getRun`, `taskStats`, `pricing`. `ApiError` carries the status and parsed `Retry-After`. Built with plain Tailwind (no Merlin dependency); proxies `/v1`, `/health`, `/pricing` to `:8000`. Its `types.ts` is a subset mirror of the Go contracts — keep in sync with the Studio's `types/index.ts`.
 
 ---

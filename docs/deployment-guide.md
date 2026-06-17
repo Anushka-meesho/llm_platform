@@ -99,9 +99,12 @@ TOKEN_EXPIRY=8h                                # shorter than the 12h dev defaul
 ALLOWED_ORIGINS=https://llm-platform.meesho.internal
 OPENAI_API_KEY / GROQ_API_KEY / GEMINI_API_KEY # from secret manager
 DB_*            # see §3
-TASKS_DIR=/etc/llm-platform/tasks.d            # mounted config, not repo-relative
 PRICING_PATH=/etc/llm-platform/pricing.json
 ```
+
+Tasks are **not** seeded from files — they live in the DB and are authored at runtime
+through the Studio (`POST /v1/tasks`, creator/admin). There is no `TASKS_DIR` to mount;
+task config is data, carried by the database (back it up / migrate it like any other data).
 
 Delete nothing in `.env` handling — `godotenv.Load()` is a no-op when the file is
 absent, which is exactly right in containers.
@@ -262,15 +265,15 @@ FROM gcr.io/distroless/static-debian12
 COPY --from=build /llm-platform /llm-platform
 COPY --from=ui /ui/dist /static
 COPY llm_platform_go/pricing.json /etc/llm-platform/pricing.json
-COPY llm_platform_go/tasks.d /etc/llm-platform/tasks.d
-ENV STATIC_DIR=/static PRICING_PATH=/etc/llm-platform/pricing.json TASKS_DIR=/etc/llm-platform/tasks.d
+ENV STATIC_DIR=/static PRICING_PATH=/etc/llm-platform/pricing.json
 ENTRYPOINT ["/llm-platform"]
 ```
 
 K8s notes: liveness `/health`, readiness `/readyz`; `terminationGracePeriodSeconds`
 ≥ the drain window (≥ 35s); secrets via env from the secret manager; **replicas: 1 +
-PVC while on SQLite**, unlock HPA only after §3. `tasks.d` as a ConfigMap mount makes
-task onboarding a config rollout (matches the YAML-contract story).
+PVC while on SQLite**, unlock HPA only after §3. Tasks are DB-resident (authored via the
+Studio), so onboarding a task is an API/UI action against the running service, not a config
+rollout — nothing task-shaped needs to be mounted.
 
 ---
 
@@ -285,8 +288,9 @@ task onboarding a config rollout (matches the YAML-contract story).
    callers; consider requiring a non-`svc:` subject for it.
 4. Observability writes never fail or block a prediction (RunWriter semantics).
 5. Budget cap 0 = exempt is the documented escape hatch for critical compliance paths.
-6. YAML re-seed must remain idempotent and must not deactivate tasks (regression test
-   exists — keep it green through the Postgres port).
+6. Tasks are DB-resident, authored via `POST /v1/tasks` (no file seeding) — the database
+   is the source of truth, so back it up and migrate it like any other stateful data
+   through the Postgres port. Only the built-in `playground` task is seeded at boot.
 
 ---
 

@@ -52,6 +52,12 @@ type predictOutcome struct {
 	Output        json.RawMessage // parsed JSON when output schema validates
 	OutputValid   *bool           // nil when the task has no output schema
 	CacheHit      bool            // served from the prediction cache, no provider call
+	// GatewayLatencyMs is the end-to-end wall-clock the platform spent on this
+	// prediction: input validation, prompt render, the whole fallback walk
+	// (including any failed/skipped models and retries), output validation, and
+	// cache work. Result.LatencyMs, by contrast, is only the winning model's
+	// call. Gateway ≥ model; the gap is the platform's own overhead + losers.
+	GatewayLatencyMs int
 }
 
 // httpError carries an HTTP status + detail out of executePrediction.
@@ -64,6 +70,7 @@ type httpError struct {
 // validate input → render prompt → call model chain → validate output → log run.
 // It never writes to the ResponseWriter — callers shape their own responses.
 func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, inputs json.RawMessage, user *auth.User, opts predictOptions) (*predictOutcome, *httpError) {
+	gatewayStart := time.Now()
 	if len(inputs) == 0 {
 		return nil, &httpError{http.StatusUnprocessableEntity, "inputs is required"}
 	}
@@ -191,7 +198,9 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		return h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry), nil
+		cached := h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
+		cached.GatewayLatencyMs = int(time.Since(gatewayStart).Milliseconds())
+		return cached, nil
 	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
@@ -268,11 +277,12 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	h.addSpend(task.ID, result.CostUSD)
 
 	return &predictOutcome{
-		RunID:         runID,
-		PromptVersion: promptVersion,
-		Result:        result,
-		Output:        output,
-		OutputValid:   outputValid,
+		RunID:            runID,
+		PromptVersion:    promptVersion,
+		Result:           result,
+		Output:           output,
+		OutputValid:      outputValid,
+		GatewayLatencyMs: int(time.Since(gatewayStart).Milliseconds()),
 	}, nil
 }
 
@@ -382,6 +392,7 @@ func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
 			TotalTokens:  o.Result.TotalTokens,
 			CostUSD:      o.Result.CostUSD,
 		},
-		LatencyMs: o.Result.LatencyMs,
+		LatencyMs:        o.Result.LatencyMs,
+		GatewayLatencyMs: o.GatewayLatencyMs,
 	}
 }

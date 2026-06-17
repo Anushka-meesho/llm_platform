@@ -20,7 +20,7 @@ does **not** own caller business logic, orchestration, or data preprocessing.
 Python in the hot path. All routing, prompt management, tracing, and eval are built here.
 
 **Current state — Phases 0 + 1 complete:**
-- Task registry (YAML + API), task-keyed prediction endpoint with schema enforcement
+- Task registry (DB-backed, authored via the Studio API/UI), task-keyed prediction endpoint with schema enforcement
 - **Multimodal input:** a task may accept one image (`image`) or many (`images[]`) — base64 data URLs or image URLs — attached to vision models as OpenAI multimodal content blocks (the live `attribute-extraction` task uses this)
 - **Resilient routing:** fallback chains + a **per-provider** circuit breaker **and** a **per-(task, model)** health breaker that skips a model for one task after repeated failures (incl. schema-invalid output) with exponential-backoff cooldown + admin reset, `X-Platform-Degraded` contract
 - **Admin observability:** a cross-tenant **prompt-history** viewer (every user's runs, filterable + paginated) and a **model-health** console (live circuit states + persisted fallback/health events), both admin-only
@@ -67,7 +67,6 @@ llm_platform/
 │   │   ├── tasks/                 # Task registry: model, store, validate, render, seed
 │   │   ├── types/                 # request/response contracts + RunRow
 │   │   └── users/                 # identity seam: Store interface + DemoStore
-│   ├── tasks.d/                   # YAML task configs, seeded at startup
 │   ├── tests/                     # black-box HTTP + DB tests
 │   ├── pricing.json               # per-model $/1M token rates
 │   └── .env                       # local secrets (gitignored)
@@ -104,8 +103,8 @@ llm_platform/
 5. `llm.BuildClients` — one `Provider` per backend (OpenAI/Groq/Gemini/Anthropic).
 6. `llm.StartRecoveryProber(ctx, clients, 15s)` — enables probe-only breakers and
    background health-checks unhealthy providers (see §3.6).
-7. `tasks.NewStore` → `tasks.SeedPlayground` → `tasks.LoadYAMLDir(TASKS_DIR)` — upserts
-   every `tasks.d/*.yaml`; a changed prompt bumps that task's `prompt_version`.
+7. `tasks.NewStore` → `tasks.SeedPlayground` — seeds only the built-in `playground` task.
+   Product tasks live in the DB and are authored at runtime via the Studio (no YAML seeding).
 8. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
 9. `db.NewRunWriter` — async observability writer; `Close()` flushes on shutdown.
 10. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) circuit
@@ -126,7 +125,6 @@ llm_platform/
 | `DB_PATH` | `./llm_platform.db` | SQLite file |
 | `PORT` | `8000` | HTTP port |
 | `PRICING_PATH` | `./pricing.json` | Cost table |
-| `TASKS_DIR` | `./tasks.d` | YAML task configs |
 | `JWT_SECRET` | dev placeholder | Signs session tokens — **set a real one outside dev** |
 | `AUTH_COOKIE_NAME` | `llm_platform_token` | Session cookie |
 | `AUTH_ISSUER` | `llm-platform-demo` | JWT `iss` |
@@ -156,8 +154,8 @@ missing (Phase 1) is a way to mint long-lived service principals distinct from U
 prompt **creator** (authors/iterates), an **approver** (owns the publish gate — Gate 2),
 and a service **caller** (only invokes predict). RBAC encodes that as six capabilities —
 `task:read`, `task:predict`, `task:write` (create/update/draft/test/shadow), `task:deploy`
-(the publish gate, deliberately split from `task:write`), `task:delete` (destructive, e.g.
-pruning prompt versions — admin-only), and `task:view_prompt` (see the prompt text itself —
+(the publish gate, deliberately split from `task:write`), `task:delete` (destructive —
+deleting a whole task or pruning prompt versions; admin-only), and `task:view_prompt` (see the prompt text itself —
 withheld from callers, who integrate against the task contract and "never touch prompts" per
 the PFS) — mapped to five roles:
 
@@ -219,10 +217,10 @@ for out-of-band convergence) so the prediction hot path never reads the DB for
 task config; treat returned `*Task` as immutable. `Update` **auto-bumps
 `prompt_version`** when `PromptTemplate` or `SystemPrompt` changed (next number =
 `max(prompt_versions)+1` so it never collides with drafts) and appends a history row;
-non-prompt updates don't. `Upsert` powers YAML seeding and **preserves the existing
-`active` flag** (YAML doesn't model activation — regression-tested). Version methods:
-`ListVersions` (active flagged), `GetVersion`, `SaveDraft` (records without
-activating), `Deploy` (copies a version into the live config). All SQL is contained
+non-prompt updates don't. `Delete` (admin-only at the route) removes a task and its
+prompt-version history — run rows stay for audit — and refuses the built-in `playground`
+task. Version methods: `ListVersions` (active flagged), `GetVersion`, `SaveDraft` (records
+without activating), `Deploy` (copies a version into the live config). All SQL is contained
 here (Postgres move = this file + `internal/db`).
 
 **Validation** (`validate.go`): `santhosh-tekuri/jsonschema/v6`, compiled schemas cached
@@ -235,18 +233,20 @@ in the input schema but absent from the request are pre-filled with `""` — so
 `{{if .description}}…{{end}}` optional-field guards work, while a template referencing an
 **undeclared** key fails loudly. Parsed templates cached by content hash.
 
-**Seeding** (`seed.go`): `LoadYAMLDir` upserts `*.yaml|*.yml`; `yamlTask` is the
-plug-and-play onboarding contract (schemas written as YAML maps, converted to JSON).
-`SeedPlayground` registers the built-in `playground` task once and never overwrites it.
+**Seeding** (`seed.go`): just `SeedPlayground`, which registers the built-in `playground`
+task once and never overwrites it. **There is no file/YAML seeding** — the DB is the single
+source of truth for tasks; product tasks are authored, edited, and deleted at runtime through
+the Studio (`POST/PUT/DELETE /v1/tasks`). A fresh database starts with only the playground
+task.
 
-**YAML contract example** — `tasks.d/attribute-extraction.yaml` (live, working):
-input `{title*, description, category*, brand, image, images[]}` → output
+**Task config example** — `attribute-extraction` (live, created via the Studio):
+input `{title*, description, category*, brand, images[]}` → output
 `{attributes: {string: string}, confidence: 0..1}`, model `gemini-2.5-flash` (vision),
 fallback `[gpt-4o-mini]` (vision), budget $50/day, `max_tokens: 2048` (Gemini 2.5 Flash
 spends hidden "thinking" tokens from the same budget; a tight cap truncates the JSON →
-schema-invalid), `cache: {enabled: true, ttl: 24h}`. The optional `image` (single string)
-and `images` (array of strings) fields take base64 data URLs or image URLs and are attached
-to the vision model as multimodal content blocks — see §3.6 (Multimodal input).
+schema-invalid), cache enabled at 24h TTL. The `images` (array of strings) field takes base64
+data URLs or image URLs and is attached to the vision model as multimodal content blocks
+(the backend still accepts a legacy single `image` string too) — see §3.6 (Multimodal input).
 
 ### 3.6 Model layer — `internal/llm`
 
@@ -472,7 +472,8 @@ matrix in §3.3; the Studio playground rows below are open to any authenticated 
 | `GET /sessions/{id}/leaderboard` | Per-session model leaderboard: avg manual ★ per model (`{session_id, entries:[{model, avg_score, rating_count}]}`), ordered by score. User-scoped; the SQL selects the session's `run_id`s in a subquery so each `feedback` row counts once (a fan-out stores one `runs` row per model under one `run_id`, so a naive join inflates) |
 | `POST /feedback {run_id, model, rating}` | 1–5★ upsert |
 | `GET /dashboard` | Per-user usage: totals, by_task, by_model, daily |
-| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
+| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. **`POST` is how tasks are authored** (`task:write` → creator/admin; no YAML seeding). PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
+| `DELETE /v1/tasks/{id}` | Delete a whole task + its prompt-version history (run rows kept for audit). **admin-only** (`task:delete`); **404** unknown · **409** for the built-in `playground` task |
 | `POST /v1/tasks/{id}/predict {inputs}` | **The product endpoint** (see below) |
 | `GET /v1/tasks/runs/{run_id}` | Poll a run (becomes async-result fetch in Phase 3) |
 | `GET/POST /v1/tasks/{id}/versions` | Prompt history / save a draft (not activated) |
@@ -523,8 +524,12 @@ included):
   "output": {…}, "output_valid": true, "raw_response": "…", "error": null,
   "cached": false,
   "usage": {"input_tokens":172,"output_tokens":53,"total_tokens":225,"cost_usd":1.3e-05},
-  "latency_ms": 696 }
+  "latency_ms": 696, "gateway_latency_ms": 712 }
 ```
+`latency_ms` is the winning model's call time; `gateway_latency_ms` is the end-to-end
+platform wall-clock (input validation + the whole fallback walk, including failed attempts,
++ output validation + cache work). Gateway ≥ model; the client portal shows both plus the
+computed `(+Nms overhead)`.
 
 ---
 
@@ -545,7 +550,13 @@ typed `ApiError{status}`.
 **Pages** (top-nav in `AppShell` — `compare | tasks | versions | estimate | dashboard`,
 plus `history | health` shown **only to admins** (`user.role === 'admin'`) — which also
 fetches `/pricing` once and feeds `setPricing`):
-- **Tasks / Studio** (`TasksPage`) — master/detail over the registry. Per task: config
+- **Tasks / Studio** (`TasksPage`) — master/detail over the registry. A **+ New** button
+  (creator/admin) opens a `CreateTaskForm` that authors a task from scratch — id (live slug +
+  duplicate check), name, description, primary model + fallback chain, temperature, max
+  tokens, daily budget, cache on/off + TTL, system prompt, prompt template, and optional
+  input/output schemas (reusing `SchemaEditor`) — and POSTs it to `/v1/tasks`. The detail
+  header carries an **admin-only Delete task** button (confirm → `DELETE /v1/tasks/{id}`,
+  refuses `playground`). Per task: config
   summary + 30-day usage strip, **model-routing chain editor** (ordered list,
   position 0 = primary; add models from the registry, drag rows to reorder,
   remove; saves `{model, fallback_models}` via PUT merge), **schema editor**
@@ -654,7 +665,7 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
 - `schema_update_test.go` — PUT merge semantics for schemas, incl. `"input_schema": null`
   clearing one.
 - `tasks_test.go` — registry CRUD, prompt-version bump rules, schema/template
-  validation, fenced-output parsing, YAML seed + re-seed version bump.
+  validation, fenced-output parsing.
 - `predict_test.go` — full predict pipeline against a fake OpenAI-compatible server:
   happy path (attribution, usage, parsed output), 422 input cases, invalid-output
   flagging, 404, playground stamping, dashboard by_task, **single + multiple image

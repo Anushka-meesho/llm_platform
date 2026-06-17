@@ -58,20 +58,12 @@ func main() {
 	llm.StartRecoveryProber(proberCtx, clients, 15*time.Second)
 	log.Printf("recovery prober: started (15s interval, probe-only breakers)")
 
-	// Task registry — seed the built-in playground task and any tasks.d/*.yaml
-	// configs (the plug-and-play onboarding contract).
+	// Task registry — the DB is the single source of truth for tasks. Only the
+	// built-in playground task is seeded; all product tasks are authored at
+	// runtime through the Studio (POST /v1/tasks) and persist in the DB.
 	taskStore := tasks.NewStore(database)
 	if err := tasks.SeedPlayground(taskStore); err != nil {
 		log.Fatalf("seed playground task: %v", err)
-	}
-	tasksDir := os.Getenv("TASKS_DIR")
-	if tasksDir == "" {
-		tasksDir = "./tasks.d"
-	}
-	if n, err := tasks.LoadYAMLDir(taskStore, tasksDir); err != nil {
-		log.Fatalf("load task configs from %s: %v", tasksDir, err)
-	} else if n > 0 {
-		log.Printf("loaded %d task config(s) from %s", n, tasksDir)
 	}
 
 	// User store — the swap seam. Replace NewDemoStore with a real Store impl

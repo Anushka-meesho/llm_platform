@@ -113,6 +113,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.With(read).Get("/v1/tasks", h.ListTasks)
 		pr.With(read).Get("/v1/tasks/{task_id}", h.GetTask)
 		pr.With(write).Put("/v1/tasks/{task_id}", h.UpdateTask)
+		pr.With(del).Delete("/v1/tasks/{task_id}", h.DeleteTask)
 		pr.With(predict).Post("/v1/tasks/{task_id}/predict", h.Predict)
 
 		// Prompt registry + Studio (Phase 1).
