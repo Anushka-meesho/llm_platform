@@ -9,12 +9,31 @@ import (
 	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/db"
+	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
 
 	"github.com/google/uuid"
 )
+
+// taskHealthGate adapts the per-(task, model) circuit breaker to llm.HealthGate,
+// binding every call to one task id and resolving the provider name for events.
+type taskHealthGate struct {
+	tracker *health.Tracker
+	taskID  string
+}
+
+func (g taskHealthGate) Allow(model string) bool {
+	ok, _ := g.tracker.Allow(g.taskID, model)
+	return ok
+}
+func (g taskHealthGate) RecordSuccess(model string) {
+	g.tracker.RecordSuccess(g.taskID, model, llm.ProviderName(model))
+}
+func (g taskHealthGate) RecordFailure(model, reason string) {
+	g.tracker.RecordFailure(g.taskID, model, llm.ProviderName(model), reason)
+}
 
 // predictOptions tweak one prediction execution.
 type predictOptions struct {
@@ -148,8 +167,26 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
-	result := llm.CallWithFallbackCached(ctx, h.Clients, models, messages,
-		float32(task.Temperature), task.MaxTokens, modelLookup)
+	// Circuit-breaker health gating + schema-aware fallback apply to production
+	// predicts only (the real fallback chain). Studio test panels and shadow
+	// runs (useCache=false) or single-model overrides run the model as asked,
+	// without skipping it or feeding production health.
+	fbOpts := llm.FallbackOptions{Lookup: modelLookup}
+	if opts.useCache && opts.overrideModel == "" {
+		if h.Health.Enabled() {
+			fbOpts.Gate = taskHealthGate{tracker: h.Health, taskID: task.ID}
+		}
+		if len(task.OutputSchema) > 0 {
+			vt := task // capture for the validator closure
+			fbOpts.Validate = func(text string) bool {
+				_, err := tasks.ValidateOutput(vt, text)
+				return err == nil
+			}
+		}
+	}
+
+	result := llm.CallWithFallbackOpts(ctx, h.Clients, models, messages,
+		float32(task.Temperature), task.MaxTokens, fbOpts)
 
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.

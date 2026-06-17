@@ -155,6 +155,70 @@ func GetRunByID(db *sql.DB, userID, runID string) ([]types.RunRow, error) {
 	return result, rows.Err()
 }
 
+// InsertHealthEvent persists one (task, model) circuit transition for later
+// observation. created_at is supplied so it matches the in-memory event time.
+func InsertHealthEvent(db *sql.DB, e *types.HealthEvent) error {
+	_, err := db.Exec(`
+		INSERT INTO model_health_events
+			(task_id, model, provider, event, reason, consecutive_failures, cooldown_ms, state, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		e.TaskID, e.Model, e.Provider, e.Event, e.Reason,
+		e.ConsecutiveFailures, e.CooldownMs, e.State,
+		e.CreatedAt.UTC().Format("2006-01-02 15:04:05"),
+	)
+	return err
+}
+
+// ListHealthEvents returns one page of health events, newest first, optionally
+// filtered by task and/or model, with their total count for pagination.
+func ListHealthEvents(db *sql.DB, taskID, model string, page, pageSize int) ([]types.HealthEvent, int, error) {
+	var clauses []string
+	var args []any
+	if taskID != "" {
+		clauses = append(clauses, "task_id = ?")
+		args = append(args, taskID)
+	}
+	if model != "" {
+		clauses = append(clauses, "model = ?")
+		args = append(args, model)
+	}
+	whereSQL := ""
+	if len(clauses) > 0 {
+		whereSQL = " WHERE " + strings.Join(clauses, " AND ")
+	}
+
+	var total int
+	if err := db.QueryRow("SELECT COUNT(*) FROM model_health_events"+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	qArgs := append(append([]any{}, args...), pageSize, offset)
+	rows, err := db.Query(`
+		SELECT id, task_id, model, provider, event, reason,
+		       consecutive_failures, cooldown_ms, state, created_at
+		FROM model_health_events`+whereSQL+`
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?`, qArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	events := []types.HealthEvent{}
+	for rows.Next() {
+		var e types.HealthEvent
+		var createdAtStr string
+		if err := rows.Scan(&e.ID, &e.TaskID, &e.Model, &e.Provider, &e.Event, &e.Reason,
+			&e.ConsecutiveFailures, &e.CooldownMs, &e.State, &createdAtStr); err != nil {
+			return nil, 0, err
+		}
+		e.CreatedAt = parseTime(createdAtStr)
+		events = append(events, e)
+	}
+	return events, total, rows.Err()
+}
+
 // RunFilter narrows the admin prompt-history list. Zero-value fields are
 // ignored, so an empty filter lists every run.
 type RunFilter struct {

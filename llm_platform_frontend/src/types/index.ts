@@ -239,6 +239,50 @@ export type TRunFilters = {
   type?: '' | 'production' | 'test';
 };
 
+// ── Admin: model health (per-(task, model) circuit breaker) ───────────────────
+
+export type TModelHealthStatus = {
+  task_id: string;
+  model: string;
+  provider: string;
+  state: 'healthy' | 'unhealthy' | 'probing';
+  consecutive_failures: number;
+  total_failures: number;
+  total_successes: number;
+  trips: number;
+  cooldown_ms: number;
+  open_for_seconds: number;
+  last_reason: string;
+  last_error: string;
+  last_change: string;
+};
+
+export type TModelHealthResponse = {
+  enabled: boolean;
+  statuses: TModelHealthStatus[];
+};
+
+export type THealthEvent = {
+  id: number;
+  task_id: string;
+  model: string;
+  provider: string;
+  event: 'failure' | 'tripped' | 'recovered' | 'manual_reset';
+  reason: string;
+  consecutive_failures: number;
+  cooldown_ms: number;
+  state: string;
+  created_at: string;
+};
+
+export type THealthEventsResponse = {
+  page: number;
+  page_size: number;
+  total_count: number;
+  total_pages: number;
+  events: THealthEvent[];
+};
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 export type TUser = {

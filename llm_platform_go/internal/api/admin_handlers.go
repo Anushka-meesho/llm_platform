@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"llm_platform_go/internal/db"
@@ -96,4 +97,81 @@ func (h *Handler) AdminRunModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
+}
+
+// AdminModelHealth returns the live circuit state of every tracked
+// (task, model). Admin-only.
+//
+// GET /v1/admin/model-health
+func (h *Handler) AdminModelHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, types.ModelHealthResponse{
+		Enabled:  h.Health.Enabled(),
+		Statuses: h.Health.Snapshot(),
+	})
+}
+
+// AdminResetModelHealth forces one (task, model) back to healthy — the admin
+// override. Admin-only.
+//
+// POST /v1/admin/model-health/reset  {"task_id":"…","model":"…"}
+func (h *Handler) AdminResetModelHealth(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		TaskID string `json:"task_id"`
+		Model  string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid JSON body")
+		return
+	}
+	if req.TaskID == "" || req.Model == "" {
+		writeError(w, http.StatusUnprocessableEntity, "task_id and model are required")
+		return
+	}
+	if h.Health == nil || !h.Health.Reset(req.TaskID, req.Model, user.Email) {
+		writeError(w, http.StatusNotFound, "no health state tracked for that task/model")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"task_id": req.TaskID,
+		"model":   req.Model,
+		"state":   "healthy",
+	})
+}
+
+// AdminModelHealthEvents returns the persisted health/fallback events, newest
+// first, optionally filtered by task and/or model. Admin-only.
+//
+// GET /v1/admin/model-health/events?task_id=&model=&page=&page_size=
+func (h *Handler) AdminModelHealthEvents(w http.ResponseWriter, r *http.Request) {
+	page := queryIntOrDefault(r, "page", 1)
+	if page < 1 {
+		page = 1
+	}
+	pageSize := queryIntOrDefault(r, "page_size", 50)
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+	taskID := r.URL.Query().Get("task_id")
+	model := r.URL.Query().Get("model")
+
+	events, total, err := db.ListHealthEvents(h.DB, taskID, model, page, pageSize)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, types.HealthEventsResponse{
+		Page:       page,
+		PageSize:   pageSize,
+		TotalCount: total,
+		TotalPages: db.TotalPages(total, pageSize),
+		Events:     events,
+	})
 }

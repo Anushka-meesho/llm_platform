@@ -14,6 +14,8 @@ import type {
   TRunListResponse,
   TRunDetail,
   TRunFilters,
+  TModelHealthResponse,
+  THealthEventsResponse,
 } from '../types';
 
 const BASE = '';
@@ -171,6 +173,24 @@ export const api = {
 
   adminRunModels: () =>
     fetchJSON<{ models: string[] }>(`${BASE}/v1/admin/runs/models`),
+
+  // Per-(task, model) circuit-breaker health.
+  modelHealth: () => fetchJSON<TModelHealthResponse>(`${BASE}/v1/admin/model-health`),
+
+  resetModelHealth: (taskId: string, model: string) =>
+    fetchJSON<{ status: string }>(
+      `${BASE}/v1/admin/model-health/reset`,
+      jsonPost({ task_id: taskId, model }),
+    ),
+
+  modelHealthEvents: (taskId = '', model = '', page = 1, pageSize = 50) => {
+    const p = new URLSearchParams();
+    p.set('page', String(page));
+    p.set('page_size', String(pageSize));
+    if (taskId) p.set('task_id', taskId);
+    if (model) p.set('model', model);
+    return fetchJSON<THealthEventsResponse>(`${BASE}/v1/admin/model-health/events?${p.toString()}`);
+  },
 
   health: () => fetchJSON<{ status: string }>(`${BASE}/health`),
 };

@@ -4,7 +4,7 @@ import "time"
 
 type ModelResultResponse struct {
 	Model        string  `json:"model"`
-	Response     *string `json:"response"`      // null on failure
+	Response     *string `json:"response"` // null on failure
 	LatencyMs    int     `json:"latency_ms"`
 	InputTokens  int     `json:"input_tokens"`
 	OutputTokens int     `json:"output_tokens"`
@@ -176,6 +176,56 @@ type RunDetailResponse struct {
 	IsTest        bool              `json:"is_test"`
 	CreatedAt     time.Time         `json:"created_at"`
 	Results       []RunDetailResult `json:"results"`
+}
+
+// ── Model health (per-(task, model) circuit breaker) ──────────────────────────
+
+// HealthEvent is one transition/observation in a (task, model)'s health, both
+// the row persisted to model_health_events and the API shape. event is one of
+// "failure" (a counted failure below threshold), "tripped" (became unhealthy),
+// "recovered" (a probe succeeded → healthy again), or "manual_reset".
+type HealthEvent struct {
+	ID                  int       `json:"id"`
+	TaskID              string    `json:"task_id"`
+	Model               string    `json:"model"`
+	Provider            string    `json:"provider"`
+	Event               string    `json:"event"`
+	Reason              string    `json:"reason"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	CooldownMs          int       `json:"cooldown_ms"`
+	State               string    `json:"state"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+type HealthEventsResponse struct {
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	TotalCount int           `json:"total_count"`
+	TotalPages int           `json:"total_pages"`
+	Events     []HealthEvent `json:"events"`
+}
+
+// ModelHealthStatus is the live circuit state for one (task, model), as served
+// to the admin health page. State is "healthy", "unhealthy", or "probing".
+type ModelHealthStatus struct {
+	TaskID              string    `json:"task_id"`
+	Model               string    `json:"model"`
+	Provider            string    `json:"provider"`
+	State               string    `json:"state"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	TotalFailures       int       `json:"total_failures"`
+	TotalSuccesses      int       `json:"total_successes"`
+	Trips               int       `json:"trips"`            // times it has gone unhealthy (drives backoff)
+	CooldownMs          int       `json:"cooldown_ms"`      // current cooldown window
+	OpenForSeconds      int       `json:"open_for_seconds"` // remaining unhealthy seconds (0 if not open)
+	LastReason          string    `json:"last_reason"`
+	LastError           string    `json:"last_error"`
+	LastChange          time.Time `json:"last_change"`
+}
+
+type ModelHealthResponse struct {
+	Enabled  bool                `json:"enabled"`
+	Statuses []ModelHealthStatus `json:"statuses"`
 }
 
 // ── Feedback ────────────────────────────────────────────────────────────────

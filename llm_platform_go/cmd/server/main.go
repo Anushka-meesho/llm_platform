@@ -12,6 +12,7 @@ import (
 	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/config"
 	"llm_platform_go/internal/db"
+	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
@@ -87,6 +88,26 @@ func main() {
 	runWriter := db.NewRunWriter(database, 0)
 	defer runWriter.Close()
 
+	// Per-(task, model) circuit breaker — skips a model in a task's fallback
+	// chain after repeated failures (provider errors OR schema-invalid output),
+	// with exponential backoff and admin reset. Transitions persist to
+	// model_health_events via an async writer for observation.
+	healthWriter := db.NewHealthEventWriter(database, 0)
+	defer healthWriter.Close()
+	healthTracker := health.NewTracker(health.Config{
+		Enabled:      cfg.HealthBreakerEnabled,
+		Threshold:    cfg.HealthThreshold,
+		BaseCooldown: cfg.HealthBaseCooldown,
+		MaxCooldown:  cfg.HealthMaxCooldown,
+		Factor:       2,
+	}, healthWriter.Write)
+	if cfg.HealthBreakerEnabled {
+		log.Printf("model health breaker: on (threshold=%d, cooldown %s→%s, ×2 backoff)",
+			cfg.HealthThreshold, cfg.HealthBaseCooldown, cfg.HealthMaxCooldown)
+	} else {
+		log.Printf("model health breaker: off")
+	}
+
 	// Prediction cache — Redis in production, in-process memory for dev boxes
 	// without Redis, off otherwise. Tasks opt in via cache_enabled.
 	var predictionCache cache.Cache
@@ -112,6 +133,7 @@ func main() {
 		Tasks:   taskStore,
 		Runs:    runWriter,
 		Cache:   predictionCache,
+		Health:  healthTracker,
 		Auth: api.AuthConfig{
 			Secret:      []byte(cfg.JWTSecret),
 			CookieName:  cfg.AuthCookieName,

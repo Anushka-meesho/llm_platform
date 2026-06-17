@@ -51,6 +51,16 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 	CacheBackend  string // "redis" | "memory" | "off" (derived when empty)
+
+	// Per-(task, model) circuit breaker. After HealthThreshold consecutive
+	// failures (provider errors OR schema-invalid output) a model is skipped for
+	// that task for HealthBaseCooldown, doubling on each re-trip up to
+	// HealthMaxCooldown. Set HEALTH_BREAKER_ENABLED=false to route every model
+	// every time regardless of recent failures.
+	HealthBreakerEnabled bool
+	HealthThreshold      int
+	HealthBaseCooldown   time.Duration
+	HealthMaxCooldown    time.Duration
 }
 
 func Load() (*Config, error) {
@@ -82,6 +92,11 @@ func Load() (*Config, error) {
 		RedisPassword: os.Getenv("REDIS_PASSWORD"),
 		RedisDB:       getEnvInt("REDIS_DB", 0),
 		CacheBackend:  os.Getenv("CACHE_BACKEND"),
+
+		HealthBreakerEnabled: getEnvBool("HEALTH_BREAKER_ENABLED", true),
+		HealthThreshold:      getEnvInt("HEALTH_FAILURE_THRESHOLD", 3),
+		HealthBaseCooldown:   getEnvDuration("HEALTH_BASE_COOLDOWN", 30*time.Second),
+		HealthMaxCooldown:    getEnvDuration("HEALTH_MAX_COOLDOWN", 30*time.Minute),
 	}
 	if cfg.CacheBackend == "" {
 		if cfg.RedisAddr != "" {

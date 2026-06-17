@@ -104,6 +104,21 @@ func Migrate(db *sql.DB) error {
 			created_at     DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
 		CREATE INDEX IF NOT EXISTS idx_shadow_task ON shadow_reports(task_id);
+
+		CREATE TABLE IF NOT EXISTS model_health_events (
+			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id              TEXT NOT NULL,
+			model                TEXT NOT NULL,
+			provider             TEXT NOT NULL DEFAULT '',
+			event                TEXT NOT NULL, -- failure | tripped | recovered | manual_reset
+			reason               TEXT NOT NULL DEFAULT '',
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			cooldown_ms          INTEGER NOT NULL DEFAULT 0,
+			state                TEXT NOT NULL DEFAULT '',
+			created_at           DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_health_task_model ON model_health_events(task_id, model);
+		CREATE INDEX IF NOT EXISTS idx_health_created_at ON model_health_events(created_at);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
