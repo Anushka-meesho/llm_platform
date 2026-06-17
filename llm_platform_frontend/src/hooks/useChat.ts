@@ -84,6 +84,10 @@ export const useChat = () => {
         newConvs[r.model].push(userMsg, assistantMsg);
       }
     }
+    const sessionModels = [
+      ...new Set(detail.turns.flatMap((turn) => turn.results.map((r) => r.model))),
+    ];
+    setSelectedModels(sessionModels);
     setConversations(newConvs);
     setSessionId(detail.session_id);
     setSystemPrompt('');
