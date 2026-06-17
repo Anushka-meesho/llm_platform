@@ -1,26 +1,11 @@
 {
-  "gpt-5.1":               { "input_per_1m": 1.250, "output_per_1m": 10.000 },
-  "gpt-5":                 { "input_per_1m": 1.250, "output_per_1m": 10.000 },
-  "gpt-5-mini":            { "input_per_1m": 0.250, "output_per_1m": 2.000 },
-  "gpt-5-nano":            { "input_per_1m": 0.050, "output_per_1m": 0.400 },
-  "gpt-4.1":               { "input_per_1m": 2.000, "output_per_1m": 8.000 },
-  "gpt-4.1-mini":          { "input_per_1m": 0.400, "output_per_1m": 1.600 },
-  "gpt-4.1-nano":          { "input_per_1m": 0.100, "output_per_1m": 0.400 },
   "gpt-4o":                { "input_per_1m": 2.500, "output_per_1m": 10.000 },
   "gpt-4o-mini":           { "input_per_1m": 0.150, "output_per_1m": 0.600 },
 
   "llama-groq":            { "input_per_1m": 0.050, "output_per_1m": 0.080 },
 
-  "gemini-3-pro":          { "input_per_1m": 2.000, "output_per_1m": 12.000 },
   "gemini-2.5-pro":        { "input_per_1m": 1.250, "output_per_1m": 10.000 },
   "gemini-2.5-flash":      { "input_per_1m": 0.300, "output_per_1m": 2.500 },
-  "gemini-2.5-flash-lite": { "input_per_1m": 0.100, "output_per_1m": 0.400 },
-  "gemini-flash":          { "input_per_1m": 0.075, "output_per_1m": 0.300 },
 
-  "meesho-gemini-2.5-flash": { "input_per_1m": 0.300, "output_per_1m": 2.500 },
-
-  "claude-fable-5":        { "input_per_1m": 10.000, "output_per_1m": 50.000 },
-  "claude-opus-4-8":       { "input_per_1m": 5.000, "output_per_1m": 25.000 },
-  "claude-sonnet-4-6":     { "input_per_1m": 3.000, "output_per_1m": 15.000 },
-  "claude-haiku-4-5":      { "input_per_1m": 1.000, "output_per_1m": 5.000 }
+  "claude-sonnet-4-6":     { "input_per_1m": 3.000, "output_per_1m": 15.000 }
 }

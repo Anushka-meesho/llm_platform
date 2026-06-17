@@ -132,19 +132,19 @@ export const useChat = () => {
           }));
         }
 
-        const result = await api.run({
-          prompt: text,
-          models: selectedModels,
-          model_conversations: modelConvs,
-          temperature,
-          max_tokens: maxOutputTokens,
-          session_id: sid,
-          system_prompt: systemPrompt || undefined,
-        });
-
-        setConversations((prev) => {
-          const next = { ...prev };
-          for (const r of result.results) {
+        // One call per model — update each column as its response arrives (first come first served)
+        const perModelPromises = selectedModels.map(async (model) => {
+          const result = await api.run({
+            prompt: text,
+            models: [model],
+            model_conversations: { [model]: modelConvs[model] ?? [] },
+            temperature,
+            max_tokens: maxOutputTokens,
+            session_id: sid,
+            system_prompt: systemPrompt || undefined,
+          });
+          const r = result.results?.[0];
+          if (r) {
             const assistantMsg: TAssistantUIMessage = {
               role: 'assistant',
               content: r.success ? (r.response ?? '') : `⚠️ ${r.error}`,
@@ -155,10 +155,34 @@ export const useChat = () => {
               run_id: result.run_id,
               model: r.model,
             };
-            next[r.model] = [...(prev[r.model] ?? []), assistantMsg];
+            setConversations((prev) => ({
+              ...prev,
+              [model]: [...(prev[model] ?? []), assistantMsg],
+            }));
           }
-          return next;
         });
+
+        const outcomes = await Promise.allSettled(perModelPromises);
+        const failedIndices = outcomes
+          .map((o, i) => (o.status === 'rejected' ? i : -1))
+          .filter((i) => i !== -1);
+
+        if (failedIndices.length > 0) {
+          const firstReason = (outcomes[failedIndices[0]] as PromiseRejectedResult).reason;
+          setError(
+            firstReason instanceof Error
+              ? firstReason.message
+              : 'Backend unreachable. Is the Go server running on port 8000?',
+          );
+          setConversations((prev) => {
+            const next = { ...prev };
+            for (const i of failedIndices) {
+              const model = selectedModels[i];
+              next[model] = (prev[model] ?? []).slice(0, -1);
+            }
+            return next;
+          });
+        }
       } catch (err) {
         setError(
           err instanceof Error ? err.message : 'Backend unreachable. Is the Go server running on port 8000?',

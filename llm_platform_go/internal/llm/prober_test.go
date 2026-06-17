@@ -72,7 +72,7 @@ func TestProberClosesCircuitWhenProviderRecovers(t *testing.T) {
 	defaultBreakers.SetProbeOnly(true)
 
 	srv, healthy, _ := flakyProvider(t)
-	clients := &Clients{OpenAI: NewOpenAICompatProvider(srv.URL, "test-key")}
+	clients := &Clients{Meesho: NewOpenAICompatProvider(srv.URL, "test-key")}
 
 	tripBreaker("openai")
 	if got := defaultBreakers.State("openai"); got != "open" {
@@ -106,7 +106,7 @@ func TestTrafficReturnsToPrimaryAfterProbeRecovery(t *testing.T) {
 	fallbackHealthy.Store(true)
 
 	clients := &Clients{
-		OpenAI: NewOpenAICompatProvider(primarySrv.URL, "k"), // gpt-4o-mini
+		Meesho: NewOpenAICompatProvider(primarySrv.URL, "k"), // gpt-4o-mini via bifrost
 		Groq:   NewOpenAICompatProvider(fallbackSrv.URL, "k"), // llama-groq
 	}
 	chain := []string{"gpt-4o-mini", "llama-groq"}

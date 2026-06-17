@@ -264,7 +264,7 @@ input_schema:
 		t.Fatalf("Get: %v", err)
 	}
 	edited := *got
-	edited.Model = "gemini-flash"
+	edited.Model = "gemini-2.5-flash"
 	edited.FallbackModels = []string{"gpt-4o-mini"}
 	if err := store.Update(&edited); err != nil {
 		t.Fatalf("Update routing: %v", err)
@@ -278,8 +278,8 @@ input_schema:
 	if err != nil {
 		t.Fatalf("Get after re-seed: %v", err)
 	}
-	if after.Model != "gemini-flash" {
-		t.Errorf("re-seed clobbered the live primary: got %q, want gemini-flash", after.Model)
+	if after.Model != "gemini-2.5-flash" {
+		t.Errorf("re-seed clobbered the live primary: got %q, want gemini-2.5-flash", after.Model)
 	}
 	if len(after.FallbackModels) != 1 || after.FallbackModels[0] != "gpt-4o-mini" {
 		t.Errorf("re-seed clobbered the live fallback chain: got %v, want [gpt-4o-mini]", after.FallbackModels)

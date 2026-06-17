@@ -23,46 +23,44 @@ type providerConfig struct {
 }
 
 var (
-	openaiC    = func(c *Clients) Provider { return c.OpenAI }
-	groqC      = func(c *Clients) Provider { return c.Groq }
-	geminiC    = func(c *Clients) Provider { return c.Gemini }
-	anthropicC = func(c *Clients) Provider { return c.Anthropic }
-	meeshoC    = func(c *Clients) Provider { return c.Meesho }
+	// openaiC    = func(c *Clients) Provider { return c.OpenAI }    // unused: all OpenAI models route via bifrost
+	groqC = func(c *Clients) Provider { return c.Groq }
+	// geminiC    = func(c *Clients) Provider { return c.Gemini }    // unused: all Gemini models route via bifrost
+	// anthropicC = func(c *Clients) Provider { return c.Anthropic } // unused: Claude routes via bifrost
+	meeshoC = func(c *Clients) Provider { return c.Meesho }
 )
 
-// registry is the single source of truth for provider routing. Every entry is
-// registered whether or not that provider's API key is configured — a missing
-// key surfaces as a per-call auth error, never a startup failure.
+// registry is the single source of truth for provider routing. All non-Groq
+// models route through the Meesho bifrost gateway (OpenAI-compatible,
+// x-bf-vk auth) using provider-prefixed model IDs. Only llama-groq uses the
+// Groq API directly.
 var registry = map[string]providerConfig{
-	// ── OpenAI ──────────────────────────────────────────────────────────────
-	"gpt-5.1":      {modelID: "gpt-5.1", provider: "openai", clientFn: openaiC, reasoning: true},
-	"gpt-5":        {modelID: "gpt-5", provider: "openai", clientFn: openaiC, reasoning: true},
-	"gpt-5-mini":   {modelID: "gpt-5-mini", provider: "openai", clientFn: openaiC, reasoning: true},
-	"gpt-5-nano":   {modelID: "gpt-5-nano", provider: "openai", clientFn: openaiC, reasoning: true},
-	"gpt-4.1":      {modelID: "gpt-4.1", provider: "openai", clientFn: openaiC},
-	"gpt-4.1-mini": {modelID: "gpt-4.1-mini", provider: "openai", clientFn: openaiC},
-	"gpt-4.1-nano": {modelID: "gpt-4.1-nano", provider: "openai", clientFn: openaiC},
-	"gpt-4o":       {modelID: "gpt-4o", provider: "openai", clientFn: openaiC},
-	"gpt-4o-mini":  {modelID: "gpt-4o-mini", provider: "openai", clientFn: openaiC},
+	// ── OpenAI via Meesho bifrost ────────────────────────────────────────────
+	// "gpt-5.1":      {modelID: "openai/gpt-5.1", provider: "openai", clientFn: meeshoC},
+	// "gpt-5":        {modelID: "openai/gpt-5", provider: "openai", clientFn: meeshoC},
+	// "gpt-5-mini":   {modelID: "openai/gpt-5-mini", provider: "openai", clientFn: meeshoC},
+	// "gpt-5-nano":   {modelID: "openai/gpt-5-nano", provider: "openai", clientFn: meeshoC},
+	// "gpt-4.1":      {modelID: "openai/gpt-4.1", provider: "openai", clientFn: meeshoC},
+	// "gpt-4.1-mini": {modelID: "openai/gpt-4.1-mini", provider: "openai", clientFn: meeshoC},
+	// "gpt-4.1-nano": {modelID: "openai/gpt-4.1-nano", provider: "openai", clientFn: meeshoC},
+	"gpt-4o":      {modelID: "openai/gpt-4o", provider: "openai", clientFn: meeshoC},
+	"gpt-4o-mini": {modelID: "openai/gpt-4o-mini", provider: "openai", clientFn: meeshoC},
 
-	// ── Groq ────────────────────────────────────────────────────────────────
+	// ── Groq (direct API — own key) ──────────────────────────────────────────
 	"llama-groq": {modelID: "llama-3.3-70b-versatile", provider: "groq", clientFn: groqC},
 
-	// ── Gemini (OpenAI-compatible endpoint) ─────────────────────────────────
-	"gemini-3-pro":          {modelID: "gemini-3-pro-preview", provider: "gemini", clientFn: geminiC},
-	"gemini-2.5-pro":        {modelID: "gemini-2.5-pro", provider: "gemini", clientFn: geminiC},
-	"gemini-2.5-flash":      {modelID: "gemini-2.5-flash", provider: "gemini", clientFn: geminiC},
-	"gemini-2.5-flash-lite": {modelID: "gemini-2.5-flash-lite", provider: "gemini", clientFn: geminiC},
-	"gemini-flash":          {modelID: "gemini-2.0-flash", provider: "gemini", clientFn: geminiC},
+	// ── Gemini via Meesho bifrost ────────────────────────────────────────────
+	// "gemini-3-pro":          {modelID: "vertex/gemini-3-pro-preview", provider: "gemini", clientFn: meeshoC},
+	"gemini-2.5-pro":   {modelID: "vertex/gemini-2.5-pro", provider: "gemini", clientFn: meeshoC},
+	"gemini-2.5-flash": {modelID: "vertex/gemini-2.5-flash", provider: "gemini", clientFn: meeshoC},
+	// "gemini-2.5-flash-lite": {modelID: "vertex/gemini-2.5-flash-lite", provider: "gemini", clientFn: meeshoC},
+	// "gemini-flash":          {modelID: "vertex/gemini-2.0-flash", provider: "gemini", clientFn: meeshoC},
 
-	// ── Meesho internal gateway (OpenAI-compatible, x-bf-vk virtual key) ─────
-	"meesho-gemini-2.5-flash": {modelID: "vertex/gemini-2.5-flash", provider: "meesho-gateway", clientFn: meeshoC},
-
-	// ── Anthropic (native Messages API — anthropic.go) ──────────────────────
-	"claude-fable-5":    {modelID: "claude-fable-5", provider: "anthropic", clientFn: anthropicC},
-	"claude-opus-4-8":   {modelID: "claude-opus-4-8", provider: "anthropic", clientFn: anthropicC},
-	"claude-sonnet-4-6": {modelID: "claude-sonnet-4-6", provider: "anthropic", clientFn: anthropicC},
-	"claude-haiku-4-5":  {modelID: "claude-haiku-4-5", provider: "anthropic", clientFn: anthropicC},
+	// ── Anthropic via Meesho bifrost (OpenAI-compatible, not native SDK) ─────
+	// "claude-fable-5":    {modelID: "anthropic/claude-fable-5", provider: "anthropic", clientFn: meeshoC},
+	// "claude-opus-4-8":   {modelID: "anthropic/claude-opus-4-8", provider: "anthropic", clientFn: meeshoC},
+	"claude-sonnet-4-6": {modelID: "anthropic/claude-sonnet-4-6", provider: "anthropic", clientFn: meeshoC},
+	// "claude-haiku-4-5":  {modelID: "anthropic/claude-haiku-4-5", provider: "anthropic", clientFn: meeshoC},
 }
 
 // ProviderName returns the attribution name for a model key ("" if unknown).

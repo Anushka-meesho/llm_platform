@@ -112,13 +112,13 @@ export const MODEL_GROUPS = [
   {
     provider: 'OpenAI',
     models: [
-      'gpt-5.1',
-      'gpt-5',
-      'gpt-5-mini',
-      'gpt-5-nano',
-      'gpt-4.1',
-      'gpt-4.1-mini',
-      'gpt-4.1-nano',
+      // 'gpt-5.1',
+      // 'gpt-5',
+      // 'gpt-5-mini',
+      // 'gpt-5-nano',
+      // 'gpt-4.1',
+      // 'gpt-4.1-mini',
+      // 'gpt-4.1-nano',
       'gpt-4o',
       'gpt-4o-mini',
     ],
@@ -130,20 +130,21 @@ export const MODEL_GROUPS = [
   {
     provider: 'Gemini',
     models: [
-      'gemini-3-pro',
+      // 'gemini-3-pro',
       'gemini-2.5-pro',
       'gemini-2.5-flash',
-      'gemini-2.5-flash-lite',
-      'gemini-flash',
+      // 'gemini-2.5-flash-lite',
+      // 'gemini-flash',
     ],
   },
   {
     provider: 'Anthropic',
-    models: ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
-  },
-  {
-    provider: 'Meesho Gateway',
-    models: ['meesho-gemini-2.5-flash'],
+    models: [
+      // 'claude-fable-5',
+      // 'claude-opus-4-8',
+      'claude-sonnet-4-6',
+      // 'claude-haiku-4-5',
+    ],
   },
 ] as const;
 
@@ -152,9 +153,8 @@ export const MODEL_GROUPS = [
 export const MODELS = MODEL_GROUPS.flatMap((g) => g.models);
 export type TModel = (typeof MODELS)[number];
 
-// Default selection for Compare/Estimate — selecting all 19 registry models
-// would fan out 19 paid calls per prompt; users opt in to more.
-export const DEFAULT_COMPARE_MODELS: TModel[] = ['gpt-4o-mini', 'llama-groq', 'gemini-flash'];
+// Default selection for Compare/Estimate — users opt in to more.
+export const DEFAULT_COMPARE_MODELS: TModel[] = ['gemini-2.5-flash'];
 
 // ── Leaderboard (manual per-model rating within a session) ───────────────────
 

@@ -45,8 +45,8 @@ func errorMock(err error) *mockProvider {
 	return &mockProvider{results: []callResult{{err: err}}}
 }
 
-func clientsWith(openai, groq, gemini Provider) *Clients {
-	return &Clients{OpenAI: openai, Groq: groq, Gemini: gemini}
+func clientsWith(meesho, groq Provider) *Clients {
+	return &Clients{Meesho: meesho, Groq: groq}
 }
 
 func simpleReq(prompt string) *types.RunRequest {
@@ -57,7 +57,7 @@ func simpleReq(prompt string) *types.RunRequest {
 
 func TestCallSingleModel_Success(t *testing.T) {
 	mock := successMock("hello back")
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
@@ -87,8 +87,8 @@ func TestCallSingleModel_UnknownModel(t *testing.T) {
 }
 
 func TestCallSingleModel_NilProvider(t *testing.T) {
-	// gpt-4o-mini is in registry but Clients.OpenAI is nil
-	clients := clientsWith(nil, nil, nil)
+	// gpt-4o-mini is in registry but Clients.Meesho is nil
+	clients := clientsWith(nil, nil)
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
@@ -103,7 +103,7 @@ func TestCallSingleModel_EmptyChoices(t *testing.T) {
 	mock := &mockProvider{results: []callResult{{
 		resp: &chatResponse{Choices: []chatChoice{}},
 	}}}
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
@@ -121,7 +121,7 @@ func TestCallSingleModel_EmptyContent(t *testing.T) {
 			Choices: []chatChoice{{Message: ChatMessage{Content: ""}}},
 		},
 	}}}
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
@@ -138,7 +138,7 @@ func TestCallSingleModel_ContextCancelled(t *testing.T) {
 	cancel()
 
 	mock := successMock("irrelevant")
-	result := callSingleModel(ctx, clientsWith(mock, nil, nil), "gpt-4o-mini", simpleReq("hi"))
+	result := callSingleModel(ctx, clientsWith(mock, nil), "gpt-4o-mini", simpleReq("hi"))
 
 	if result.Success {
 		t.Fatal("expected failure for cancelled context")
@@ -157,7 +157,7 @@ func TestCallSingleModel_RetriesOnTransientError(t *testing.T) {
 			Usage:   chatUsage{PromptTokens: 5, CompletionTokens: 5},
 		}},
 	}}
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	// Patch sleep to avoid 6s delay in tests — we do this by using a cancelable
 	// context with a generous deadline (retries sleep but context allows them).
@@ -174,7 +174,7 @@ func TestCallSingleModel_RetriesOnTransientError(t *testing.T) {
 func TestCallSingleModel_NoRetryOnPermanentError(t *testing.T) {
 	// 401 is not retryable — should stop after first call.
 	mock := errorMock(&APIError{HTTPStatusCode: 401, Message: "bad key"})
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
@@ -189,7 +189,7 @@ func TestCallSingleModel_NoRetryOnPermanentError(t *testing.T) {
 func TestCallSingleModel_AllRetriesExhausted(t *testing.T) {
 	// All 3 attempts return 500.
 	mock := errorMock(&APIError{HTTPStatusCode: 500, Message: "server error"})
-	clients := clientsWith(mock, nil, nil)
+	clients := clientsWith(mock, nil)
 
 	result := callSingleModel(context.Background(), clients, "gpt-4o-mini", simpleReq("hi"))
 
@@ -215,7 +215,7 @@ func TestCallSingleModel_StopsRetryOnContextCancel(t *testing.T) {
 
 	// Cancel after first call.
 	originalMock := &cancelOnNthCall{provider: mock, cancelAfter: 1, cancel: cancel}
-	clients := clientsWith(originalMock, nil, nil)
+	clients := clientsWith(originalMock, nil)
 
 	result := callSingleModel(ctx, clients, "gpt-4o-mini", simpleReq("hi"))
 

@@ -39,7 +39,7 @@ func newPredictServer(t *testing.T, modelOutput string) (*httptest.Server, *sql.
 	t.Helper()
 	fake := fakeModelServer(t, modelOutput)
 	clients := &llm.Clients{
-		OpenAI: llm.NewOpenAICompatProvider(fake.URL, "test-key"),
+		Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key"),
 	}
 	srv, database := newTestServerWithClients(t, clients)
 
@@ -193,7 +193,7 @@ func TestPredictUnknownTask(t *testing.T) {
 
 func TestRunStampedAsPlayground(t *testing.T) {
 	fake := fakeModelServer(t, "hello there")
-	clients := &llm.Clients{OpenAI: llm.NewOpenAICompatProvider(fake.URL, "k")}
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "k")}
 	srv, database := newTestServerWithClients(t, clients)
 
 	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/run",

@@ -87,7 +87,7 @@ func countingModelServer(t *testing.T, content string, status int) (*httptest.Se
 func newCacheServer(t *testing.T, modelOutput string, modelStatus int) (*httptest.Server, *sql.DB, *atomic.Int64) {
 	t.Helper()
 	fake, calls := countingModelServer(t, modelOutput, modelStatus)
-	clients := &llm.Clients{OpenAI: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
 	srv, database := newTestServerWithCache(t, clients, cache.NewMemory())
 
 	taskJSON := `{
@@ -252,7 +252,7 @@ func TestPredictCacheInvalidatedByDeploy(t *testing.T) {
 
 func TestPredictCacheRequiresOptIn(t *testing.T) {
 	fake, calls := countingModelServer(t, `{"label":"positive"}`, http.StatusOK)
-	clients := &llm.Clients{OpenAI: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
 	srv, _ := newTestServerWithCache(t, clients, cache.NewMemory())
 
 	// Task without cache_enabled — caching must never engage.
@@ -414,14 +414,13 @@ func TestPredictCachesFallbackAnswer(t *testing.T) {
 func TestConcurrentPredictAndChainEdit(t *testing.T) {
 	ok, _ := countingModelServer(t, `{"label":"positive"}`, http.StatusOK)
 	clients := &llm.Clients{
-		OpenAI: llm.NewOpenAICompatProvider(ok.URL, "k"), // gpt-4o-mini
-		Gemini: llm.NewOpenAICompatProvider(ok.URL, "k"), // gemini-flash
+		Meesho: llm.NewOpenAICompatProvider(ok.URL, "k"), // gpt-4o-mini and gemini-2.5-flash via bifrost
 	}
 	srv, _ := newTestServerWithCache(t, clients, cache.NewMemory())
 
 	create := `{
 		"id":"cached-sentiment","name":"Cached Sentiment",
-		"model":"gpt-4o-mini","fallback_models":["gemini-flash"],"cache_enabled": true,
+		"model":"gpt-4o-mini","fallback_models":["gemini-2.5-flash"],"cache_enabled": true,
 		"prompt_template":"Classify sentiment: {{.text}}",
 		"input_schema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}}},
 		"output_schema":{"type":"object","required":["label"],"properties":{"label":{"type":"string"}}}
@@ -445,7 +444,7 @@ func TestConcurrentPredictAndChainEdit(t *testing.T) {
 		}(i)
 	}
 	// Writers: flip the fallback chain repeatedly.
-	chains := []string{`{"fallback_models":["gemini-flash"]}`, `{"fallback_models":[]}`}
+	chains := []string{`{"fallback_models":["gemini-2.5-flash"]}`, `{"fallback_models":[]}`}
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(n int) {
@@ -472,7 +471,7 @@ func TestConcurrentPredictAndChainEdit(t *testing.T) {
 func TestCacheModelEntryTTL(t *testing.T) {
 	rec := newRecordingCache()
 	ok, _ := countingModelServer(t, `{"label":"positive"}`, http.StatusOK)
-	clients := &llm.Clients{OpenAI: llm.NewOpenAICompatProvider(ok.URL, "k")}
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(ok.URL, "k")}
 	srv, _ := newTestServerWithCache(t, clients, rec)
 
 	taskJSON := `{
@@ -506,16 +505,15 @@ func TestCacheModelEntryTTL(t *testing.T) {
 func TestPerModelCacheSurvivesChainEdit(t *testing.T) {
 	rec := newRecordingCache()
 	ok, calls := countingModelServer(t, `{"label":"positive"}`, http.StatusOK)
-	// Both gpt-4o-mini (openai) and gemini-flash (gemini) resolve to this fake.
+	// Both gpt-4o-mini and gemini-2.5-flash route through bifrost (meeshoC).
 	clients := &llm.Clients{
-		OpenAI: llm.NewOpenAICompatProvider(ok.URL, "k"),
-		Gemini: llm.NewOpenAICompatProvider(ok.URL, "k"),
+		Meesho: llm.NewOpenAICompatProvider(ok.URL, "k"),
 	}
 	srv, _ := newTestServerWithCache(t, clients, rec)
 
 	create := `{
 		"id":"cached-sentiment","name":"Cached Sentiment",
-		"model":"gpt-4o-mini","fallback_models":["gemini-flash"],"cache_enabled": true,
+		"model":"gpt-4o-mini","fallback_models":["gemini-2.5-flash"],"cache_enabled": true,
 		"prompt_template":"Classify sentiment: {{.text}}",
 		"input_schema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}}},
 		"output_schema":{"type":"object","required":["label"],"properties":{"label":{"type":"string"}}}
@@ -572,9 +570,8 @@ func TestRecoveredPrimaryNotShadowedByFallbackCache(t *testing.T) {
 	fallback, fallbackCalls := countingModelServer(t, `{"label":"fallback"}`, http.StatusOK)
 
 	clients := &llm.Clients{
-		OpenAI: llm.NewOpenAICompatProvider(primary.URL, ""),   // gpt-4o-mini → primary
+		Meesho: llm.NewOpenAICompatProvider(primary.URL, ""),   // gpt-4o-mini and gemini-2.5-flash via bifrost
 		Groq:   llm.NewOpenAICompatProvider(fallback.URL, "k"), // llama-groq → fallback
-		Gemini: llm.NewOpenAICompatProvider(fallback.URL, "k"), // gemini-flash (structure-change model)
 	}
 	srv, _ := newTestServerWithCache(t, clients, cache.NewMemory())
 
@@ -602,7 +599,7 @@ func TestRecoveredPrimaryNotShadowedByFallbackCache(t *testing.T) {
 	//    chain-level entry misses — the path that used to replay the stale
 	//    per-model fallback answer.
 	primaryHealthy.Store(true)
-	put := `{"fallback_models":["llama-groq","gemini-flash"]}`
+	put := `{"fallback_models":["llama-groq","gemini-2.5-flash"]}`
 	r2, _ := http.DefaultClient.Do(authReq(t, http.MethodPut, srv.URL+"/v1/tasks/cached-sentiment", put))
 	r2.Body.Close()
 

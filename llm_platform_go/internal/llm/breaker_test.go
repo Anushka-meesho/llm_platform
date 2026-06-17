@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -131,6 +132,34 @@ func authFailureServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// modelDispatchServer returns a server that inspects the "model" field in the
+// request JSON and responds with the configured HTTP status per model ID.
+// Use for tests where two models sharing the same client need different outcomes.
+func modelDispatchServer(t *testing.T, modelStatus map[string]int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		code, ok := modelStatus[body.Model]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown model"}}`))
+			return
+		}
+		if code == http.StatusOK {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`))
+			return
+		}
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"error":{"message":"error"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestCallWithFallback(t *testing.T) {
 	ResetBreakers()
 	t.Cleanup(ResetBreakers)
@@ -142,7 +171,7 @@ func TestCallWithFallback(t *testing.T) {
 		ResetBreakers()
 		ok := okServer(t, "served-by-fallback")
 		clients := &Clients{
-			OpenAI: deadProvider(),                          // primary gpt-4o-mini → dead
+			Meesho: deadProvider(),                          // primary gpt-4o-mini → dead (via bifrost)
 			Groq:   NewOpenAICompatProvider(ok.URL, "k"),    // fallback llama-groq → ok
 		}
 		r := CallWithFallback(context.Background(), clients,
@@ -159,7 +188,7 @@ func TestCallWithFallback(t *testing.T) {
 	t.Run("primary success does not fall back", func(t *testing.T) {
 		ResetBreakers()
 		ok := okServer(t, "primary")
-		clients := &Clients{OpenAI: NewOpenAICompatProvider(ok.URL, "k"), Groq: deadProvider()}
+		clients := &Clients{Meesho: NewOpenAICompatProvider(ok.URL, "k"), Groq: deadProvider()}
 		r := CallWithFallback(context.Background(), clients,
 			[]string{"gpt-4o-mini", "llama-groq"}, msgs, 0.1, 100)
 		if !r.Success || r.FallbackUsed || r.Degraded || r.Model != "gpt-4o-mini" {
@@ -168,21 +197,23 @@ func TestCallWithFallback(t *testing.T) {
 	})
 
 	t.Run("primary auth failure (401) falls back", func(t *testing.T) {
-		// The reported bug: a misconfigured primary (bad/missing API key → 401)
-		// must advance to a working fallback provider.
+		// A misconfigured primary (bad/missing API key → 401) must advance to a
+		// working fallback. Both models route through bifrost (meeshoC), so a
+		// model-dispatch server returns different status codes per model ID.
 		ResetBreakers()
-		bad := authFailureServer(t)
-		ok := okServer(t, "served-by-fallback")
+		dispatch := modelDispatchServer(t, map[string]int{
+			"openai/gpt-4o-mini":      http.StatusUnauthorized,
+			"vertex/gemini-2.5-flash": http.StatusOK,
+		})
 		clients := &Clients{
-			OpenAI: NewOpenAICompatProvider(bad.URL, ""),    // primary gpt-4o-mini → 401
-			Gemini: NewOpenAICompatProvider(ok.URL, "k"),    // fallback gemini → ok
+			Meesho: NewOpenAICompatProvider(dispatch.URL, "k"),
 		}
 		r := CallWithFallback(context.Background(), clients,
-			[]string{"gpt-4o-mini", "gemini-flash"}, msgs, 0.1, 100)
+			[]string{"gpt-4o-mini", "gemini-2.5-flash"}, msgs, 0.1, 100)
 		if !r.Success {
 			t.Fatalf("expected success via fallback after 401, got error: %v", r.Error)
 		}
-		if r.Model != "gemini-flash" || !r.FallbackUsed || !r.Degraded {
+		if r.Model != "gemini-2.5-flash" || !r.FallbackUsed || !r.Degraded {
 			t.Errorf("401 should advance the chain: model=%s fallback=%v degraded=%v",
 				r.Model, r.FallbackUsed, r.Degraded)
 		}
@@ -193,7 +224,7 @@ func TestCallWithFallback(t *testing.T) {
 		bad := badRequestServer(t)
 		ok := okServer(t, "should-not-be-reached")
 		clients := &Clients{
-			OpenAI: NewOpenAICompatProvider(bad.URL, "k"),
+			Meesho: NewOpenAICompatProvider(bad.URL, "k"),
 			Groq:   NewOpenAICompatProvider(ok.URL, "k"),
 		}
 		r := CallWithFallback(context.Background(), clients,
@@ -208,7 +239,7 @@ func TestCallWithFallback(t *testing.T) {
 
 	t.Run("whole chain dead → degraded failure", func(t *testing.T) {
 		ResetBreakers()
-		clients := &Clients{OpenAI: deadProvider(), Groq: deadProvider()}
+		clients := &Clients{Meesho: deadProvider(), Groq: deadProvider()}
 		r := CallWithFallback(context.Background(), clients,
 			[]string{"gpt-4o-mini", "llama-groq"}, msgs, 0.1, 100)
 		if r.Success || !r.Degraded {
@@ -218,7 +249,7 @@ func TestCallWithFallback(t *testing.T) {
 
 	t.Run("breaker opens after repeated failures and fails fast", func(t *testing.T) {
 		ResetBreakers()
-		clients := &Clients{OpenAI: deadProvider()}
+		clients := &Clients{Meesho: deadProvider()}
 		// 3 infra failures trip the openai circuit.
 		for i := 0; i < 3; i++ {
 			_ = CallModel(context.Background(), clients, "gpt-4o-mini", msgs, 0.1, 100)

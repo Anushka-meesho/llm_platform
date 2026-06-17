@@ -1,7 +1,7 @@
 package llm
 
 // DefaultModels is the canonical set of provider keys used when none are specified.
-var DefaultModels = []string{"gpt-4o-mini", "llama-groq", "gemini-flash"}
+var DefaultModels = []string{"gpt-4o-mini", "gemini-2.5-flash", "llama-groq"}
 
 // ModelResult holds everything returned by one provider for one call.
 type ModelResult struct {

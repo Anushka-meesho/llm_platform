@@ -1,4 +1,6 @@
 import { Typography } from '@meesho/merlin-ui-tailwind';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { TUIMessage } from '../types';
 import StarRating from './StarRating';
 
@@ -37,13 +39,11 @@ const AssistantBubble = ({
           : 'bg-error-bg border-error-border'
       }`}
     >
-      <Typography
-        variant="body"
-        size="3"
-        className={message.success ? 'text-primary-text' : 'text-error-text'}
-      >
-        {message.content}
-      </Typography>
+      <div className={`markdown-body text-sm ${message.success ? 'text-primary-text' : 'text-error-text'}`}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          {message.content}
+        </ReactMarkdown>
+      </div>
     </div>
     <div className="flex items-center gap-3 ml-1">
       {message.latency_ms > 0 && (
