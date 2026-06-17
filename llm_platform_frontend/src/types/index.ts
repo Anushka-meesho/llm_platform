@@ -169,6 +169,120 @@ export type TLeaderboardResponse = {
   entries: TLeaderboardEntry[];
 };
 
+// ── Admin: prompt history ─────────────────────────────────────────────────────
+
+export type TRunListItem = {
+  id: number;
+  run_id: string;
+  task_id: string | null;
+  user_email: string | null;
+  model: string;
+  provider: string | null;
+  prompt_preview: string;
+  has_image: boolean;
+  image_count: number;
+  success: boolean;
+  cache_hit: boolean;
+  fallback_used: boolean;
+  is_test: boolean;
+  latency_ms: number;
+  total_tokens: number;
+  cost_usd: number;
+  created_at: string;
+};
+
+export type TRunListResponse = {
+  page: number;
+  page_size: number;
+  total_runs: number;
+  total_pages: number;
+  runs: TRunListItem[];
+};
+
+export type TRunDetailResult = {
+  model: string;
+  provider: string | null;
+  response: string | null;
+  success: boolean;
+  error: string | null;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  cache_hit: boolean;
+  fallback_used: boolean;
+};
+
+export type TRunDetail = {
+  run_id: string;
+  task_id: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  prompt_version: number;
+  prompt: string;
+  system_prompt: string | null;
+  images: string[];
+  is_test: boolean;
+  created_at: string;
+  results: TRunDetailResult[];
+};
+
+export type TRunFilters = {
+  page?: number;
+  pageSize?: number;
+  taskId?: string;
+  model?: string;
+  userEmail?: string;
+  q?: string;
+  status?: '' | 'success' | 'error';
+  type?: '' | 'production' | 'test';
+};
+
+// ── Admin: model health (per-(task, model) circuit breaker) ───────────────────
+
+export type TModelHealthStatus = {
+  task_id: string;
+  model: string;
+  provider: string;
+  state: 'healthy' | 'unhealthy' | 'probing';
+  consecutive_failures: number;
+  total_failures: number;
+  total_successes: number;
+  trips: number;
+  cooldown_ms: number;
+  open_for_seconds: number;
+  last_reason: string;
+  last_error: string;
+  last_change: string;
+};
+
+export type TModelHealthResponse = {
+  enabled: boolean;
+  statuses: TModelHealthStatus[];
+};
+
+export type THealthEvent = {
+  id: number;
+  task_id: string;
+  model: string;
+  provider: string;
+  event: 'failure' | 'tripped' | 'recovered' | 'manual_reset';
+  reason: string;
+  consecutive_failures: number;
+  cooldown_ms: number;
+  state: string;
+  created_at: string;
+};
+
+export type THealthEventsResponse = {
+  page: number;
+  page_size: number;
+  total_count: number;
+  total_pages: number;
+  events: THealthEvent[];
+};
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 export type TUser = {

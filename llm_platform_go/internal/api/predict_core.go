@@ -9,12 +9,31 @@ import (
 	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/db"
+	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
 
 	"github.com/google/uuid"
 )
+
+// taskHealthGate adapts the per-(task, model) circuit breaker to llm.HealthGate,
+// binding every call to one task id and resolving the provider name for events.
+type taskHealthGate struct {
+	tracker *health.Tracker
+	taskID  string
+}
+
+func (g taskHealthGate) Allow(model string) bool {
+	ok, _ := g.tracker.Allow(g.taskID, model)
+	return ok
+}
+func (g taskHealthGate) RecordSuccess(model string) {
+	g.tracker.RecordSuccess(g.taskID, model, llm.ProviderName(model))
+}
+func (g taskHealthGate) RecordFailure(model, reason string) {
+	g.tracker.RecordFailure(g.taskID, model, llm.ProviderName(model), reason)
+}
 
 // predictOptions tweak one prediction execution.
 type predictOptions struct {
@@ -73,11 +92,23 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		return nil, &httpError{http.StatusUnprocessableEntity, err.Error()}
 	}
 
+	// Multimodal input: image fields (base64 data URLs or https URLs) are not
+	// rendered into the text prompt — the template only gates on them with
+	// {{if .image}} / {{if .images}} — but are attached to the user message as
+	// image_url blocks for vision models. They must also key the cache (same text
+	// + different photos is a different prediction). Both a single "image" string
+	// and an "images" array are accepted, in submission order.
+	images := collectImages(inputMap)
+
 	messages := []llm.ChatMessage{}
 	if renderTask.SystemPrompt != "" {
 		messages = append(messages, llm.ChatMessage{Role: "system", Content: renderTask.SystemPrompt})
 	}
-	messages = append(messages, llm.ChatMessage{Role: "user", Content: prompt})
+	userMsg := llm.ChatMessage{Role: "user", Content: prompt}
+	if len(images) > 0 {
+		userMsg.Images = images
+	}
+	messages = append(messages, userMsg)
 
 	// Model chain: explicit override (Studio), or primary + fallbacks.
 	models := append([]string{task.Model}, task.FallbackModels...)
@@ -108,6 +139,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		Temperature:    task.Temperature,
 		MaxTokens:      task.MaxTokens,
 		OutputSchema:   string(task.OutputSchema),
+		Images:         images,
 	}
 	modelKey := func(model string) string { ki := base; ki.Model = model; return cache.Key(ki) }
 
@@ -135,13 +167,31 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
-	result := llm.CallWithFallbackCached(ctx, h.Clients, models, messages,
-		float32(task.Temperature), task.MaxTokens, modelLookup)
+	// Circuit-breaker health gating + schema-aware fallback apply to production
+	// predicts only (the real fallback chain). Studio test panels and shadow
+	// runs (useCache=false) or single-model overrides run the model as asked,
+	// without skipping it or feeding production health.
+	fbOpts := llm.FallbackOptions{Lookup: modelLookup}
+	if opts.useCache && opts.overrideModel == "" {
+		if h.Health.Enabled() {
+			fbOpts.Gate = taskHealthGate{tracker: h.Health, taskID: task.ID}
+		}
+		if len(task.OutputSchema) > 0 {
+			vt := task // capture for the validator closure
+			fbOpts.Validate = func(text string) bool {
+				_, err := tasks.ValidateOutput(vt, text)
+				return err == nil
+			}
+		}
+	}
+
+	result := llm.CallWithFallbackOpts(ctx, h.Clients, models, messages,
+		float32(task.Temperature), task.MaxTokens, fbOpts)
 
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		return h.serveCached(task, prompt, renderTask.SystemPrompt, promptVersion, user, hitEntry), nil
+		return h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry), nil
 	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
@@ -193,6 +243,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
+		Images:        images,
 		Model:         result.Model,
 		Response:      result.Response,
 		LatencyMs:     result.LatencyMs,
@@ -229,7 +280,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 // still gets a run row (cache_hit=1) so attribution and hit-rate stay
 // observable, but with zero cost/tokens — nothing was consumed upstream, and
 // the budget gate must not count replayed answers as spend.
-func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string,
+func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, images []string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
@@ -257,6 +308,7 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string,
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
+		Images:        images,
 		Model:         entry.Model,
 		Response:      &response,
 		Success:       true,
@@ -288,6 +340,26 @@ func (h *Handler) insertRun(row *types.RunRow) {
 		return
 	}
 	_ = db.InsertRun(h.DB, row)
+}
+
+// collectImages gathers the multimodal inputs from a request, in submission
+// order: a single "image" string (legacy single-image contract) first, then any
+// entries of an "images" array. Blank entries are dropped. Both keys are
+// accepted so existing single-image callers keep working alongside multi-image
+// ones, and a non-string entry is simply ignored rather than failing the call.
+func collectImages(inputMap map[string]any) []string {
+	var out []string
+	if s, ok := inputMap["image"].(string); ok && s != "" {
+		out = append(out, s)
+	}
+	if arr, ok := inputMap["images"].([]any); ok {
+		for _, v := range arr {
+			if s, ok := v.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.

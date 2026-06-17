@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from 'react';
 import type { TJSONSchema, TPredictResult, TTask, TTaskStatsDetail } from '../types';
 import { api, ApiError, type PredictOutcome } from '../api/client';
 import { API_TOKEN } from '../auth/token';
@@ -147,14 +147,30 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
                   <span className="text-neutral-400"> — {f.schema.description}</span>
                 )}
               </div>
-              <textarea
-                value={values[f.name] ?? ''}
-                onChange={(e) =>
-                  setValues((prev) => ({ ...prev, [f.name]: e.target.value }))
-                }
-                rows={1}
-                className="w-full border border-neutral-300 rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-white"
-              />
+              {imageFieldMode(f) === 'multi' ? (
+                <MultiImageField
+                  value={values[f.name] ?? ''}
+                  onChange={(json) =>
+                    setValues((prev) => ({ ...prev, [f.name]: json }))
+                  }
+                />
+              ) : imageFieldMode(f) === 'single' ? (
+                <ImageField
+                  value={values[f.name] ?? ''}
+                  onChange={(dataUrl) =>
+                    setValues((prev) => ({ ...prev, [f.name]: dataUrl }))
+                  }
+                />
+              ) : (
+                <textarea
+                  value={values[f.name] ?? ''}
+                  onChange={(e) =>
+                    setValues((prev) => ({ ...prev, [f.name]: e.target.value }))
+                  }
+                  rows={1}
+                  className="w-full border border-neutral-300 rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-white"
+                />
+              )}
             </label>
           ))}
         </div>
@@ -208,6 +224,154 @@ function coerce(raw: string, schema: TJSONSchema): unknown {
       return raw;
   }
 }
+
+// imageFieldMode classifies an input as an image field and how many it takes:
+// 'single' for a string image field, 'multi' for an array-of-strings image
+// field. A field qualifies when it's named image/images or its description
+// mentions a data URL / image / photo — the platform attaches each value to the
+// model as a vision block. Returns null for non-image fields.
+function imageFieldMode(f: Field): 'single' | 'multi' | null {
+  const name = f.name.toLowerCase();
+  const d = (f.schema.description ?? '').toLowerCase();
+  const looksImage =
+    name === 'image' ||
+    name === 'images' ||
+    d.includes('data url') ||
+    d.includes('image url') ||
+    d.includes('product photo') ||
+    d.includes('photo');
+  if (!looksImage) return null;
+  if (f.schema.type === 'array') {
+    const item = f.schema.items?.type;
+    return !item || item === 'string' ? 'multi' : null;
+  }
+  if (f.schema.type && f.schema.type !== 'string') return null;
+  return 'single';
+}
+
+// ImageField lets a seller pick a photo; it's read into a base64 data URL (the
+// string the predict API expects) and previewed inline.
+const ImageField = ({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (dataUrl: string) => void;
+}) => {
+  const [name, setName] = useState<string | null>(null);
+
+  const onPick = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => onChange(typeof reader.result === 'string' ? reader.result : '');
+    reader.readAsDataURL(file);
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <input
+        type="file"
+        accept="image/*"
+        onChange={onPick}
+        className="text-sm text-neutral-700 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
+      />
+      {value && (
+        <div className="flex items-center gap-3">
+          <img src={value} alt="preview" className="h-20 w-20 object-cover rounded-md border border-neutral-200" />
+          <button
+            type="button"
+            onClick={() => {
+              setName(null);
+              onChange('');
+            }}
+            className="text-xs text-neutral-500 underline bg-transparent border-none cursor-pointer p-0"
+          >
+            Remove {name ? `(${name})` : ''}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// MultiImageField lets a seller pick one OR many photos; each is read into a
+// base64 data URL and the set is stored as a JSON array string (coerce() parses
+// it back to a real array for the array-typed input field). Previews show as a
+// grid with per-image removal, so large selections stay manageable.
+const MultiImageField = ({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (json: string) => void;
+}) => {
+  // value is a JSON-encoded string[]; tolerate empty / malformed as [].
+  let urls: string[] = [];
+  if (value) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) urls = parsed.filter((x): x is string => typeof x === 'string');
+    } catch {
+      urls = [];
+    }
+  }
+
+  // Serialize back: an empty set becomes '' so the field is omitted from the
+  // request rather than sent as an empty array.
+  const commit = (next: string[]) => onChange(next.length ? JSON.stringify(next) : '');
+
+  const onPick = (e: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
+    Promise.all(
+      files.map(
+        (file) =>
+          new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+            reader.readAsDataURL(file);
+          }),
+      ),
+    ).then((dataUrls) => commit([...urls, ...dataUrls.filter(Boolean)]));
+    // Allow re-picking the same file(s) after a removal.
+    e.target.value = '';
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={onPick}
+        className="text-sm text-neutral-700 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
+      />
+      {urls.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {urls.map((src, i) => (
+            <div key={i} className="relative">
+              <img
+                src={src}
+                alt={`image ${i + 1}`}
+                className="h-20 w-20 object-cover rounded-md border border-neutral-200"
+              />
+              <button
+                type="button"
+                onClick={() => commit(urls.filter((_, j) => j !== i))}
+                title="Remove"
+                className="absolute -top-1.5 -right-1.5 h-5 w-5 rounded-full bg-neutral-900 text-white text-xs leading-none border-none cursor-pointer flex items-center justify-center"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
 
 const ResultCard = ({ outcome }: { outcome: PredictOutcome }) => {
   const r: TPredictResult = outcome.result;

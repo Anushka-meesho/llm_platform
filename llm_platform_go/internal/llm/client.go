@@ -33,6 +33,39 @@ type chatRequest struct {
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images, when set, are sent as OpenAI-compatible multimodal content blocks
+	// alongside the text. Each entry is an image reference the provider accepts —
+	// a base64 data URL ("data:image/jpeg;base64,…") or an https URL. Empty for
+	// text-only messages (the common case), which keep the plain string wire form.
+	Images []string `json:"-"`
+}
+
+// MarshalJSON emits the OpenAI chat-completions content format. With no images
+// it is a plain string (`"content": "…"`) — byte-identical to the old wire form,
+// so text-only callers and their tests are unaffected. With images, content
+// becomes the multimodal array (`[{type:text…},{type:image_url…}]`) understood by
+// vision models (gpt-4o, gemini, etc.) over the OpenAI-compatible endpoint.
+func (m ChatMessage) MarshalJSON() ([]byte, error) {
+	if len(m.Images) == 0 {
+		return json.Marshal(struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{m.Role, m.Content})
+	}
+	parts := make([]any, 0, len(m.Images)+1)
+	if m.Content != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]string{"url": img},
+		})
+	}
+	return json.Marshal(struct {
+		Role    string `json:"role"`
+		Content []any  `json:"content"`
+	}{m.Role, parts})
 }
 
 // chatResponse is the OpenAI-compatible chat completions response body.

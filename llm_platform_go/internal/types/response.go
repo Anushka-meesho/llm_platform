@@ -4,7 +4,7 @@ import "time"
 
 type ModelResultResponse struct {
 	Model        string  `json:"model"`
-	Response     *string `json:"response"`      // null on failure
+	Response     *string `json:"response"` // null on failure
 	LatencyMs    int     `json:"latency_ms"`
 	InputTokens  int     `json:"input_tokens"`
 	OutputTokens int     `json:"output_tokens"`
@@ -88,6 +88,7 @@ type RunRow struct {
 	SessionID    *string
 	Prompt       string
 	SystemPrompt *string
+	Images       []string // multimodal inputs (data URLs / image URLs), in submission order; empty for text-only runs
 	Model        string
 	Response     *string
 	LatencyMs    int
@@ -107,6 +108,124 @@ type RunRow struct {
 	CacheHit      bool
 	IsTest        bool // Studio test-panel call, not production traffic
 	CreatedAt     time.Time
+}
+
+// ── Admin: prompt history ────────────────────────────────────────────────────
+
+// RunListItem is one row of the admin prompt-history list. It is deliberately
+// lightweight: the prompt is truncated to a preview and full responses/images
+// are omitted, so a page of history stays small regardless of how large the
+// underlying prompts or base64 images are. The detail endpoint serves the rest.
+type RunListItem struct {
+	ID            int       `json:"id"`
+	RunID         string    `json:"run_id"`
+	TaskID        *string   `json:"task_id"`
+	UserEmail     *string   `json:"user_email"`
+	Model         string    `json:"model"`
+	Provider      *string   `json:"provider"`
+	PromptPreview string    `json:"prompt_preview"`
+	HasImage      bool      `json:"has_image"`
+	ImageCount    int       `json:"image_count"`
+	Success       bool      `json:"success"`
+	CacheHit      bool      `json:"cache_hit"`
+	FallbackUsed  bool      `json:"fallback_used"`
+	IsTest        bool      `json:"is_test"`
+	LatencyMs     int       `json:"latency_ms"`
+	TotalTokens   int       `json:"total_tokens"`
+	CostUSD       float64   `json:"cost_usd"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type RunListResponse struct {
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	TotalRuns  int           `json:"total_runs"`
+	TotalPages int           `json:"total_pages"`
+	Runs       []RunListItem `json:"runs"`
+}
+
+// RunDetailResult is one model's outcome within a run (a playground /run stores
+// one row per model; a task predict stores exactly one).
+type RunDetailResult struct {
+	Model        string  `json:"model"`
+	Provider     *string `json:"provider"`
+	Response     *string `json:"response"`
+	Success      bool    `json:"success"`
+	Error        *string `json:"error"`
+	LatencyMs    int     `json:"latency_ms"`
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	CacheHit     bool    `json:"cache_hit"`
+	FallbackUsed bool    `json:"fallback_used"`
+}
+
+// RunDetailResponse is the full record for one run_id, shared prompt/inputs on
+// top and per-model results below. Images carry the full data URLs (this is the
+// only endpoint that returns them).
+type RunDetailResponse struct {
+	RunID         string            `json:"run_id"`
+	TaskID        *string           `json:"task_id"`
+	UserID        *string           `json:"user_id"`
+	UserEmail     *string           `json:"user_email"`
+	PromptVersion int               `json:"prompt_version"`
+	Prompt        string            `json:"prompt"`
+	SystemPrompt  *string           `json:"system_prompt"`
+	Images        []string          `json:"images"`
+	IsTest        bool              `json:"is_test"`
+	CreatedAt     time.Time         `json:"created_at"`
+	Results       []RunDetailResult `json:"results"`
+}
+
+// ── Model health (per-(task, model) circuit breaker) ──────────────────────────
+
+// HealthEvent is one transition/observation in a (task, model)'s health, both
+// the row persisted to model_health_events and the API shape. event is one of
+// "failure" (a counted failure below threshold), "tripped" (became unhealthy),
+// "recovered" (a probe succeeded → healthy again), or "manual_reset".
+type HealthEvent struct {
+	ID                  int       `json:"id"`
+	TaskID              string    `json:"task_id"`
+	Model               string    `json:"model"`
+	Provider            string    `json:"provider"`
+	Event               string    `json:"event"`
+	Reason              string    `json:"reason"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	CooldownMs          int       `json:"cooldown_ms"`
+	State               string    `json:"state"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+type HealthEventsResponse struct {
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	TotalCount int           `json:"total_count"`
+	TotalPages int           `json:"total_pages"`
+	Events     []HealthEvent `json:"events"`
+}
+
+// ModelHealthStatus is the live circuit state for one (task, model), as served
+// to the admin health page. State is "healthy", "unhealthy", or "probing".
+type ModelHealthStatus struct {
+	TaskID              string    `json:"task_id"`
+	Model               string    `json:"model"`
+	Provider            string    `json:"provider"`
+	State               string    `json:"state"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	TotalFailures       int       `json:"total_failures"`
+	TotalSuccesses      int       `json:"total_successes"`
+	Trips               int       `json:"trips"`            // times it has gone unhealthy (drives backoff)
+	CooldownMs          int       `json:"cooldown_ms"`      // current cooldown window
+	OpenForSeconds      int       `json:"open_for_seconds"` // remaining unhealthy seconds (0 if not open)
+	LastReason          string    `json:"last_reason"`
+	LastError           string    `json:"last_error"`
+	LastChange          time.Time `json:"last_change"`
+}
+
+type ModelHealthResponse struct {
+	Enabled  bool                `json:"enabled"`
+	Statuses []ModelHealthStatus `json:"statuses"`
 }
 
 // ── Feedback ────────────────────────────────────────────────────────────────

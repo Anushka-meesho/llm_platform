@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -13,12 +14,12 @@ import (
 func InsertRun(db *sql.DB, r *types.RunRow) error {
 	_, err := db.Exec(`
 		INSERT INTO runs
-			(run_id, session_id, prompt, system_prompt, model, response,
+			(run_id, session_id, prompt, system_prompt, image, model, response,
 			 latency_ms, input_tokens, output_tokens, total_tokens,
 			 cost_usd, success, error, user_id, user_email,
 			 task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.RunID, r.SessionID, r.Prompt, r.SystemPrompt, r.Model, r.Response,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.RunID, r.SessionID, r.Prompt, r.SystemPrompt, imagesToColumn(r.Images), r.Model, r.Response,
 		r.LatencyMs, r.InputTokens, r.OutputTokens, r.TotalTokens,
 		r.CostUSD, boolToInt(r.Success), r.Error, r.UserID, r.UserEmail,
 		r.TaskID, r.PromptVersion, r.Provider, boolToInt(r.FallbackUsed), boolToInt(r.CacheHit),
@@ -26,6 +27,38 @@ func InsertRun(db *sql.DB, r *types.RunRow) error {
 		r.CreatedAt.UTC().Format("2006-01-02 15:04:05"),
 	)
 	return err
+}
+
+// imagesToColumn serializes a run's multimodal inputs for the runs.image TEXT
+// column: NULL when there are none, otherwise a JSON array of the data URLs /
+// image URLs. Storing an array (rather than a bare string) lets a single column
+// hold one or many images without a schema change.
+func imagesToColumn(imgs []string) any {
+	if len(imgs) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(imgs)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
+// ParseImagesColumn reads the runs.image column back into a slice. It accepts
+// both the JSON-array form written by current code and a bare data URL written
+// by older single-image rows, so historical runs render correctly.
+func ParseImagesColumn(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if strings.HasPrefix(s, "[") {
+		var out []string
+		if err := json.Unmarshal([]byte(s), &out); err == nil {
+			return out
+		}
+	}
+	return []string{s}
 }
 
 // TaskSpendToday returns the UTC-today cost for one task across all callers
@@ -120,6 +153,274 @@ func GetRunByID(db *sql.DB, userID, runID string) ([]types.RunRow, error) {
 		result = append(result, r)
 	}
 	return result, rows.Err()
+}
+
+// InsertHealthEvent persists one (task, model) circuit transition for later
+// observation. created_at is supplied so it matches the in-memory event time.
+func InsertHealthEvent(db *sql.DB, e *types.HealthEvent) error {
+	_, err := db.Exec(`
+		INSERT INTO model_health_events
+			(task_id, model, provider, event, reason, consecutive_failures, cooldown_ms, state, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		e.TaskID, e.Model, e.Provider, e.Event, e.Reason,
+		e.ConsecutiveFailures, e.CooldownMs, e.State,
+		e.CreatedAt.UTC().Format("2006-01-02 15:04:05"),
+	)
+	return err
+}
+
+// ListHealthEvents returns one page of health events, newest first, optionally
+// filtered by task and/or model, with their total count for pagination.
+func ListHealthEvents(db *sql.DB, taskID, model string, page, pageSize int) ([]types.HealthEvent, int, error) {
+	var clauses []string
+	var args []any
+	if taskID != "" {
+		clauses = append(clauses, "task_id = ?")
+		args = append(args, taskID)
+	}
+	if model != "" {
+		clauses = append(clauses, "model = ?")
+		args = append(args, model)
+	}
+	whereSQL := ""
+	if len(clauses) > 0 {
+		whereSQL = " WHERE " + strings.Join(clauses, " AND ")
+	}
+
+	var total int
+	if err := db.QueryRow("SELECT COUNT(*) FROM model_health_events"+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	qArgs := append(append([]any{}, args...), pageSize, offset)
+	rows, err := db.Query(`
+		SELECT id, task_id, model, provider, event, reason,
+		       consecutive_failures, cooldown_ms, state, created_at
+		FROM model_health_events`+whereSQL+`
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?`, qArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	events := []types.HealthEvent{}
+	for rows.Next() {
+		var e types.HealthEvent
+		var createdAtStr string
+		if err := rows.Scan(&e.ID, &e.TaskID, &e.Model, &e.Provider, &e.Event, &e.Reason,
+			&e.ConsecutiveFailures, &e.CooldownMs, &e.State, &createdAtStr); err != nil {
+			return nil, 0, err
+		}
+		e.CreatedAt = parseTime(createdAtStr)
+		events = append(events, e)
+	}
+	return events, total, rows.Err()
+}
+
+// RunFilter narrows the admin prompt-history list. Zero-value fields are
+// ignored, so an empty filter lists every run.
+type RunFilter struct {
+	TaskID    string // exact match
+	Model     string // exact match
+	UserEmail string // case-insensitive substring
+	Query     string // case-insensitive substring of the prompt text
+	Success   *bool  // nil = either; else filter on success
+	IsTest    *bool  // nil = both production and test; else filter on is_test
+}
+
+// where builds the SQL WHERE clause + args shared by ListAllRuns and its count.
+func (f RunFilter) where() (string, []any) {
+	var clauses []string
+	var args []any
+	if f.TaskID != "" {
+		clauses = append(clauses, "task_id = ?")
+		args = append(args, f.TaskID)
+	}
+	if f.Model != "" {
+		clauses = append(clauses, "model = ?")
+		args = append(args, f.Model)
+	}
+	if f.UserEmail != "" {
+		clauses = append(clauses, "user_email LIKE ? COLLATE NOCASE")
+		args = append(args, "%"+f.UserEmail+"%")
+	}
+	if f.Query != "" {
+		clauses = append(clauses, "prompt LIKE ? COLLATE NOCASE")
+		args = append(args, "%"+f.Query+"%")
+	}
+	if f.Success != nil {
+		clauses = append(clauses, "success = ?")
+		args = append(args, boolToInt(*f.Success))
+	}
+	if f.IsTest != nil {
+		clauses = append(clauses, "is_test = ?")
+		args = append(args, boolToInt(*f.IsTest))
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// ListAllRuns returns one page of runs across ALL users (admin-only), newest
+// first, with their total count for pagination. Rows are lightweight: the
+// prompt is truncated to a preview and images are reduced to a count, so a page
+// stays small no matter how large the underlying prompts or base64 images are.
+func ListAllRuns(database *sql.DB, f RunFilter, page, pageSize int) ([]types.RunListItem, int, error) {
+	whereSQL, whereArgs := f.where()
+
+	var total int
+	if err := database.QueryRow("SELECT COUNT(*) FROM runs"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	args := append(append([]any{}, whereArgs...), pageSize, offset)
+	// id DESC ≈ newest-first (id is the autoincrement insert order) and uses the
+	// primary key, so paging stays cheap as the table grows.
+	rows, err := database.Query(`
+		SELECT id, run_id, task_id, user_email, model, provider,
+		       substr(prompt, 1, 200),
+		       image,
+		       success, cache_hit, fallback_used, is_test,
+		       latency_ms, total_tokens, cost_usd, created_at
+		FROM runs`+whereSQL+`
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := []types.RunListItem{}
+	for rows.Next() {
+		var it types.RunListItem
+		var image sql.NullString
+		var successInt, cacheInt, fallbackInt, testInt int
+		var createdAtStr string
+		if err := rows.Scan(
+			&it.ID, &it.RunID, &it.TaskID, &it.UserEmail, &it.Model, &it.Provider,
+			&it.PromptPreview,
+			&image,
+			&successInt, &cacheInt, &fallbackInt, &testInt,
+			&it.LatencyMs, &it.TotalTokens, &it.CostUSD, &createdAtStr,
+		); err != nil {
+			return nil, 0, err
+		}
+		if image.Valid {
+			imgs := ParseImagesColumn(image.String)
+			it.ImageCount = len(imgs)
+			it.HasImage = it.ImageCount > 0
+		}
+		it.Success = successInt == 1
+		it.CacheHit = cacheInt == 1
+		it.FallbackUsed = fallbackInt == 1
+		it.IsTest = testInt == 1
+		it.CreatedAt = parseTime(createdAtStr)
+		items = append(items, it)
+	}
+	return items, total, rows.Err()
+}
+
+// GetRunDetail returns the full record for one run_id across all users
+// (admin-only): the shared prompt/inputs plus one result per model row. Returns
+// (nil, nil) when the run_id is unknown.
+func GetRunDetail(database *sql.DB, runID string) (*types.RunDetailResponse, error) {
+	rows, err := database.Query(`
+		SELECT prompt, system_prompt, image, model, response,
+		       latency_ms, input_tokens, output_tokens, total_tokens,
+		       cost_usd, success, error, user_id, user_email,
+		       task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at
+		FROM runs
+		WHERE run_id = ?
+		ORDER BY id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var detail *types.RunDetailResponse
+	for rows.Next() {
+		var (
+			prompt, model                               string
+			systemPrompt, image, response, errMsg       sql.NullString
+			userID, userEmail, taskID, provider         sql.NullString
+			latency, inTok, outTok, totalTok, promptVer int
+			cost                                        float64
+			successInt, fallbackInt, cacheInt, testInt  int
+			createdAtStr                                string
+		)
+		if err := rows.Scan(
+			&prompt, &systemPrompt, &image, &model, &response,
+			&latency, &inTok, &outTok, &totalTok,
+			&cost, &successInt, &errMsg, &userID, &userEmail,
+			&taskID, &promptVer, &provider, &fallbackInt, &cacheInt, &testInt, &createdAtStr,
+		); err != nil {
+			return nil, err
+		}
+		if detail == nil {
+			detail = &types.RunDetailResponse{
+				RunID:         runID,
+				TaskID:        nullStrPtr(taskID),
+				UserID:        nullStrPtr(userID),
+				UserEmail:     nullStrPtr(userEmail),
+				PromptVersion: promptVer,
+				Prompt:        prompt,
+				SystemPrompt:  nullStrPtr(systemPrompt),
+				Images:        []string{},
+				IsTest:        testInt == 1,
+				CreatedAt:     parseTime(createdAtStr),
+				Results:       []types.RunDetailResult{},
+			}
+			if image.Valid {
+				detail.Images = ParseImagesColumn(image.String)
+			}
+		}
+		detail.Results = append(detail.Results, types.RunDetailResult{
+			Model:        model,
+			Provider:     nullStrPtr(provider),
+			Response:     nullStrPtr(response),
+			Success:      successInt == 1,
+			Error:        nullStrPtr(errMsg),
+			LatencyMs:    latency,
+			InputTokens:  inTok,
+			OutputTokens: outTok,
+			TotalTokens:  totalTok,
+			CostUSD:      cost,
+			CacheHit:     cacheInt == 1,
+			FallbackUsed: fallbackInt == 1,
+		})
+	}
+	return detail, rows.Err()
+}
+
+// DistinctRunModels lists the distinct models that appear in the runs table,
+// alphabetically — used to populate the admin history's model filter.
+func DistinctRunModels(database *sql.DB) ([]string, error) {
+	rows, err := database.Query(`SELECT DISTINCT model FROM runs ORDER BY model ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	models := []string{}
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		models = append(models, m)
+	}
+	return models, rows.Err()
+}
+
+func nullStrPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
 }
 
 // UpsertFeedback records (or updates) a star rating for one model response.

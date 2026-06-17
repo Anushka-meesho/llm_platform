@@ -4,17 +4,26 @@
 id: attribute-extraction
 name: Attribute Extraction
 description: >
-  Extract structured product attributes from a listing's title, description,
-  and category. First real task on the platform (CIS prefill shadow target).
+  Extract structured product attributes from what a seller provides for a
+  listing — title, category, optional description/brand, and an optional
+  product photo. First real task on the platform (CIS prefill shadow target).
 
 # Routing seeds the task only at first creation; after that it's owned at
 # runtime (edit via the API/UI) and survives restarts. Editing model /
 # fallback_models here has no effect on an already-created task.
-model: llama-groq
+#
+# Vision models only: the task accepts a product image, which text-only models
+# (e.g. llama-groq) cannot read. gemini-2.5-flash is fast + cheap and supports
+# vision; gpt-4o-mini is the vision-capable fallback. Both route via the gateway.
+model: gemini-2.5-flash
 fallback_models: [gpt-4o-mini]
 temperature: 0.1
-max_tokens: 800
-daily_budget_usd: 50 # stored now; enforcement lands in Phase 1
+# Gemini 2.5 Flash spends hidden "thinking" tokens out of this same budget, so
+# a tight cap (e.g. 800) can leave too few tokens for the JSON answer and the
+# output gets truncated mid-object → fails output-schema validation. 2048 gives
+# thinking + the (small) attribute JSON comfortable headroom.
+max_tokens: 2048
+daily_budget_usd: 50
 
 input_schema:
   type: object
@@ -24,11 +33,32 @@ input_schema:
     title:
       type: string
       minLength: 3
+      description: Product title / name as it appears on the listing
     description:
       type: string
+      description: Optional seller-written product description
     category:
       type: string
       minLength: 2
+      description: Product category, e.g. "Men's T-Shirts" or "Kitchen Storage"
+    brand:
+      type: string
+      description: Brand name, if the seller knows it
+    image:
+      type: string
+      description: >
+        Optional single product photo as a base64 data URL
+        ("data:image/jpeg;base64,...") or an image URL. The model reads visible
+        attributes directly from it. Prefer "images" for one or more photos;
+        this single-image field is kept for backward compatibility.
+    images:
+      type: array
+      items:
+        type: string
+      description: >
+        Optional product photos (one or more) as base64 data URLs
+        ("data:image/jpeg;base64,...") or image URLs — e.g. front, back, and
+        label shots. The model reads visible attributes from every image.
 
 output_schema:
   type: object
@@ -45,23 +75,29 @@ output_schema:
 
 system_prompt: >
   You are a product attribute extraction engine for an e-commerce catalog.
-  Respond with JSON only — no prose, no markdown fences.
+  You may receive a product image in addition to the text fields; when an image
+  is present, read attributes visible in it (colour, pattern, material, sleeve
+  length, neckline, shape, etc.) and combine them with the text. Respond with
+  JSON only — no prose, no markdown fences.
 
 prompt_template: |
-  Extract product attributes from this listing.
+  Extract product attributes for this catalog listing.
 
   Title: {{.title}}
   {{if .description}}Description: {{.description}}{{end}}
   Category: {{.category}}
+  {{if .brand}}Brand: {{.brand}}{{end}}
+  {{if .image}}A product photo is attached — extract attributes visible in it as well as from the text.{{end}}{{if .images}}Product photo(s) are attached — extract attributes visible in them as well as from the text.{{end}}
 
   Return a JSON object with exactly two keys:
   - "attributes": an object of attribute name -> value (strings only, e.g. "color": "red", "material": "cotton")
   - "confidence": a number between 0 and 1 for your overall confidence
 
-  Extract only attributes clearly supported by the listing text. Respond with JSON only.
+  Extract only attributes clearly supported by the listing text or image. Respond with JSON only.
 
 # Prediction cache: identical requests (same prompt version, rendered prompt,
-# model, params) are served from Redis without a provider call for the TTL.
+# model, params, and image) are served from Redis without a provider call for
+# the TTL.
 cache:
   enabled: true
   ttl: 24h

@@ -7,6 +7,7 @@ import (
 	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/cache"
 	"llm_platform_go/internal/db"
+	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
@@ -22,8 +23,9 @@ type RouterDeps struct {
 	Clients        *llm.Clients
 	Users          users.Store
 	Tasks          *tasks.Store
-	Runs           *db.RunWriter // optional async observability writer
-	Cache          cache.Cache   // optional prediction cache; nil → caching off
+	Runs           *db.RunWriter   // optional async observability writer
+	Cache          cache.Cache     // optional prediction cache; nil → caching off
+	Health         *health.Tracker // optional per-(task, model) circuit breaker
 	Auth           AuthConfig
 	AllowedOrigins []string // CORS — the frontend origin(s)
 }
@@ -36,6 +38,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		Tasks:   deps.Tasks,
 		Runs:    deps.Runs,
 		Cache:   deps.Cache,
+		Health:  deps.Health,
 		Auth:    deps.Auth,
 	}
 
@@ -78,6 +81,20 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.Delete("/sessions", h.DeleteSessions)
 		pr.Post("/feedback", h.Feedback)
 		pr.Get("/dashboard", h.Dashboard)
+
+		// Admin prompt history — a cross-tenant view of every user's runs, so
+		// it's held to the admin role (RequireAdmin), not a task capability.
+		// Static "models" is registered before "{run_id}" so it isn't captured
+		// as a run id.
+		pr.With(RequireAdmin).Get("/v1/admin/runs", h.AdminListRuns)
+		pr.With(RequireAdmin).Get("/v1/admin/runs/models", h.AdminRunModels)
+		pr.With(RequireAdmin).Get("/v1/admin/runs/{run_id}", h.AdminGetRun)
+
+		// Per-(task, model) circuit-breaker health: view live states, reset a
+		// model to healthy, and read the persisted fallback/health events.
+		pr.With(RequireAdmin).Get("/v1/admin/model-health", h.AdminModelHealth)
+		pr.With(RequireAdmin).Get("/v1/admin/model-health/events", h.AdminModelHealthEvents)
+		pr.With(RequireAdmin).Post("/v1/admin/model-health/reset", h.AdminResetModelHealth)
 
 		// Product task API — each route gated on the RBAC capability it needs.
 		// read: anyone with task access. predict: callers + authors. write:

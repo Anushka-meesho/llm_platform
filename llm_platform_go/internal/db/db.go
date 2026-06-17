@@ -104,6 +104,21 @@ func Migrate(db *sql.DB) error {
 			created_at     DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
 		CREATE INDEX IF NOT EXISTS idx_shadow_task ON shadow_reports(task_id);
+
+		CREATE TABLE IF NOT EXISTS model_health_events (
+			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id              TEXT NOT NULL,
+			model                TEXT NOT NULL,
+			provider             TEXT NOT NULL DEFAULT '',
+			event                TEXT NOT NULL, -- failure | tripped | recovered | manual_reset
+			reason               TEXT NOT NULL DEFAULT '',
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			cooldown_ms          INTEGER NOT NULL DEFAULT 0,
+			state                TEXT NOT NULL DEFAULT '',
+			created_at           DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_health_task_model ON model_health_events(task_id, model);
+		CREATE INDEX IF NOT EXISTS idx_health_created_at ON model_health_events(created_at);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -125,6 +140,9 @@ func Migrate(db *sql.DB) error {
 		// Prediction cache: per-task opt-in + TTL (0 = backend default 24h).
 		"ALTER TABLE tasks ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE tasks ADD COLUMN cache_ttl_seconds INTEGER NOT NULL DEFAULT 0",
+		// Multimodal predictions: the image input (base64 data URL / image URL)
+		// submitted with the run, persisted for audit/replay. NULL for text-only runs.
+		"ALTER TABLE runs ADD COLUMN image TEXT",
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate alter: %w", err)
