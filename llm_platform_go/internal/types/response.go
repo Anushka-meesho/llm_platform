@@ -88,7 +88,7 @@ type RunRow struct {
 	SessionID    *string
 	Prompt       string
 	SystemPrompt *string
-	Image        *string // multimodal input (data URL / image URL); nil for text-only runs
+	Images       []string // multimodal inputs (data URLs / image URLs), in submission order; empty for text-only runs
 	Model        string
 	Response     *string
 	LatencyMs    int
@@ -108,6 +108,74 @@ type RunRow struct {
 	CacheHit      bool
 	IsTest        bool // Studio test-panel call, not production traffic
 	CreatedAt     time.Time
+}
+
+// ── Admin: prompt history ────────────────────────────────────────────────────
+
+// RunListItem is one row of the admin prompt-history list. It is deliberately
+// lightweight: the prompt is truncated to a preview and full responses/images
+// are omitted, so a page of history stays small regardless of how large the
+// underlying prompts or base64 images are. The detail endpoint serves the rest.
+type RunListItem struct {
+	ID            int       `json:"id"`
+	RunID         string    `json:"run_id"`
+	TaskID        *string   `json:"task_id"`
+	UserEmail     *string   `json:"user_email"`
+	Model         string    `json:"model"`
+	Provider      *string   `json:"provider"`
+	PromptPreview string    `json:"prompt_preview"`
+	HasImage      bool      `json:"has_image"`
+	ImageCount    int       `json:"image_count"`
+	Success       bool      `json:"success"`
+	CacheHit      bool      `json:"cache_hit"`
+	FallbackUsed  bool      `json:"fallback_used"`
+	IsTest        bool      `json:"is_test"`
+	LatencyMs     int       `json:"latency_ms"`
+	TotalTokens   int       `json:"total_tokens"`
+	CostUSD       float64   `json:"cost_usd"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type RunListResponse struct {
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	TotalRuns  int           `json:"total_runs"`
+	TotalPages int           `json:"total_pages"`
+	Runs       []RunListItem `json:"runs"`
+}
+
+// RunDetailResult is one model's outcome within a run (a playground /run stores
+// one row per model; a task predict stores exactly one).
+type RunDetailResult struct {
+	Model        string  `json:"model"`
+	Provider     *string `json:"provider"`
+	Response     *string `json:"response"`
+	Success      bool    `json:"success"`
+	Error        *string `json:"error"`
+	LatencyMs    int     `json:"latency_ms"`
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	CacheHit     bool    `json:"cache_hit"`
+	FallbackUsed bool    `json:"fallback_used"`
+}
+
+// RunDetailResponse is the full record for one run_id, shared prompt/inputs on
+// top and per-model results below. Images carry the full data URLs (this is the
+// only endpoint that returns them).
+type RunDetailResponse struct {
+	RunID         string            `json:"run_id"`
+	TaskID        *string           `json:"task_id"`
+	UserID        *string           `json:"user_id"`
+	UserEmail     *string           `json:"user_email"`
+	PromptVersion int               `json:"prompt_version"`
+	Prompt        string            `json:"prompt"`
+	SystemPrompt  *string           `json:"system_prompt"`
+	Images        []string          `json:"images"`
+	IsTest        bool              `json:"is_test"`
+	CreatedAt     time.Time         `json:"created_at"`
+	Results       []RunDetailResult `json:"results"`
 }
 
 // ── Feedback ────────────────────────────────────────────────────────────────

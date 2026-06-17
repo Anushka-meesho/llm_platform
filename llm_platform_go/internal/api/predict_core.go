@@ -73,20 +73,21 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		return nil, &httpError{http.StatusUnprocessableEntity, err.Error()}
 	}
 
-	// Multimodal input: an "image" field (base64 data URL or https URL) is not
-	// rendered into the text prompt — the template only gates on it with
-	// {{if .image}} — but is attached to the user message as an image_url block
-	// for vision models. It must also key the cache (same text + different photo
-	// is a different prediction).
-	imageURL, _ := inputMap["image"].(string)
+	// Multimodal input: image fields (base64 data URLs or https URLs) are not
+	// rendered into the text prompt — the template only gates on them with
+	// {{if .image}} / {{if .images}} — but are attached to the user message as
+	// image_url blocks for vision models. They must also key the cache (same text
+	// + different photos is a different prediction). Both a single "image" string
+	// and an "images" array are accepted, in submission order.
+	images := collectImages(inputMap)
 
 	messages := []llm.ChatMessage{}
 	if renderTask.SystemPrompt != "" {
 		messages = append(messages, llm.ChatMessage{Role: "system", Content: renderTask.SystemPrompt})
 	}
 	userMsg := llm.ChatMessage{Role: "user", Content: prompt}
-	if imageURL != "" {
-		userMsg.Images = []string{imageURL}
+	if len(images) > 0 {
+		userMsg.Images = images
 	}
 	messages = append(messages, userMsg)
 
@@ -119,7 +120,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		Temperature:    task.Temperature,
 		MaxTokens:      task.MaxTokens,
 		OutputSchema:   string(task.OutputSchema),
-		Image:          imageURL,
+		Images:         images,
 	}
 	modelKey := func(model string) string { ki := base; ki.Model = model; return cache.Key(ki) }
 
@@ -153,7 +154,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		return h.serveCached(task, prompt, renderTask.SystemPrompt, imageURL, promptVersion, user, hitEntry), nil
+		return h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry), nil
 	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
@@ -199,17 +200,13 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	if renderTask.SystemPrompt != "" {
 		sysPrompt = &renderTask.SystemPrompt
 	}
-	var imagePtr *string
-	if imageURL != "" {
-		imagePtr = &imageURL
-	}
 	providerName := result.Provider
 
 	h.insertRun(&types.RunRow{
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
-		Image:         imagePtr,
+		Images:        images,
 		Model:         result.Model,
 		Response:      result.Response,
 		LatencyMs:     result.LatencyMs,
@@ -246,7 +243,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 // still gets a run row (cache_hit=1) so attribution and hit-rate stay
 // observable, but with zero cost/tokens — nothing was consumed upstream, and
 // the budget gate must not count replayed answers as spend.
-func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt, imageURL string,
+func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, images []string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
@@ -268,17 +265,13 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt, imageURL s
 	if systemPrompt != "" {
 		sysPrompt = &systemPrompt
 	}
-	var imagePtr *string
-	if imageURL != "" {
-		imagePtr = &imageURL
-	}
 	providerName := entry.Provider
 
 	h.insertRun(&types.RunRow{
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
-		Image:         imagePtr,
+		Images:        images,
 		Model:         entry.Model,
 		Response:      &response,
 		Success:       true,
@@ -310,6 +303,26 @@ func (h *Handler) insertRun(row *types.RunRow) {
 		return
 	}
 	_ = db.InsertRun(h.DB, row)
+}
+
+// collectImages gathers the multimodal inputs from a request, in submission
+// order: a single "image" string (legacy single-image contract) first, then any
+// entries of an "images" array. Blank entries are dropped. Both keys are
+// accepted so existing single-image callers keep working alongside multi-image
+// ones, and a non-string entry is simply ignored rather than failing the call.
+func collectImages(inputMap map[string]any) []string {
+	var out []string
+	if s, ok := inputMap["image"].(string); ok && s != "" {
+		out = append(out, s)
+	}
+	if arr, ok := inputMap["images"].([]any); ok {
+		for _, v := range arr {
+			if s, ok := v.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.

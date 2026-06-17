@@ -133,13 +133,107 @@ func TestPredictForwardsAndStoresImage(t *testing.T) {
 		t.Errorf("image_url block with the data URL not forwarded to provider: %v", parts)
 	}
 
-	// (2) The run row must persist the image.
+	// (2) The run row must persist the image as a JSON array (the multi-image
+	// storage form — one image is just a single-element array).
 	var stored sql.NullString
 	if err := database.QueryRow(`SELECT image FROM runs WHERE task_id = 'img-task'`).Scan(&stored); err != nil {
 		t.Fatalf("read run image: %v", err)
 	}
-	if !stored.Valid || stored.String != dataURL {
-		t.Errorf("run image not stored: valid=%v got=%q", stored.Valid, stored.String)
+	var storedImages []string
+	if !stored.Valid || json.Unmarshal([]byte(stored.String), &storedImages) != nil {
+		t.Fatalf("run image not stored as a JSON array: valid=%v got=%q", stored.Valid, stored.String)
+	}
+	if len(storedImages) != 1 || storedImages[0] != dataURL {
+		t.Errorf("run image not stored: got %v", storedImages)
+	}
+}
+
+// TestPredictForwardsAndStoresMultipleImages covers the multi-image path: an
+// "images" array must forward every photo to the provider as its own image_url
+// block and persist all of them on the run row.
+func TestPredictForwardsAndStoresMultipleImages(t *testing.T) {
+	imageA := "data:image/png;base64,AAAAAAAAA"
+	imageB := "data:image/png;base64,BBBBBBBBB"
+
+	var gotContent any
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if len(body.Messages) > 0 {
+			gotContent = body.Messages[len(body.Messages)-1].Content // last = user message
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": `{"label":"shirts"}`}}},
+			"usage":   map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	t.Cleanup(fake.Close)
+
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
+	srv, database := newTestServerWithClients(t, clients)
+
+	taskBody := `{
+		"id": "multi-img-task",
+		"name": "Multi Image Task",
+		"model": "gpt-4o-mini",
+		"prompt_template": "Describe {{.title}}{{if .images}} (images attached){{end}}",
+		"input_schema": {"type":"object","required":["title"],"properties":{"title":{"type":"string"},"images":{"type":"array","items":{"type":"string"}}}},
+		"output_schema": {"type":"object","required":["label"],"properties":{"label":{"type":"string"}}}
+	}`
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/tasks", taskBody))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create task: err=%v status=%v", err, resp.StatusCode)
+	}
+
+	predictBody, _ := json.Marshal(map[string]any{"inputs": map[string]any{
+		"title": "Two shirts", "images": []string{imageA, imageB},
+	}})
+	resp, err = http.DefaultClient.Do(authReq(t, http.MethodPost,
+		srv.URL+"/v1/tasks/multi-img-task/predict", string(predictBody)))
+	if err != nil {
+		t.Fatalf("predict: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("predict status: got %d, want 200", resp.StatusCode)
+	}
+
+	// (1) Both images forwarded as image_url blocks.
+	parts, ok := gotContent.([]any)
+	if !ok {
+		t.Fatalf("provider got non-multimodal content %T: %v", gotContent, gotContent)
+	}
+	seen := map[string]bool{}
+	for _, p := range parts {
+		m, _ := p.(map[string]any)
+		if m["type"] == "image_url" {
+			if iu, _ := m["image_url"].(map[string]any); iu != nil {
+				if url, _ := iu["url"].(string); url != "" {
+					seen[url] = true
+				}
+			}
+		}
+	}
+	if !seen[imageA] || !seen[imageB] {
+		t.Errorf("not all images forwarded to provider: %v", parts)
+	}
+
+	// (2) Both images persisted on the run row, in order.
+	var stored sql.NullString
+	if err := database.QueryRow(`SELECT image FROM runs WHERE task_id = 'multi-img-task'`).Scan(&stored); err != nil {
+		t.Fatalf("read run image: %v", err)
+	}
+	var storedImages []string
+	if !stored.Valid || json.Unmarshal([]byte(stored.String), &storedImages) != nil {
+		t.Fatalf("run images not stored as a JSON array: valid=%v got=%q", stored.Valid, stored.String)
+	}
+	if len(storedImages) != 2 || storedImages[0] != imageA || storedImages[1] != imageB {
+		t.Errorf("run images not stored in order: got %v", storedImages)
 	}
 }
 

@@ -169,6 +169,76 @@ export type TLeaderboardResponse = {
   entries: TLeaderboardEntry[];
 };
 
+// ── Admin: prompt history ─────────────────────────────────────────────────────
+
+export type TRunListItem = {
+  id: number;
+  run_id: string;
+  task_id: string | null;
+  user_email: string | null;
+  model: string;
+  provider: string | null;
+  prompt_preview: string;
+  has_image: boolean;
+  image_count: number;
+  success: boolean;
+  cache_hit: boolean;
+  fallback_used: boolean;
+  is_test: boolean;
+  latency_ms: number;
+  total_tokens: number;
+  cost_usd: number;
+  created_at: string;
+};
+
+export type TRunListResponse = {
+  page: number;
+  page_size: number;
+  total_runs: number;
+  total_pages: number;
+  runs: TRunListItem[];
+};
+
+export type TRunDetailResult = {
+  model: string;
+  provider: string | null;
+  response: string | null;
+  success: boolean;
+  error: string | null;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  cache_hit: boolean;
+  fallback_used: boolean;
+};
+
+export type TRunDetail = {
+  run_id: string;
+  task_id: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  prompt_version: number;
+  prompt: string;
+  system_prompt: string | null;
+  images: string[];
+  is_test: boolean;
+  created_at: string;
+  results: TRunDetailResult[];
+};
+
+export type TRunFilters = {
+  page?: number;
+  pageSize?: number;
+  taskId?: string;
+  model?: string;
+  userEmail?: string;
+  q?: string;
+  status?: '' | 'success' | 'error';
+  type?: '' | 'production' | 'test';
+};
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 export type TUser = {

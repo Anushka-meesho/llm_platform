@@ -47,8 +47,18 @@ input_schema:
     image:
       type: string
       description: >
-        Optional product photo as a base64 data URL ("data:image/jpeg;base64,...")
-        or an image URL. The model reads visible attributes directly from it.
+        Optional single product photo as a base64 data URL
+        ("data:image/jpeg;base64,...") or an image URL. The model reads visible
+        attributes directly from it. Prefer "images" for one or more photos;
+        this single-image field is kept for backward compatibility.
+    images:
+      type: array
+      items:
+        type: string
+      description: >
+        Optional product photos (one or more) as base64 data URLs
+        ("data:image/jpeg;base64,...") or image URLs — e.g. front, back, and
+        label shots. The model reads visible attributes from every image.
 
 output_schema:
   type: object
@@ -77,7 +87,7 @@ prompt_template: |
   {{if .description}}Description: {{.description}}{{end}}
   Category: {{.category}}
   {{if .brand}}Brand: {{.brand}}{{end}}
-  {{if .image}}A product photo is attached — extract attributes visible in it as well as from the text.{{end}}
+  {{if .image}}A product photo is attached — extract attributes visible in it as well as from the text.{{end}}{{if .images}}Product photo(s) are attached — extract attributes visible in them as well as from the text.{{end}}
 
   Return a JSON object with exactly two keys:
   - "attributes": an object of attribute name -> value (strings only, e.g. "color": "red", "material": "cotton")

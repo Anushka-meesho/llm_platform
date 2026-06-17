@@ -79,6 +79,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.Post("/feedback", h.Feedback)
 		pr.Get("/dashboard", h.Dashboard)
 
+		// Admin prompt history — a cross-tenant view of every user's runs, so
+		// it's held to the admin role (RequireAdmin), not a task capability.
+		// Static "models" is registered before "{run_id}" so it isn't captured
+		// as a run id.
+		pr.With(RequireAdmin).Get("/v1/admin/runs", h.AdminListRuns)
+		pr.With(RequireAdmin).Get("/v1/admin/runs/models", h.AdminRunModels)
+		pr.With(RequireAdmin).Get("/v1/admin/runs/{run_id}", h.AdminGetRun)
+
 		// Product task API — each route gated on the RBAC capability it needs.
 		// read: anyone with task access. predict: callers + authors. write:
 		// authoring (creator/admin). deploy: the publish gate (approver/admin).

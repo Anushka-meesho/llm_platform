@@ -8,20 +8,25 @@ import TasksPage from '../pages/TasksPage';
 import VersionsPage from '../pages/VersionsPage';
 import EstimatePage from '../pages/EstimatePage';
 import DashboardPage from '../pages/DashboardPage';
+import AdminRunsPage from '../pages/AdminRunsPage';
 
-type TView = 'compare' | 'tasks' | 'versions' | 'estimate' | 'dashboard';
+type TView = 'compare' | 'tasks' | 'versions' | 'estimate' | 'dashboard' | 'history';
 
-const NAV: { key: TView; label: string; icon: string }[] = [
+const NAV: { key: TView; label: string; icon: string; adminOnly?: boolean }[] = [
   { key: 'compare', label: 'Compare', icon: '💬' },
   { key: 'tasks', label: 'Tasks', icon: '🗂️' },
   { key: 'versions', label: 'Versions', icon: '🕘' },
   { key: 'estimate', label: 'Estimate', icon: '🧮' },
   { key: 'dashboard', label: 'Dashboard', icon: '📊' },
+  { key: 'history', label: 'History', icon: '🗂', adminOnly: true },
 ];
 
 const AppShell = () => {
   const { user, logout } = useAuth();
   const [view, setView] = useState<TView>('compare');
+
+  const isAdmin = user?.role === 'admin';
+  const nav = NAV.filter((item) => !item.adminOnly || isAdmin);
 
   // Sync the frontend's pricing table with the backend's once we're in.
   useEffect(() => {
@@ -42,7 +47,7 @@ const AppShell = () => {
         </Typography>
 
         <nav className="flex items-center gap-1">
-          {NAV.map((item) => (
+          {nav.map((item) => (
             <button
               key={item.key}
               onClick={() => setView(item.key)}
@@ -92,6 +97,7 @@ const AppShell = () => {
       {view === 'versions' && <VersionsPage />}
       {view === 'estimate' && <EstimatePage />}
       {view === 'dashboard' && <DashboardPage />}
+      {view === 'history' && isAdmin && <AdminRunsPage />}
     </div>
   );
 };

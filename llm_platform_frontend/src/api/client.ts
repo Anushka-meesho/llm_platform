@@ -11,6 +11,9 @@ import type {
   TPredictResult,
   TTaskStatsDetail,
   TLeaderboardResponse,
+  TRunListResponse,
+  TRunDetail,
+  TRunFilters,
 } from '../types';
 
 const BASE = '';
@@ -148,6 +151,26 @@ export const api = {
 
   taskStats: (id: string, days = 30) =>
     fetchJSON<TTaskStatsDetail>(`${BASE}/v1/tasks/${id}/stats?days=${days}`),
+
+  // ── Admin: prompt history (admin role only, 403 otherwise) ─────────────────
+  adminRuns: (f: TRunFilters = {}) => {
+    const p = new URLSearchParams();
+    p.set('page', String(f.page ?? 1));
+    p.set('page_size', String(f.pageSize ?? 25));
+    if (f.taskId) p.set('task_id', f.taskId);
+    if (f.model) p.set('model', f.model);
+    if (f.userEmail) p.set('user_email', f.userEmail);
+    if (f.q) p.set('q', f.q);
+    if (f.status) p.set('status', f.status);
+    if (f.type) p.set('type', f.type);
+    return fetchJSON<TRunListResponse>(`${BASE}/v1/admin/runs?${p.toString()}`);
+  },
+
+  adminRun: (runId: string) =>
+    fetchJSON<TRunDetail>(`${BASE}/v1/admin/runs/${encodeURIComponent(runId)}`),
+
+  adminRunModels: () =>
+    fetchJSON<{ models: string[] }>(`${BASE}/v1/admin/runs/models`),
 
   health: () => fetchJSON<{ status: string }>(`${BASE}/health`),
 };
