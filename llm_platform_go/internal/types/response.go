@@ -88,6 +88,7 @@ type RunRow struct {
 	SessionID    *string
 	Prompt       string
 	SystemPrompt *string
+	Image        *string // multimodal input (data URL / image URL); nil for text-only runs
 	Model        string
 	Response     *string
 	LatencyMs    int

@@ -125,6 +125,9 @@ func Migrate(db *sql.DB) error {
 		// Prediction cache: per-task opt-in + TTL (0 = backend default 24h).
 		"ALTER TABLE tasks ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE tasks ADD COLUMN cache_ttl_seconds INTEGER NOT NULL DEFAULT 0",
+		// Multimodal predictions: the image input (base64 data URL / image URL)
+		// submitted with the run, persisted for audit/replay. NULL for text-only runs.
+		"ALTER TABLE runs ADD COLUMN image TEXT",
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate alter: %w", err)

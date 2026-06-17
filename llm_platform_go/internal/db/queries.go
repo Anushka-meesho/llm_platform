@@ -13,12 +13,12 @@ import (
 func InsertRun(db *sql.DB, r *types.RunRow) error {
 	_, err := db.Exec(`
 		INSERT INTO runs
-			(run_id, session_id, prompt, system_prompt, model, response,
+			(run_id, session_id, prompt, system_prompt, image, model, response,
 			 latency_ms, input_tokens, output_tokens, total_tokens,
 			 cost_usd, success, error, user_id, user_email,
 			 task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.RunID, r.SessionID, r.Prompt, r.SystemPrompt, r.Model, r.Response,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.RunID, r.SessionID, r.Prompt, r.SystemPrompt, r.Image, r.Model, r.Response,
 		r.LatencyMs, r.InputTokens, r.OutputTokens, r.TotalTokens,
 		r.CostUSD, boolToInt(r.Success), r.Error, r.UserID, r.UserEmail,
 		r.TaskID, r.PromptVersion, r.Provider, boolToInt(r.FallbackUsed), boolToInt(r.CacheHit),

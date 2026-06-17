@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from 'react';
 import type { TJSONSchema, TPredictResult, TTask, TTaskStatsDetail } from '../types';
 import { api, ApiError, type PredictOutcome } from '../api/client';
 import { API_TOKEN } from '../auth/token';
@@ -147,14 +147,23 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
                   <span className="text-neutral-400"> — {f.schema.description}</span>
                 )}
               </div>
-              <textarea
-                value={values[f.name] ?? ''}
-                onChange={(e) =>
-                  setValues((prev) => ({ ...prev, [f.name]: e.target.value }))
-                }
-                rows={1}
-                className="w-full border border-neutral-300 rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-white"
-              />
+              {isImageField(f) ? (
+                <ImageField
+                  value={values[f.name] ?? ''}
+                  onChange={(dataUrl) =>
+                    setValues((prev) => ({ ...prev, [f.name]: dataUrl }))
+                  }
+                />
+              ) : (
+                <textarea
+                  value={values[f.name] ?? ''}
+                  onChange={(e) =>
+                    setValues((prev) => ({ ...prev, [f.name]: e.target.value }))
+                  }
+                  rows={1}
+                  className="w-full border border-neutral-300 rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-white"
+                />
+              )}
             </label>
           ))}
         </div>
@@ -208,6 +217,62 @@ function coerce(raw: string, schema: TJSONSchema): unknown {
       return raw;
   }
 }
+
+// A field is an image input when it's named "image" or its description mentions
+// a data URL / image — the platform attaches it to the model as a vision block.
+function isImageField(f: Field): boolean {
+  if (f.schema.type && f.schema.type !== 'string') return false;
+  if (f.name.toLowerCase() === 'image') return true;
+  const d = (f.schema.description ?? '').toLowerCase();
+  return d.includes('data url') || d.includes('image url') || d.includes('product photo');
+}
+
+// ImageField lets a seller pick a photo; it's read into a base64 data URL (the
+// string the predict API expects) and previewed inline.
+const ImageField = ({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (dataUrl: string) => void;
+}) => {
+  const [name, setName] = useState<string | null>(null);
+
+  const onPick = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => onChange(typeof reader.result === 'string' ? reader.result : '');
+    reader.readAsDataURL(file);
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <input
+        type="file"
+        accept="image/*"
+        onChange={onPick}
+        className="text-sm text-neutral-700 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
+      />
+      {value && (
+        <div className="flex items-center gap-3">
+          <img src={value} alt="preview" className="h-20 w-20 object-cover rounded-md border border-neutral-200" />
+          <button
+            type="button"
+            onClick={() => {
+              setName(null);
+              onChange('');
+            }}
+            className="text-xs text-neutral-500 underline bg-transparent border-none cursor-pointer p-0"
+          >
+            Remove {name ? `(${name})` : ''}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
 
 const ResultCard = ({ outcome }: { outcome: PredictOutcome }) => {
   const r: TPredictResult = outcome.result;

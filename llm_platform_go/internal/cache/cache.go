@@ -53,7 +53,8 @@ type KeyInputs struct {
 	RenderedPrompt string  `json:"rendered_prompt"` // template + all inputs/context
 	Temperature    float64 `json:"temperature"`
 	MaxTokens      int     `json:"max_tokens"`
-	OutputSchema   string  `json:"output_schema"` // raw schema JSON; "" when absent
+	OutputSchema   string  `json:"output_schema"`  // raw schema JSON; "" when absent
+	Image          string  `json:"image,omitempty"` // multimodal input (data URL); "" for text-only tasks
 }
 
 // Key returns the deterministic cache key for one prediction. Field order is

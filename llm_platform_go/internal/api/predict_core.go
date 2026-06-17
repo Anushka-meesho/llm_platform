@@ -73,11 +73,22 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		return nil, &httpError{http.StatusUnprocessableEntity, err.Error()}
 	}
 
+	// Multimodal input: an "image" field (base64 data URL or https URL) is not
+	// rendered into the text prompt — the template only gates on it with
+	// {{if .image}} — but is attached to the user message as an image_url block
+	// for vision models. It must also key the cache (same text + different photo
+	// is a different prediction).
+	imageURL, _ := inputMap["image"].(string)
+
 	messages := []llm.ChatMessage{}
 	if renderTask.SystemPrompt != "" {
 		messages = append(messages, llm.ChatMessage{Role: "system", Content: renderTask.SystemPrompt})
 	}
-	messages = append(messages, llm.ChatMessage{Role: "user", Content: prompt})
+	userMsg := llm.ChatMessage{Role: "user", Content: prompt}
+	if imageURL != "" {
+		userMsg.Images = []string{imageURL}
+	}
+	messages = append(messages, userMsg)
 
 	// Model chain: explicit override (Studio), or primary + fallbacks.
 	models := append([]string{task.Model}, task.FallbackModels...)
@@ -108,6 +119,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		Temperature:    task.Temperature,
 		MaxTokens:      task.MaxTokens,
 		OutputSchema:   string(task.OutputSchema),
+		Image:          imageURL,
 	}
 	modelKey := func(model string) string { ki := base; ki.Model = model; return cache.Key(ki) }
 
@@ -141,7 +153,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		return h.serveCached(task, prompt, renderTask.SystemPrompt, promptVersion, user, hitEntry), nil
+		return h.serveCached(task, prompt, renderTask.SystemPrompt, imageURL, promptVersion, user, hitEntry), nil
 	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
@@ -187,12 +199,17 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	if renderTask.SystemPrompt != "" {
 		sysPrompt = &renderTask.SystemPrompt
 	}
+	var imagePtr *string
+	if imageURL != "" {
+		imagePtr = &imageURL
+	}
 	providerName := result.Provider
 
 	h.insertRun(&types.RunRow{
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
+		Image:         imagePtr,
 		Model:         result.Model,
 		Response:      result.Response,
 		LatencyMs:     result.LatencyMs,
@@ -229,7 +246,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 // still gets a run row (cache_hit=1) so attribution and hit-rate stay
 // observable, but with zero cost/tokens — nothing was consumed upstream, and
 // the budget gate must not count replayed answers as spend.
-func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string,
+func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt, imageURL string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
@@ -251,12 +268,17 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string,
 	if systemPrompt != "" {
 		sysPrompt = &systemPrompt
 	}
+	var imagePtr *string
+	if imageURL != "" {
+		imagePtr = &imageURL
+	}
 	providerName := entry.Provider
 
 	h.insertRun(&types.RunRow{
 		RunID:         runID,
 		Prompt:        prompt,
 		SystemPrompt:  sysPrompt,
+		Image:         imagePtr,
 		Model:         entry.Model,
 		Response:      &response,
 		Success:       true,
