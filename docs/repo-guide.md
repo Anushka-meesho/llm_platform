@@ -1,6 +1,6 @@
 # LLM Platform — Complete Repository Guide
 
-**Last updated:** 2026-06-16
+**Last updated:** 2026-06-17
 **Scope:** `llm_platform_go` (backend) + `llm_platform_frontend` (operator Studio UI) +
 `llm_platform_client` (consumer-facing client portal). The Python `llm_platform_v0` is
 superseded and excluded.
@@ -21,7 +21,9 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 
 **Current state — Phases 0 + 1 complete:**
 - Task registry (YAML + API), task-keyed prediction endpoint with schema enforcement
-- **Resilient routing:** fallback chains + per-provider circuit breaker, `X-Platform-Degraded` contract
+- **Multimodal input:** a task may accept one image (`image`) or many (`images[]`) — base64 data URLs or image URLs — attached to vision models as OpenAI multimodal content blocks (the live `attribute-extraction` task uses this)
+- **Resilient routing:** fallback chains + a **per-provider** circuit breaker **and** a **per-(task, model)** health breaker that skips a model for one task after repeated failures (incl. schema-invalid output) with exponential-backoff cooldown + admin reset, `X-Platform-Degraded` contract
+- **Admin observability:** a cross-tenant **prompt-history** viewer (every user's runs, filterable + paginated) and a **model-health** console (live circuit states + persisted fallback/health events), both admin-only
 - **Budget enforcement:** per-task daily caps → 429 + `Retry-After` (0 = exempt)
 - **Service auth + RBAC:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready) with a role; role-based authorization enforced at the gateway (creator / approver / caller / viewer / admin — see §3.3)
 - **Prompt registry:** first-class versions (draft → test → deploy), auto-history, Studio UI (Tasks page)
@@ -59,8 +61,9 @@ llm_platform/
 │   │   ├── auth/                  # JWT issue/parse, cookie management
 │   │   ├── cache/                 # prediction cache: Redis / memory behind Cache iface
 │   │   ├── config/                # env-driven configuration
-│   │   ├── db/                    # SQLite open/migrate + all SQL queries
-│   │   ├── llm/                   # provider clients, model routing, pricing
+│   │   ├── db/                    # SQLite open/migrate + SQL queries + async run/health writers
+│   │   ├── health/                # per-(task, model) circuit-breaker tracker
+│   │   ├── llm/                   # provider clients, model routing, pricing, fallback walk
 │   │   ├── tasks/                 # Task registry: model, store, validate, render, seed
 │   │   ├── types/                 # request/response contracts + RunRow
 │   │   └── users/                 # identity seam: Store interface + DemoStore
@@ -76,7 +79,8 @@ llm_platform/
 │       │                          #   ChatInput, MessageBubble, StarRating, LeaderboardModal,
 │       │                          #   SchemaEditor, VersionHistory, SystemPromptBar
 │       ├── hooks/                 # useChat (Compare state), useSessions
-│       ├── pages/                 # ComparePage, TasksPage, VersionsPage, EstimatePage, DashboardPage
+│       ├── pages/                 # ComparePage, TasksPage, VersionsPage, EstimatePage, DashboardPage,
+│       │                          #   AdminRunsPage (prompt history), ModelHealthPage (admin-only)
 │       ├── types/index.ts         # API contract mirror
 │       └── utils/tokens.ts        # js-tiktoken counting + pricing-fed cost estimation
 ├── llm_platform_client/           # Client portal (:5174) — consumer-facing, /v1 API only
@@ -104,9 +108,12 @@ llm_platform/
    every `tasks.d/*.yaml`; a changed prompt bumps that task's `prompt_version`.
 8. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
 9. `db.NewRunWriter` — async observability writer; `Close()` flushes on shutdown.
-10. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
+10. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) circuit
+    breaker (thresholds from config; transitions persisted via the async health writer).
+    See §3.6.
+11. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
     memory / off.
-11. `api.NewRouter(RouterDeps{...})` → `http.ListenAndServe(:PORT)`.
+12. `api.NewRouter(RouterDeps{...})` → `http.ListenAndServe(:PORT)`.
 
 ### 3.2 Configuration — `internal/config`
 
@@ -128,6 +135,10 @@ llm_platform/
 | `ALLOWED_ORIGINS` | `http://localhost:5173` | CORS allowlist (credentials mode) |
 | `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | — | Prediction cache backend; addr set → Redis (boot fails on bad addr) |
 | `CACHE_BACKEND` | derived | `redis` \| `memory` (in-process, dev only) \| `off` (default when no `REDIS_ADDR`) |
+| `HEALTH_BREAKER_ENABLED` | `true` | Per-(task, model) health breaker on/off (off = every model is tried every time) |
+| `HEALTH_FAILURE_THRESHOLD` | `3` | Consecutive failures (provider error OR schema-invalid output) before a model is tripped unhealthy for a task |
+| `HEALTH_BASE_COOLDOWN` | `30s` | First unhealthy cooldown window; doubles on each re-trip |
+| `HEALTH_MAX_COOLDOWN` | `30m` | Cap for the backed-off cooldown |
 
 ### 3.3 Auth — `internal/auth`
 
@@ -229,9 +240,13 @@ plug-and-play onboarding contract (schemas written as YAML maps, converted to JS
 `SeedPlayground` registers the built-in `playground` task once and never overwrites it.
 
 **YAML contract example** — `tasks.d/attribute-extraction.yaml` (live, working):
-input `{title*, description, category*}` → output `{attributes: {string: string},
-confidence: 0..1}`, model `llama-groq`, fallback `[gpt-4o-mini]`, budget $50/day,
-`cache: {enabled: true, ttl: 24h}`.
+input `{title*, description, category*, brand, image, images[]}` → output
+`{attributes: {string: string}, confidence: 0..1}`, model `gemini-2.5-flash` (vision),
+fallback `[gpt-4o-mini]` (vision), budget $50/day, `max_tokens: 2048` (Gemini 2.5 Flash
+spends hidden "thinking" tokens from the same budget; a tight cap truncates the JSON →
+schema-invalid), `cache: {enabled: true, ttl: 24h}`. The optional `image` (single string)
+and `images` (array of strings) fields take base64 data URLs or image URLs and are attached
+to the vision model as multimodal content blocks — see §3.6 (Multimodal input).
 
 ### 3.6 Model layer — `internal/llm`
 
@@ -294,10 +309,49 @@ circuit isn't closed; a completed exchange closes the circuit, and since
 `CallWithFallback` walks the chain from the front on every request, the very
 next prediction returns to the highest-priority healthy model automatically.
 
-**Fallback chain** (`fallback.go`): `CallWithFallback(models []string, …)` tries
-primary then fallbacks, advancing **only on infra failures or open circuits** — a
-content-level outcome (success or 4xx) returns immediately. Sets
-`ModelResult.FallbackUsed` and `.Degraded` (drives the `X-Platform-Degraded` header).
+**Fallback chain** (`fallback.go`): `CallWithFallbackOpts(models []string, …, FallbackOptions)`
+tries primary then fallbacks. `FallbackOptions` carries three optional hooks: the per-model
+cache `Lookup`, a `HealthGate` (the per-(task, model) breaker — §below), and an
+`OutputValidator` (schema check). For each model in priority order it:
+- **skips** the model entirely (no call) if the `HealthGate` reports it unhealthy for this task;
+- serves a cached answer if `Lookup` hits;
+- otherwise calls it live. A **usable** success (passes the validator, or no validator) is
+  returned and recorded healthy; a provider error **or a schema-invalid response** is recorded
+  against health and **advances the chain to the next model in the same request**; a 400/422
+  content error returns immediately (bad input — not the model's fault, not counted).
+
+So a content-level success or 4xx returns immediately, while infra/config failures *and*
+schema-invalid output advance the chain. Sets `ModelResult.FallbackUsed` and `.Degraded`
+(drives the `X-Platform-Degraded` header). `CallWithFallback`/`CallWithFallbackCached` remain
+as thin wrappers (no gate, no validator) for callers that don't need health gating.
+
+**Multimodal input** (`client.go`): `ChatMessage.Images []string` holds image references
+(base64 data URLs or image URLs). Its custom `MarshalJSON` emits the plain-string content
+form when there are no images (byte-identical to the legacy wire form) and the OpenAI
+multimodal array (`[{type:text}, {type:image_url}…]`) when there are — so one or many images
+ride the same OpenAI-compatible endpoint. The predict pipeline collects images from both an
+`image` (single string) and an `images` (array) input field, in submission order
+(`collectImages`), folds them into the cache key, and persists them on the run row.
+
+**Per-(task, model) health breaker** (`internal/health`): distinct from the provider breaker
+above — keyed on a specific task's use of a specific model, so a model that misbehaves for one
+task is routed around **only for that task**. The `Tracker` (process-wide, mutex-guarded) is
+fed by the fallback walk through a task-bound `HealthGate` adapter (`predict_core.go`):
+- every failed call — a provider error (network / 401-403 auth / 429 / 5xx / timeout) **or a
+  schema-invalid output** — increments a consecutive-failure counter;
+- after `HEALTH_FAILURE_THRESHOLD` (default 3) consecutive failures the model is tripped
+  **unhealthy** for a cooldown window (`HEALTH_BASE_COOLDOWN`, default 30s) and **skipped** —
+  no call is made — until it elapses;
+- when the window elapses, one **probing** trial is allowed; a success recovers it to healthy,
+  a failure re-trips it with a **doubled** cooldown (×2, capped at `HEALTH_MAX_COOLDOWN`,
+  default 30m);
+- an admin can force any model back to healthy (`POST /v1/admin/model-health/reset`).
+
+Health gating + schema-aware fallback apply to **production predicts only** (`useCache` set,
+no model override) — Studio test panels, shadow runs, and single-model overrides call the
+model as asked and don't feed production health. Live state is in-process (like the provider
+breaker; it resets on restart); every transition (`failure` / `tripped` / `recovered` /
+`manual_reset`) is persisted to `model_health_events` via an async writer for observation.
 
 **`RunAll`** — playground fan-out: goroutine per model, buffered channel, results in
 arrival order (fastest first).
@@ -306,23 +360,18 @@ arrival order (fastest first).
 (Redis in production, in-process memory for dev, off when unconfigured — `Cache`
 interface is the seam). Every key is a SHA-256 over *what determined the output*:
 task id, **deployed prompt version**, the **fully rendered prompt** (template +
-every input/context value), system prompt, temperature, max_tokens, and output
-schema — so deploys, param changes, and schema edits all invalidate implicitly.
-The cache is **two-level**, both written on a clean predict:
+every input/context value), system prompt, temperature, max_tokens, output
+schema, and any **image inputs** (in order) — so deploys, param changes, schema
+edits, and a different photo all invalidate implicitly. The chain is **not** part
+of the key: the cache is keyed **per model** (the single routing key that produced
+the answer), and is consulted *during* the fallback walk as the router reaches each
+model — never as a pre-call shortcut past a higher-priority model. So a recovered
+primary is always tried live rather than shadowed by a stale lower-priority entry.
+TTL is the per-task `cache_ttl_seconds` or `DefaultTTL` (24h) — "model X said Y for
+prompt P" is a stable fact regardless of chain composition.
 
-1. **Chain-level** — key also pins the **whole fallback structure**
-   (`[primary, ...fallbacks]`). Checked **first**: if the chain is identical to
-   when it was cached, this hits directly. Short TTL (`cache.ChainTTL`, 60s) —
-   it may hold a degraded (fallback-served) answer, so it re-evaluates often.
-2. **Per-model** — key pins a single **model routing key**. Looked up only when
-   the chain-level entry misses (the fallback structure changed, or it expired):
-   the lookup walks the chain and serves the first model with a cached answer.
-   Long TTL (the per-task setting or `DefaultTTL` 24h) — "model X said Y for
-   prompt P" is stable regardless of chain composition.
-
-Fill writes both: the chain entry (whatever model served — **including a
-fallback**) and a per-model entry (under the serving model). A cached answer
-from a non-primary model is still reported `fallback_used` / `X-Platform-
+Fill writes one entry under the serving model (**including a fallback**). A cached
+answer from a non-primary model is still reported `fallback_used` / `X-Platform-
 Degraded`. Only **clean production predicts** are cached: success + output
 schema valid (or no schema), `useCache` set only by `Predict` (Studio test +
 shadow always run fresh); failures and schema-invalid outputs are never cached.
@@ -355,7 +404,7 @@ read back as the zero time (which surfaced in the UI as `0001-01-01`).
 | Column group | Columns |
 |---|---|
 | Identity | `id`, `run_id` (uuid, groups a fan-out), `session_id` (playground only) |
-| Request | `prompt` (rendered), `system_prompt`, `model` |
+| Request | `prompt` (rendered), `system_prompt`, `model`, `image` (multimodal inputs — a JSON array of data URLs / image URLs, or NULL for text-only; legacy single-string rows still parse) |
 | Result | `response`, `success`, `error`, `latency_ms` |
 | Usage | `input_tokens`, `output_tokens`, `total_tokens`, `cost_usd` |
 | Attribution | `user_id`, `user_email`, **`task_id`**, **`prompt_version`**, **`provider`** |
@@ -374,17 +423,34 @@ row. **`shadow_reports`** — persisted comparison reports (match_rate, latency
 percentiles, cost, mismatch details JSON). `runs.is_test` flags Studio test-panel
 calls (spend still counts).
 
+**`model_health_events`** — the durable log behind the per-(task, model) health
+breaker (§3.6): `(task_id, model, provider, event, reason, consecutive_failures,
+cooldown_ms, state, created_at)`, where `event ∈ {failure, tripped, recovered,
+manual_reset}`. Indexed on `(task_id, model)` and `created_at`. The live circuit
+state is in-memory (`internal/health`); this table is the persisted history for the
+admin model-health console and post-hoc analysis.
+
 **Queries** (`queries.go`): `InsertRun`, `GetRunByID` (poll), `ListSessions` /
 `GetSession` / `DeleteSessions` (all user-scoped), `UpsertFeedback`,
 `DashboardStats(userID)` → totals + `by_task` (runs/tokens/cost/avg-latency/success-rate)
 + `by_model` (incl. avg star rating via pre-aggregated join — no fan-out inflation) +
 daily time series; `TaskSpendToday` (budget gate), `TaskDailyStats` (per-task stats
-endpoint). Pre-Phase-0 rows surface as task `untagged` via COALESCE.
+endpoint). Pre-Phase-0 rows surface as task `untagged` via COALESCE. **Admin
+(cross-tenant, not user-scoped):** `ListAllRuns(filter, page, pageSize)` (lightweight
+rows — truncated prompt preview + image count, never the bytes — with filters on
+task/model/user/status/prod-vs-test and prompt-text search), `GetRunDetail(runID)`
+(full prompt + per-model results + image data URLs), `DistinctRunModels` (filter
+dropdown), `InsertHealthEvent`, `ListHealthEvents(taskID, model, page, pageSize)`.
+Image columns serialize via `imagesToColumn` / `ParseImagesColumn` (JSON array,
+back-compatible with legacy single-string rows).
 
 **`RunWriter`** (`runwriter.go`): buffered channel (1024) + drain goroutine →
 `InsertRun`; non-blocking `Write` with dropped-row counter; `Close()` flushes on
 shutdown. Handlers go through `Handler.insertRun`, which uses the writer when set and
 falls back to synchronous inserts when nil (tests stay deterministic).
+**`HealthEventWriter`** (`healthwriter.go`): the same pattern for `model_health_events`
+— a buffered channel drained to `InsertHealthEvent`, wired as the health tracker's
+event sink so transitions persist off the request hot path.
 
 ### 3.8 HTTP API — `internal/api`
 
@@ -417,23 +483,39 @@ matrix in §3.3; the Studio playground rows below are open to any authenticated 
 | `POST /v1/shadow/compare {task_id, items[≤200]}` | Field-level match vs `expected_output` per item; persists report |
 | `GET /v1/shadow/reports?task_id=` | List persisted shadow reports |
 
+**Admin-only** (`RequireAdmin` middleware — gated on the `admin` *role*, not a
+capability, because these are privacy-sensitive cross-tenant views; non-admins get **403**):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/admin/runs?page&page_size&task_id&model&user_email&q&status&type` | Prompt history across **all** users, newest first. Lightweight rows (truncated `prompt_preview` + `image_count`, never bytes). `status` = `success`\|`error`; `type` = `production`\|`test` |
+| `GET /v1/admin/runs/models` | Distinct models seen in `runs` (filter dropdown) |
+| `GET /v1/admin/runs/{run_id}` | Full run detail: prompt, system prompt, image data URLs, per-model results |
+| `GET /v1/admin/model-health` | Live per-(task, model) circuit states `{enabled, statuses:[{task_id, model, provider, state, consecutive_failures, total_failures, total_successes, trips, cooldown_ms, open_for_seconds, last_reason, last_change}]}` |
+| `GET /v1/admin/model-health/events?task_id&model&page&page_size` | Persisted health/fallback events (newest first) |
+| `POST /v1/admin/model-health/reset {task_id, model}` | Force a model back to healthy (records a `manual_reset` event); **404** if the pair was never tracked |
+
 Route-order note: `/v1/tasks/runs/{run_id}` is registered **before** `/v1/tasks/{task_id}`
-so `"runs"` never matches as a task id.
+so `"runs"` never matches as a task id; likewise `/v1/admin/runs/models` is registered
+before `/v1/admin/runs/{run_id}`.
 
 **`Predict` pipeline** (`task_handlers.go` + the shared core in `predict_core.go`,
 reused by Test and Shadow): resolve task (404 / 409-if-inactive; in-memory config
 cache, no DB read) → **budget gate** (429 + `Retry-After` to UTC midnight when daily
 spend ≥ cap; warn-log at 80%; cap 0 = exempt; spend comes from an in-memory view —
 `budget_cache.go`: DB SUM refresh ≤ every 5s + per-prediction local increments — so
-no per-request aggregate query and async-writer lag can't under-count) → `executePrediction`: `ValidateInput` (422) → `RenderPrompt` →
-**cache lookup** (opt-in per task; hit → `cached:true`, zero usage, `cache_hit`
-run row, respond immediately) → `llm.CallWithFallback` over
-`[model, fallbacks...]` → if output schema:
-`ValidateOutput` → `output_valid` flag (invalid output returns **200 with
-`output_valid:false` + `raw_response`**, not an error — correction retry is Phase 2;
-upstream chain failure returns **502**) → async run write (task/user/provider/version/
-fallback/is_test stamped) → **`X-Platform-Degraded: true`** header when a fallback
-served it or the chain failed → respond (`fallback_used` included):
+no per-request aggregate query and async-writer lag can't under-count) → `executePrediction`: `ValidateInput` (422) → `RenderPrompt` (+ `collectImages`
+attaches `image`/`images` as vision blocks) → `llm.CallWithFallbackOpts` over
+`[model, fallbacks...]` with the per-model **cache lookup** (hit → `cached:true`, zero
+usage, `cache_hit` run row), the **health gate** (skips models unhealthy for this task),
+and the **output validator** (production predicts only) → a provider error **or a
+schema-invalid output** advances the chain to the next model *in the same request*; a
+clean schema-valid success stops. Invalid output from *every* model returns **200 with
+`output_valid:false` + `raw_response`** (not an error; correction retry is Phase 2); an
+upstream chain failure, or all models unhealthy, returns **502** → async run write
+(task/user/provider/version/fallback/is_test/images stamped) → **`X-Platform-Degraded:
+true`** header when a fallback served it or the chain failed → respond (`fallback_used`
+included):
 
 ```json
 { "task_run_id": "...", "task_id": "...", "prompt_version": 1,
@@ -460,8 +542,9 @@ spinner → `LoginScreen` (one-click demo users from `/auth/demo-users`) → `Ap
 client (`src/api/client.ts`) sends `credentials: 'include'` on every call and throws
 typed `ApiError{status}`.
 
-**Pages** (top-nav in `AppShell` — `compare | tasks | versions | estimate | dashboard` —
-which also fetches `/pricing` once and feeds `setPricing`):
+**Pages** (top-nav in `AppShell` — `compare | tasks | versions | estimate | dashboard`,
+plus `history | health` shown **only to admins** (`user.role === 'admin'`) — which also
+fetches `/pricing` once and feeds `setPricing`):
 - **Tasks / Studio** (`TasksPage`) — master/detail over the registry. Per task: config
   summary + 30-day usage strip, **model-routing chain editor** (ordered list,
   position 0 = primary; add models from the registry, drag rows to reorder,
@@ -501,10 +584,25 @@ which also fetches `/pricing` once and feeds `setPricing`):
   fed by backend `/pricing` (fallback table in `utils/tokens.ts` for offline).
 - **Dashboard** (`DashboardPage`) — summary cards, **By task** table (runs/tokens/cost/
   latency/success), By model table (incl. avg ★), daily-spend CSS bars. No chart lib.
+- **History** (`AdminRunsPage`, admin-only) — cross-tenant prompt history: a filterable,
+  paginated table of every user's runs (search prompt text; filter by task / model / user
+  email / status / production-vs-test) with status pills (ok/error, cached, fallback, test).
+  The list is lightweight (server-truncated previews + an image indicator) so it stays fast
+  on large prompts/images; clicking a row opens a detail drawer that lazily fetches the full
+  prompt, system prompt, image grid, and per-model responses (wrapped + height-capped so huge
+  bodies never break the layout).
+- **Health** (`ModelHealthPage`, admin-only) — the per-(task, model) circuit-breaker console:
+  a live status table (auto-polls every 4s) showing each model's state (healthy / probing /
+  unhealthy + cooldown remaining), consecutive failures, trips, and last reason, with a
+  one-click **Mark healthy** override (`POST /v1/admin/model-health/reset`); plus a filterable
+  **event log** (failure / tripped / recovered / manual_reset) — click a status row to filter
+  the log to that pair.
 
 **Types:** `src/types/index.ts` mirrors the Go JSON contracts exactly (`TRunResponse`,
-`TDashboard{by_task,by_model,daily}`, `TUser`, `TPricing` …). Update it whenever a Go
-response type changes.
+`TDashboard{by_task,by_model,daily}`, `TUser`, `TPricing`, the admin
+`TRunListResponse`/`TRunDetail`/`TRunFilters`, and the health
+`TModelHealthResponse`/`THealthEventsResponse` …). Update it whenever a Go response type
+changes.
 
 ---
 
@@ -559,7 +657,8 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   validation, fenced-output parsing, YAML seed + re-seed version bump.
 - `predict_test.go` — full predict pipeline against a fake OpenAI-compatible server:
   happy path (attribution, usage, parsed output), 422 input cases, invalid-output
-  flagging, 404, playground stamping, dashboard by_task.
+  flagging, 404, playground stamping, dashboard by_task, **single + multiple image
+  forward/store** (image_url blocks to the provider, JSON-array `image` column).
 - `db_test.go` — run insert/query/delete, pagination, ordering (user-scoped).
 - `phase1_test.go` — budget 429 + Retry-After + exemption, full version lifecycle
   (draft doesn't activate, test stamps `is_test` + renders the draft, deploy switches
@@ -581,9 +680,22 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   template invalidates), opt-in required, Studio test bypass, failures and
   schema-invalid outputs never cached. `internal/cache/cache_test.go` — key
   determinism/sensitivity, Redis round-trip + TTL via miniredis, outage = miss.
+- `admin_runs_test.go` — admin prompt-history list (lightweight rows + filters),
+  full run detail, filter-on-missing-task = empty, unknown run = 404, and that
+  non-admins get **403** on the admin endpoints.
+- `model_health_test.go` — schema-invalid output falls back to the next model
+  in-request; a model that keeps failing trips unhealthy, surfaces in the admin
+  snapshot with persisted events, is **skipped** while open, and an admin reset
+  restores it; unknown reset = 404, non-admin = 403.
+- `internal/health/tracker_test.go` — the per-(task, model) breaker state machine
+  (fake clock): trip after threshold, skip-then-probe, exponential backoff + cap,
+  manual reset, disabled = always allow, nil-tracker safety.
+- `internal/llm/multimodal_test.go` — `ChatMessage` marshaling: text-only keeps the
+  legacy plain-string content form; with images it emits the OpenAI multimodal array.
 
 Test auth helper: `authReq(t, method, url, body)` attaches a Bearer token for `u-admin`
-signed with the test secret.
+signed with the test secret; `roleReq(t, role, …)` mints a token for any role (used by the
+RBAC and admin 403 tests).
 
 ---
 
@@ -605,5 +717,12 @@ signed with the test secret.
 8. **Frontend pricing/types always follow the backend** (`/pricing`, mirrored types).
 9. **The prediction hot path does no synchronous DB work** (decided 2026-06-12):
    task config from the in-memory store cache, budget from the cached spend view,
-   run rows via the async writer, prediction cache in Redis/memory. New per-request
-   features must follow this — read from memory, write async.
+   run rows via the async writer, prediction cache in Redis/memory, health gate from
+   the in-memory tracker (events persisted async). New per-request features must follow
+   this — read from memory, write async.
+10. **Health is per-(task, model), live state in-memory, history persisted.** The
+    per-(task, model) breaker (`internal/health`) is orthogonal to the per-provider
+    breaker — keep both. Live circuit state resets on restart (matching the provider
+    breaker); only `model_health_events` is durable. Admin observability/override routes
+    (`/v1/admin/*`) are gated on the `admin` *role* (`RequireAdmin`), not a task capability,
+    because they expose cross-tenant data.
