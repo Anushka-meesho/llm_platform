@@ -1,16 +1,28 @@
 import { getEncoding } from 'js-tiktoken';
 
-let _enc: ReturnType<typeof getEncoding> | null = null;
+let _encCl100k: ReturnType<typeof getEncoding> | null = null;
+let _encO200k: ReturnType<typeof getEncoding> | null = null;
 
-function getEnc() {
-  if (!_enc) _enc = getEncoding('cl100k_base');
-  return _enc;
+// Returns the right tiktoken encoder for the model, or null when no tiktoken
+// encoding applies (Gemini, Claude, Llama — caller falls back to char/4).
+function getEncForModel(model?: string): ReturnType<typeof getEncoding> | null {
+  if (model && /^gpt-4o/i.test(model)) {
+    if (!_encO200k) _encO200k = getEncoding('o200k_base');
+    return _encO200k;
+  }
+  if (!model || /^gpt-/i.test(model)) {
+    if (!_encCl100k) _encCl100k = getEncoding('cl100k_base');
+    return _encCl100k;
+  }
+  return null;
 }
 
-export function countTokens(text: string): number {
+export function countTokens(text: string, model?: string): number {
   if (!text) return 0;
   try {
-    return getEnc().encode(text).length;
+    const enc = getEncForModel(model);
+    if (!enc) return Math.ceil(text.length / 4);
+    return enc.encode(text).length;
   } catch {
     return Math.ceil(text.length / 4);
   }

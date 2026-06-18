@@ -74,11 +74,11 @@ const ChatInput = ({
   );
 
   const estimates = useMemo(() => {
-    const systemTok = countTokens(systemPrompt);
-    const msgTok = countTokens(text);
     return selectedModels.map((model) => {
+      const systemTok = countTokens(systemPrompt, model);
+      const msgTok = countTokens(text, model);
       const historyTok = (conversations[model] ?? []).reduce(
-        (acc, msg) => acc + countTokens(msg.content),
+        (acc, msg) => acc + countTokens(msg.content, model),
         0,
       );
       const inputTokens = systemTok + historyTok + msgTok;

@@ -128,8 +128,8 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
   const draftDirty =
     draft !== task.prompt_template || draftSystem !== (task.system_prompt ?? '');
   const draftTokens = useMemo(
-    () => countTokens(draftSystem) + countTokens(draft),
-    [draft, draftSystem],
+    () => countTokens(draftSystem, task.model) + countTokens(draft, task.model),
+    [draft, draftSystem, task.model],
   );
   const draftCost = estimateCost(task.model, draftTokens, task.max_tokens);
 
@@ -583,23 +583,19 @@ const EstimateSection = ({ draft, draftSystem }: { draft: string; draftSystem: s
   const [expectedOutput, setExpectedOutput] = useState(500);
   const [models, setModels] = useState<string[]>([...DEFAULT_COMPARE_MODELS]);
 
-  const promptTokens = useMemo(
-    () => countTokens(draftSystem) + countTokens(draft),
-    [draft, draftSystem],
-  );
-
   const perModel = useMemo(
     () =>
       models.map((model) => {
         const outPer = Math.max(0, expectedOutput);
+        const inputTokens = countTokens(draftSystem, model) + countTokens(draft, model);
         return {
           model,
-          inputTokens: promptTokens,
+          inputTokens,
           outputTokens: outPer,
-          cost: estimateCost(model, promptTokens, outPer),
+          cost: estimateCost(model, inputTokens, outPer),
         };
       }),
-    [models, promptTokens, expectedOutput],
+    [models, draft, draftSystem, expectedOutput],
   );
 
   const grandTotal = perModel.reduce((a, m) => a + m.cost, 0);
@@ -657,7 +653,7 @@ const EstimateSection = ({ draft, draftSystem }: { draft: string; draftSystem: s
 
       <div className="flex flex-wrap gap-4 mb-4">
         <EstSummaryCard label="Prompts" value="1" />
-        <EstSummaryCard label="Total input tokens" value={promptTokens.toLocaleString()} />
+        <EstSummaryCard label="Total input tokens" value={(perModel[0]?.inputTokens ?? 0).toLocaleString()} />
         <EstSummaryCard label="Est. total cost" value={formatCost(grandTotal)} accent />
       </div>
 
