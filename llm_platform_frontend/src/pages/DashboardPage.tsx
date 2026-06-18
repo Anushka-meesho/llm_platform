@@ -36,7 +36,6 @@ const DashboardPage = () => {
   }
 
   const empty = data.total_runs === 0;
-  const maxCost = Math.max(...data.daily.map((d) => d.cost_usd), 0.000001);
 
   return (
     <div className="flex-1 overflow-y-auto bg-primary-bg p-6">
@@ -135,32 +134,6 @@ const DashboardPage = () => {
               </table>
             </div>
 
-            {/* Daily cost time series */}
-            <div className="border border-solid border-primary-border rounded-lg p-4">
-              <Typography
-                variant="body"
-                size="2"
-                className="text-primary-text font-semi-bold mb-4"
-              >
-                Daily spend
-              </Typography>
-              <div className="flex items-end gap-2 h-40">
-                {data.daily.map((d) => (
-                  <div key={d.date} className="flex-1 flex flex-col items-center gap-1 min-w-0">
-                    <div className="flex-1 flex items-end w-full">
-                      <div
-                        className="w-full rounded-t bg-accent transition-all"
-                        style={{ height: `${(d.cost_usd / maxCost) * 100}%`, minHeight: 2 }}
-                        title={`${d.date}: ${formatCost(d.cost_usd)} · ${d.runs} run(s)`}
-                      />
-                    </div>
-                    <span className="text-[9px] text-tertiary-text truncate w-full text-center">
-                      {d.date.slice(5)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
           </>
         )}
       </div>

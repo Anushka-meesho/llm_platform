@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Button, Spinner, TextArea, Typography, cn } from '@meesho/merlin-ui-tailwind';
+import { Button, Checkbox, Input, Spinner, TextArea, Typography, cn } from '@meesho/merlin-ui-tailwind';
 import type {
-  TPredictResult,
   TPromptVersion,
   TTask,
   TTaskStatsDetail,
 } from '../types';
-import { MODELS, MODEL_GROUPS } from '../types';
+import { DEFAULT_COMPARE_MODELS, MODELS, MODEL_GROUPS } from '../types';
 import { api } from '../api/client';
 import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
@@ -239,8 +238,8 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
         </Typography>
       </Section>
 
-      {/* Test panel */}
-      <TestPanel task={task} versions={versions} />
+      {/* Cost estimate */}
+      <EstimateSection draft={draft} draftSystem={draftSystem} />
 
       {/* Version history */}
       <Section title="Version history">
@@ -556,123 +555,6 @@ const ModelSection = ({
   );
 };
 
-// ── Test panel ────────────────────────────────────────────────────────────────
-
-const TestPanel = ({ task, versions }: { task: TTask; versions: TPromptVersion[] }) => {
-  const fields = useMemo(() => {
-    const props =
-      (task.input_schema?.properties as Record<string, unknown> | undefined) ?? {};
-    return Object.keys(props);
-  }, [task.input_schema]);
-
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [version, setVersion] = useState<number>(0); // 0 = active
-  const [result, setResult] = useState<TPredictResult | null>(null);
-  // Round-trip latency measured on the client: from the Run click to the moment
-  // the prediction lands here (includes network + server time, what the user
-  // actually waits), shown instead of the server-reported latency_ms.
-  const [clientLatencyMs, setClientLatencyMs] = useState<number | null>(null);
-  const [running, setRunning] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const run = async () => {
-    setRunning(true);
-    setErr(null);
-    setResult(null);
-    setClientLatencyMs(null);
-    const start = performance.now();
-    try {
-      const inputs: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(values)) {
-        if (v !== '') inputs[k] = v;
-      }
-      const res = await api.testTask(task.id, inputs, version > 0 ? { version } : undefined);
-      setClientLatencyMs(Math.round(performance.now() - start));
-      setResult(res);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Test failed');
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  return (
-    <Section title="Test panel (not counted as production traffic)">
-      {fields.length === 0 ? (
-        <Typography variant="body" size="2" className="text-tertiary-text">
-          This task has no input schema — use the Compare playground instead.
-        </Typography>
-      ) : (
-        <>
-          <div className="flex flex-col gap-2">
-            {fields.map((f) => (
-              <div key={f}>
-                <Typography variant="body" size="1" className="text-tertiary-text mb-0.5">
-                  {f}
-                </Typography>
-                <TextArea
-                  value={values[f] ?? ''}
-                  onChange={({ value }) => setValues((prev) => ({ ...prev, [f]: value }))}
-                  rows={1}
-                />
-              </div>
-            ))}
-          </div>
-          <div className="flex items-center gap-3 mt-3">
-            <select
-              value={version}
-              onChange={(e) => setVersion(Number(e.target.value))}
-              className="border border-solid border-primary-border rounded-md px-2 py-1.5 text-sm bg-primary-bg text-primary-text"
-            >
-              <option value={0}>Active version (v{task.prompt_version})</option>
-              {versions
-                .filter((v) => !v.active)
-                .map((v) => (
-                  <option key={v.version} value={v.version}>
-                    v{v.version} {v.note ? `— ${v.note.slice(0, 30)}` : '(draft)'}
-                  </option>
-                ))}
-            </select>
-            <Button variant="primary" size="s" disabled={running} onClick={run}>
-              {running ? 'Running…' : '▶ Run test'}
-            </Button>
-          </div>
-        </>
-      )}
-
-      {err && (
-        <Typography variant="body" size="2" className="text-error-text mt-2">
-          {err}
-        </Typography>
-      )}
-
-      {result && (
-        <div className="mt-3 border border-solid border-primary-border rounded-md overflow-hidden">
-          <div className="flex items-center gap-3 bg-secondary-bg px-3 py-2">
-            <Badge ok={result.output_valid !== false}>
-              {result.output_valid === null
-                ? 'no output schema'
-                : result.output_valid
-                  ? 'schema valid'
-                  : 'SCHEMA INVALID'}
-            </Badge>
-            {result.fallback_used && <Badge ok={false}>fallback used</Badge>}
-            <Typography variant="body" size="1" className="text-tertiary-text">
-              v{result.prompt_version} · {result.model} · {clientLatencyMs ?? result.latency_ms}ms ·{' '}
-              {result.usage.total_tokens} tok · {formatCost(result.usage.cost_usd)}
-            </Typography>
-          </div>
-          <pre className="m-0 px-3 py-2 text-xs text-primary-text overflow-x-auto whitespace-pre-wrap">
-            {result.error
-              ? `⚠️ ${result.error}`
-              : JSON.stringify(result.output ?? result.raw_response, null, 2)}
-          </pre>
-        </div>
-      )}
-    </Section>
-  );
-};
-
 // ── Small building blocks ─────────────────────────────────────────────────────
 
 const Section = ({ title, children }: { title: string; children: ReactNode }) => (
@@ -695,15 +577,160 @@ const Stat = ({ label, value }: { label: string; value: string }) => (
   </div>
 );
 
-const Badge = ({ ok, children }: { ok: boolean; children: ReactNode }) => (
-  <span
-    className={cn(
-      'text-[10px] font-semi-bold uppercase tracking-wider px-2 py-0.5 rounded-full',
-      ok ? 'bg-tertiary-bg text-primary-text' : 'bg-error-bg text-error-text',
-    )}
-  >
-    {children}
-  </span>
+// ── Inline cost estimator ─────────────────────────────────────────────────────
+
+const EstimateSection = ({ draft, draftSystem }: { draft: string; draftSystem: string }) => {
+  const [expectedOutput, setExpectedOutput] = useState(500);
+  const [models, setModels] = useState<string[]>([...DEFAULT_COMPARE_MODELS]);
+
+  const promptTokens = useMemo(
+    () => countTokens(draftSystem) + countTokens(draft),
+    [draft, draftSystem],
+  );
+
+  const perModel = useMemo(
+    () =>
+      models.map((model) => {
+        const outPer = Math.max(0, expectedOutput);
+        return {
+          model,
+          inputTokens: promptTokens,
+          outputTokens: outPer,
+          cost: estimateCost(model, promptTokens, outPer),
+        };
+      }),
+    [models, promptTokens, expectedOutput],
+  );
+
+  const grandTotal = perModel.reduce((a, m) => a + m.cost, 0);
+
+  const toggleModel = (model: string, checked: boolean) =>
+    setModels((prev) => (checked ? [...prev, model] : prev.filter((m) => m !== model)));
+
+  return (
+    <Section title="Cost estimate">
+      <div className="flex flex-wrap items-end gap-6 mb-4">
+        <div>
+          <Typography variant="body" size="2" className="text-primary-text mb-1 font-medium">
+            Expected output tokens / prompt
+          </Typography>
+          <Input
+            type="number"
+            value={String(expectedOutput)}
+            onChange={({ value }) => setExpectedOutput(Number(value) || 0)}
+            wrapperClassName="w-40"
+          />
+        </div>
+        <div>
+          <Typography variant="body" size="2" className="text-primary-text mb-1 font-medium">
+            Models
+          </Typography>
+          <div className="flex flex-wrap gap-6">
+            {MODEL_GROUPS.map((group) => (
+              <div key={group.provider}>
+                <Typography
+                  variant="body"
+                  size="1"
+                  className="text-tertiary-text font-semi-bold uppercase tracking-wider mb-1"
+                >
+                  {group.provider}
+                </Typography>
+                <div className="flex flex-col gap-1">
+                  {group.models.map((m) => (
+                    <Checkbox
+                      key={m}
+                      checked={models.includes(m)}
+                      onChange={({ checked }) => toggleModel(m, checked)}
+                      label={
+                        <Typography variant="body" size="2" className="text-primary-text">
+                          {m}
+                        </Typography>
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-4 mb-4">
+        <EstSummaryCard label="Prompts" value="1" />
+        <EstSummaryCard label="Total input tokens" value={promptTokens.toLocaleString()} />
+        <EstSummaryCard label="Est. total cost" value={formatCost(grandTotal)} accent />
+      </div>
+
+      {models.length > 0 && draft.trim() && (
+        <div className="border border-solid border-primary-border rounded-lg overflow-hidden">
+          <table className="w-full text-left">
+            <thead className="bg-secondary-bg">
+              <tr>
+                <EstTh>Model</EstTh>
+                <EstTh right>Input tok</EstTh>
+                <EstTh right>Output tok</EstTh>
+                <EstTh right>Est. cost</EstTh>
+              </tr>
+            </thead>
+            <tbody>
+              {perModel.map((row) => (
+                <tr key={row.model} className="border-t border-solid border-tertiary-border">
+                  <EstTd>{row.model}</EstTd>
+                  <EstTd right>{row.inputTokens.toLocaleString()}</EstTd>
+                  <EstTd right>{row.outputTokens.toLocaleString()}</EstTd>
+                  <EstTd right>{formatCost(row.cost)}</EstTd>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Typography variant="body" size="1" className="text-tertiary-text mt-3">
+        Token counts use the cl100k_base tokenizer — an approximation for non-OpenAI models.
+        Rates come from the backend pricing table; actual usage may vary.
+      </Typography>
+    </Section>
+  );
+};
+
+const EstSummaryCard = ({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: string;
+  accent?: boolean;
+}) => (
+  <div className="flex-1 min-w-[160px] bg-secondary-bg border border-solid border-primary-border rounded-lg px-4 py-3">
+    <Typography variant="body" size="1" className="text-tertiary-text uppercase tracking-wider">
+      {label}
+    </Typography>
+    <Typography
+      variant="heading"
+      size="5"
+      className={accent ? 'text-accent' : 'text-primary-text'}
+    >
+      {value}
+    </Typography>
+  </div>
+);
+
+const EstTh = ({ children, right }: { children: ReactNode; right?: boolean }) => (
+  <th className={`px-4 py-2 ${right ? 'text-right' : 'text-left'}`}>
+    <Typography variant="body" size="1" className="text-tertiary-text uppercase tracking-wider">
+      {children}
+    </Typography>
+  </th>
+);
+
+const EstTd = ({ children, right }: { children: ReactNode; right?: boolean }) => (
+  <td className={`px-4 py-2.5 ${right ? 'text-right tabular-nums' : ''}`}>
+    <Typography variant="body" size="3" className="text-primary-text">
+      {children}
+    </Typography>
+  </td>
 );
 
 export default TasksPage;

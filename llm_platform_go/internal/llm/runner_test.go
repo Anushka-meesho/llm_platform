@@ -331,11 +331,14 @@ func TestBuildMessages_SystemPromptWithHistory(t *testing.T) {
 	}
 }
 
-func TestBuildMessages_NonStringContentStringified(t *testing.T) {
+func TestBuildMessages_StructuredTextContent(t *testing.T) {
 	req := &types.RunRequest{
 		ModelConversations: map[string][]types.Message{
 			"gpt-4o-mini": {
-				{Role: "user", Content: []interface{}{"part1", "part2"}},
+				{Role: "user", Content: []interface{}{
+					map[string]interface{}{"type": "text", "text": "part1"},
+					map[string]interface{}{"type": "text", "text": "part2"},
+				}},
 			},
 		},
 	}
@@ -345,7 +348,7 @@ func TestBuildMessages_NonStringContentStringified(t *testing.T) {
 		t.Fatal("expected at least one message")
 	}
 	if msgs[0].Content == "" {
-		t.Error("non-string content should be stringified, not empty")
+		t.Error("structured text content blocks should produce non-empty content")
 	}
 }
 
@@ -363,6 +366,32 @@ func TestIsRetryable(t *testing.T) {
 	for _, code := range notRetryable {
 		if isRetryable(code) {
 			t.Errorf("expected %d to NOT be retryable", code)
+		}
+	}
+}
+
+// Every registry entry must be priced and attributable — an unpriced model
+// silently bills $0 (money-path regression).
+func TestRegistryModelsArePricedAndAttributed(t *testing.T) {
+	if err := LoadPricing("../../pricing.json"); err != nil {
+		t.Fatalf("load pricing: %v", err)
+	}
+	table := PricingTable()
+	for key, cfg := range registry {
+		if _, ok := table[key]; !ok {
+			t.Errorf("model %q has no pricing.json entry", key)
+		}
+		if cfg.provider == "" {
+			t.Errorf("model %q has no provider attribution", key)
+		}
+		if cfg.clientFn == nil {
+			t.Errorf("model %q has no client function", key)
+		}
+	}
+	// And the reverse: no orphaned pricing entries for unknown models.
+	for key := range table {
+		if !KnownModel(key) {
+			t.Errorf("pricing.json entry %q is not in the routing registry", key)
 		}
 	}
 }

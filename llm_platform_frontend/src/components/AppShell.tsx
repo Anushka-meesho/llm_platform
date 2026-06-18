@@ -5,8 +5,6 @@ import { api } from '../api/client';
 import { setPricing } from '../utils/tokens';
 import ComparePage from '../pages/ComparePage';
 import TasksPage from '../pages/TasksPage';
-import VersionsPage from '../pages/VersionsPage';
-import EstimatePage from '../pages/EstimatePage';
 import DashboardPage from '../pages/DashboardPage';
 import AdminRunsPage from '../pages/AdminRunsPage';
 import ModelHealthPage from '../pages/ModelHealthPage';
@@ -14,8 +12,6 @@ import ModelHealthPage from '../pages/ModelHealthPage';
 type TView =
   | 'compare'
   | 'tasks'
-  | 'versions'
-  | 'estimate'
   | 'dashboard'
   | 'history'
   | 'health';
@@ -23,8 +19,6 @@ type TView =
 const NAV: { key: TView; label: string; icon: string; adminOnly?: boolean }[] = [
   { key: 'compare', label: 'Compare', icon: '💬' },
   { key: 'tasks', label: 'Tasks', icon: '🗂️' },
-  { key: 'versions', label: 'Versions', icon: '🕘' },
-  { key: 'estimate', label: 'Estimate', icon: '🧮' },
   { key: 'dashboard', label: 'Dashboard', icon: '📊' },
   { key: 'history', label: 'History', icon: '🗂', adminOnly: true },
   { key: 'health', label: 'Health', icon: '🫀', adminOnly: true },
@@ -103,8 +97,6 @@ const AppShell = () => {
       {/* Active view */}
       {view === 'compare' && <ComparePage />}
       {view === 'tasks' && <TasksPage />}
-      {view === 'versions' && <VersionsPage />}
-      {view === 'estimate' && <EstimatePage />}
       {view === 'dashboard' && <DashboardPage />}
       {view === 'history' && isAdmin && <AdminRunsPage />}
       {view === 'health' && isAdmin && <ModelHealthPage />}

@@ -68,7 +68,7 @@ export const useChat = () => {
         const userMsg: TUserUIMessage = {
           role: 'user',
           content: turn.prompt,
-          images: [],
+          images: turn.images ?? [],
           systemPrompt: turn.system_prompt ?? undefined,
         };
         const assistantMsg: TAssistantUIMessage = {

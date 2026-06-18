@@ -23,10 +23,7 @@ type providerConfig struct {
 }
 
 var (
-	// openaiC    = func(c *Clients) Provider { return c.OpenAI }    // unused: all OpenAI models route via bifrost
-	groqC = func(c *Clients) Provider { return c.Groq }
-	// geminiC    = func(c *Clients) Provider { return c.Gemini }    // unused: all Gemini models route via bifrost
-	// anthropicC = func(c *Clients) Provider { return c.Anthropic } // unused: Claude routes via bifrost
+	groqC   = func(c *Clients) Provider { return c.Groq }
 	meeshoC = func(c *Clients) Provider { return c.Meesho }
 )
 
@@ -233,14 +230,38 @@ func buildMessages(modelName string, req *types.RunRequest) []ChatMessage {
 
 	if hist, ok := req.ModelConversations[modelName]; ok && len(hist) > 0 {
 		for _, m := range hist {
-			content := ""
+			var textContent string
+			var imgURLs []string
 			switch v := m.Content.(type) {
 			case string:
-				content = v
+				textContent = v
+			case []interface{}:
+				for _, part := range v {
+					pm, ok := part.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					switch pm["type"] {
+					case "text":
+						if t, ok := pm["text"].(string); ok {
+							textContent = t
+						}
+					case "image_url":
+						if iu, ok := pm["image_url"].(map[string]interface{}); ok {
+							if url, ok := iu["url"].(string); ok && url != "" {
+								imgURLs = append(imgURLs, url)
+							}
+						}
+					}
+				}
 			default:
-				content = fmt.Sprintf("%v", v)
+				textContent = fmt.Sprintf("%v", v)
 			}
-			msgs = append(msgs, ChatMessage{Role: m.Role, Content: content})
+			msg := ChatMessage{Role: m.Role, Content: textContent}
+			if len(imgURLs) > 0 {
+				msg.Images = imgURLs
+			}
+			msgs = append(msgs, msg)
 		}
 	} else {
 		msgs = append(msgs, ChatMessage{Role: "user", Content: req.Prompt})

@@ -13,7 +13,6 @@ import (
 )
 
 // Provider is the single seam for any LLM backend.
-// To add Claude: implement anthropicProvider satisfying this interface, wire it in BuildClients.
 type Provider interface {
 	Call(ctx context.Context, req *chatRequest) (*chatResponse, error)
 }
@@ -169,40 +168,17 @@ func NewOpenAICompatProvider(baseURL, apiKey string) Provider {
 
 // Clients holds one configured Provider per LLM backend.
 type Clients struct {
-	OpenAI    Provider
-	Groq      Provider
-	Gemini    Provider
-	Anthropic Provider // native Messages API (anthropic.go), not OpenAI-compatible
-	Meesho    Provider // Meesho internal gateway (OpenAI-compatible, x-bf-vk auth)
+	Groq   Provider
+	Meesho Provider // Meesho internal gateway (OpenAI-compatible, x-bf-vk auth)
 }
 
 func BuildClients(cfg *config.Config) *Clients {
-	// Anthropic's SDK rejects a missing key client-side (a plain error, which
-	// would misclassify as an infra failure and trip the breaker). Leave the
-	// provider nil when unconfigured — calls then get the standard
-	// "LLM client not configured" result, same as any unconfigured backend.
-	var anthropicProvider Provider
-	if cfg.AnthropicKey != "" {
-		anthropicProvider = NewAnthropicProvider(cfg.AnthropicKey, cfg.AnthropicBaseURL)
-	}
-
 	return &Clients{
-		OpenAI: &openAICompatProvider{
-			baseURL: cfg.OpenAIBaseURL,
-			apiKey:  cfg.OpenAIKey,
-			client:  sharedHTTPClient,
-		},
 		Groq: &openAICompatProvider{
 			baseURL: cfg.GroqBaseURL,
 			apiKey:  cfg.GroqKey,
 			client:  sharedHTTPClient,
 		},
-		Gemini: &openAICompatProvider{
-			baseURL: cfg.GeminiBaseURL,
-			apiKey:  cfg.GeminiKey,
-			client:  sharedHTTPClient,
-		},
-		Anthropic: anthropicProvider,
 		Meesho: &openAICompatProvider{
 			baseURL:    cfg.MeeshoGatewayBaseURL,
 			apiKey:     cfg.MeeshoGatewayVK,

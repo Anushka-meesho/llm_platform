@@ -8,21 +8,13 @@ import (
 )
 
 type Config struct {
-	OpenAIKey    string
-	GroqKey      string
-	GeminiKey    string
-	AnthropicKey string
-	DBPath       string
-	Port         string
-	PricingPath  string
+	GroqKey     string
+	DBPath      string
+	Port        string
+	PricingPath string
 
-	// Provider base URLs — override to route through a proxy/gateway or a
-	// self-hosted endpoint. Defaults are the public APIs. AnthropicBaseURL
-	// empty → the SDK default (https://api.anthropic.com).
-	OpenAIBaseURL    string
-	GroqBaseURL      string
-	GeminiBaseURL    string
-	AnthropicBaseURL string
+	// Provider base URLs — override to route through a proxy/gateway or a self-hosted endpoint.
+	GroqBaseURL string
 
 	// Meesho internal LLM gateway (OpenAI-compatible wire, but authenticated
 	// with an x-bf-vk virtual-key header instead of Bearer). MeeshoGatewayVK is
@@ -65,18 +57,12 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
-		GroqKey:      os.Getenv("GROQ_API_KEY"),
-		GeminiKey:    os.Getenv("GEMINI_API_KEY"),
-		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
-		DBPath:       getEnvOrDefault("DB_PATH", "./llm_platform.db"),
-		Port:         getEnvOrDefault("PORT", "8000"),
-		PricingPath:  getEnvOrDefault("PRICING_PATH", "./pricing.json"),
+		GroqKey:     os.Getenv("GROQ_API_KEY"),
+		DBPath:      getEnvOrDefault("DB_PATH", "./llm_platform.db"),
+		Port:        getEnvOrDefault("PORT", "8000"),
+		PricingPath: getEnvOrDefault("PRICING_PATH", "./pricing.json"),
 
-		OpenAIBaseURL:    getEnvOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		GroqBaseURL:      getEnvOrDefault("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-		GeminiBaseURL:    getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"),
-		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
+		GroqBaseURL: getEnvOrDefault("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
 
 		MeeshoGatewayBaseURL: getEnvOrDefault("MEESHO_GATEWAY_BASE_URL", "http://llm-gateway.prd.meesho.int/v1"),
 		MeeshoGatewayVK:      os.Getenv("MEESHO_GATEWAY_VK"),
@@ -106,12 +92,10 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// Each provider key is independent: the platform boots with whatever subset
-	// is configured. Models whose key is missing simply fail at call time (the
-	// runner reports a per-model auth error). Only require at least one, so a
-	// totally unconfigured server still fails loudly.
-	if cfg.OpenAIKey == "" && cfg.GroqKey == "" && cfg.GeminiKey == "" && cfg.AnthropicKey == "" && cfg.MeeshoGatewayVK == "" {
-		return nil, fmt.Errorf("no provider API keys set: configure at least one of OPENAI_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, MEESHO_GATEWAY_VK")
+	// Require at least one active provider key so a totally unconfigured server
+	// fails loudly at startup rather than returning auth errors on every call.
+	if cfg.GroqKey == "" && cfg.MeeshoGatewayVK == "" {
+		return nil, fmt.Errorf("no provider API keys set: configure at least one of GROQ_API_KEY, MEESHO_GATEWAY_VK")
 	}
 
 	return cfg, nil
@@ -121,17 +105,8 @@ func Load() (*Config, error) {
 // informational startup warning.
 func (c *Config) MissingProviderKeys() []string {
 	var missing []string
-	if c.OpenAIKey == "" {
-		missing = append(missing, "OPENAI_API_KEY")
-	}
 	if c.GroqKey == "" {
 		missing = append(missing, "GROQ_API_KEY")
-	}
-	if c.GeminiKey == "" {
-		missing = append(missing, "GEMINI_API_KEY")
-	}
-	if c.AnthropicKey == "" {
-		missing = append(missing, "ANTHROPIC_API_KEY")
 	}
 	if c.MeeshoGatewayVK == "" {
 		missing = append(missing, "MEESHO_GATEWAY_VK")

@@ -51,6 +51,7 @@ const Sidebar = ({
   // Per-provider expand/collapse. Unset = default: open when a model in the
   // group is selected, collapsed otherwise.
   const [openProviders, setOpenProviders] = useState<Record<string, boolean>>({});
+  const [focusedIdx, setFocusedIdx] = useState<number | null>(null);
 
   const handleModelChange = useCallback(
     (model: string, checked: boolean) => {
@@ -65,10 +66,27 @@ const Sidebar = ({
 
   const handleLoad = useCallback(
     async (id: string) => {
+      setFocusedIdx(null);
       const detail = await onLoadSession(id);
       onSessionLoaded(detail);
     },
     [onLoadSession, onSessionLoaded],
+  );
+
+  const handleListKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (sessions.length === 0) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setFocusedIdx((prev) => Math.min((prev ?? -1) + 1, sessions.length - 1));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setFocusedIdx((prev) => Math.max((prev ?? sessions.length) - 1, 0));
+      } else if (e.key === 'Enter') {
+        if (focusedIdx !== null) handleLoad(sessions[focusedIdx].session_id);
+      }
+    },
+    [sessions, focusedIdx, handleLoad],
   );
 
   const handleDelete = useCallback(
@@ -216,7 +234,12 @@ const Sidebar = ({
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto flex flex-col gap-1 min-h-0">
+        <div
+          className="flex-1 overflow-y-auto flex flex-col gap-1 min-h-0 outline-none"
+          tabIndex={0}
+          onKeyDown={handleListKeyDown}
+          onBlur={() => setFocusedIdx(null)}
+        >
           {sessionsLoading && (
             <Typography variant="body" size="2" className="text-tertiary-text text-center py-4">
               Loading…
@@ -227,13 +250,14 @@ const Sidebar = ({
               No sessions yet.
             </Typography>
           )}
-          {sessions.map((session) => {
+          {sessions.map((session, idx) => {
             const preview =
               session.first_prompt.length > 35
                 ? session.first_prompt.slice(0, 35) + '…'
                 : session.first_prompt;
             const isActive = session.session_id === currentSessionId;
             const isConfirming = confirmDeleteId === session.session_id;
+            const isFocused = idx === focusedIdx;
 
             return (
               <div
@@ -241,6 +265,7 @@ const Sidebar = ({
                 className={cn(
                   'rounded-md p-2 border border-solid border-transparent transition-colors',
                   isActive ? 'bg-tertiary-bg border-primary-border' : 'hover:bg-tertiary-bg',
+                  isFocused && !isActive && 'ring-1 ring-inset ring-primary-border bg-tertiary-bg',
                 )}
               >
                 <div className="flex items-start gap-1">

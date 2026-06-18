@@ -72,6 +72,7 @@ export type TSessionTurn = {
   run_id: string;
   prompt: string;
   system_prompt: string | null;
+  images: string[];
   created_at: string;
   results: TTurnResult[];
 };
