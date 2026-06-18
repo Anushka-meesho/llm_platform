@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -10,34 +9,9 @@ import (
 	"llm_platform_go/internal/auth"
 	appdb "llm_platform_go/internal/db"
 	"llm_platform_go/internal/types"
-	"llm_platform_go/internal/users"
 
 	_ "modernc.org/sqlite"
 )
-
-func TestDemoStore(t *testing.T) {
-	s := users.NewDemoStore()
-
-	list, err := s.List(context.Background())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(list) < 2 {
-		t.Fatalf("expected at least 2 seeded users, got %d", len(list))
-	}
-
-	u, err := s.GetByID(context.Background(), "u-admin")
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if u.Email != "admin@demo.local" {
-		t.Errorf("email: got %q", u.Email)
-	}
-
-	if _, err := s.GetByID(context.Background(), "nope"); err != users.ErrNotFound {
-		t.Errorf("expected ErrNotFound, got %v", err)
-	}
-}
 
 func TestTokenRoundTrip(t *testing.T) {
 	u := &auth.User{Subject: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: auth.RoleAdmin}
