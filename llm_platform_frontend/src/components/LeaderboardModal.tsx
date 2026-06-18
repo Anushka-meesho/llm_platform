@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Typography } from '@meesho/merlin-ui-tailwind';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
 import type { TLeaderboardEntry } from '../types';
 
 type TLeaderboardModalProps = {
@@ -9,17 +10,24 @@ type TLeaderboardModalProps = {
 };
 
 const LeaderboardModal = ({ sessionId, onClose }: TLeaderboardModalProps) => {
+  const toast = useToast();
   const [entries, setEntries] = useState<TLeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // setState lives only in the promise callbacks (loading initializes to true),
+  // so calling this from the effect doesn't cascade renders.
   const fetchData = useCallback(() => {
-    setLoading(true);
     api
       .getLeaderboard(sessionId)
       .then((res) => setEntries(res.entries))
-      .catch(() => setEntries([]))
+      .catch((e) => {
+        // The user opened/refreshed the leaderboard — clearing it would silently
+        // look like "no ratings", so surface the real reason via a toast.
+        setEntries([]);
+        toast.error(errorMessage(e));
+      })
       .finally(() => setLoading(false));
-  }, [sessionId]);
+  }, [sessionId, toast]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 

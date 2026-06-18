@@ -49,7 +49,7 @@ type Handler struct {
 func requireUser(w http.ResponseWriter, r *http.Request) (*auth.User, bool) {
 	u, ok := auth.FromContext(r.Context())
 	if !ok || u == nil {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
+		writeErr(w, r, Unauthorized(CodeUnauthorized, "not authenticated"))
 		return nil, false
 	}
 	return u, true
@@ -79,11 +79,11 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	var req types.RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 	if req.Prompt == "" {
-		writeError(w, http.StatusUnprocessableEntity, "prompt must not be empty")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "prompt must not be empty"))
 		return
 	}
 
@@ -187,7 +187,7 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 
 	sessions, total, err := db.ListSessions(h.DB, user.Subject, page, pageSize)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list sessions").WithCause(err))
 		return
 	}
 
@@ -210,11 +210,11 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.GetSession(h.DB, user.Subject, sessionID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load session %q", sessionID).WithCause(err))
 		return
 	}
 	if len(rows) == 0 {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeErr(w, r, NotFound(CodeSessionNotFound, "session not found"))
 		return
 	}
 
@@ -267,7 +267,7 @@ func (h *Handler) GetLeaderboard(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "session_id")
 	entries, err := db.GetLeaderboard(h.DB, user.Subject, sessionID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load leaderboard %q", sessionID).WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, types.LeaderboardResponse{
@@ -284,13 +284,13 @@ func (h *Handler) DeleteSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	var req types.DeleteSessionsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 
 	deleted, err := db.DeleteSessions(h.DB, user.Subject, req.SessionIDs)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "delete sessions").WithCause(err))
 		return
 	}
 
@@ -322,20 +322,20 @@ func (h *Handler) Feedback(w http.ResponseWriter, r *http.Request) {
 	}
 	var req types.FeedbackRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 	if req.RunID == "" || req.Model == "" {
-		writeError(w, http.StatusUnprocessableEntity, "run_id and model are required")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "run_id and model are required"))
 		return
 	}
 	if req.Rating < 1 || req.Rating > 5 {
-		writeError(w, http.StatusUnprocessableEntity, "rating must be between 1 and 5")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "rating must be between 1 and 5"))
 		return
 	}
 
 	if err := db.UpsertFeedback(h.DB, req.RunID, req.Model, user.Subject, req.Rating); err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "save rating").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -351,7 +351,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	stats, err := db.DashboardStats(h.DB, user.Subject)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load dashboard stats").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)

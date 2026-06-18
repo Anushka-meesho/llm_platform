@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -21,6 +22,15 @@ import (
 func main() {
 	// Load .env — ignore error so the binary works with real env vars too.
 	_ = godotenv.Load()
+
+	// Structured logging: every handled error is logged as JSON keyed by the
+	// request id, so a failure surfaced to a client (which carries the same id)
+	// is findable in the logs. LOG_LEVEL=debug widens it.
+	logLevel := slog.LevelInfo
+	if strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug") {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
 	cfg, err := config.Load()
 	if err != nil {

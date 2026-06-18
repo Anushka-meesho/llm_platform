@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Button, Typography, cn } from '@meesho/merlin-ui-tailwind';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
 import type { TPromptVersion } from '../types';
 
 const PAGE_SIZES = [5, 10, 25] as const;
@@ -48,6 +49,7 @@ const VersionHistory = ({
   const [compareVersion, setCompareVersion] = useState<TPromptVersion | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
+  const toast = useToast();
 
   const total = versions.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -61,10 +63,11 @@ const VersionHistory = ({
     try {
       await api.deployVersion(taskId, version);
       setFlash(`v${version} is now live.`);
+      toast.success(`v${version} is now live.`);
       await onReload();
       await onActiveChanged?.();
     } catch (e) {
-      setFlash(e instanceof Error ? e.message : 'Deploy failed');
+      toast.error(errorMessage(e));
     } finally {
       setBusy(null);
     }
@@ -76,15 +79,17 @@ const VersionHistory = ({
     try {
       await api.deleteVersion(taskId, version);
       setFlash(`v${version} deleted.`);
+      toast.success(`v${version} deleted.`);
       if (compareVersion?.version === version) setCompareVersion(null);
       await onReload();
     } catch (e) {
-      setFlash(
+      // 409 = can't delete the active version (backend code `version_active`);
+      // keep the actionable phrasing but still surface the backend ref via
+      // errorMessage(e).
+      toast.error(
         e instanceof ApiError && e.status === 409
-          ? 'Cannot delete the active version — deploy another version first.'
-          : e instanceof Error
-            ? e.message
-            : 'Delete failed',
+          ? `Cannot delete the active version — deploy another version first. ${errorMessage(e)}`
+          : errorMessage(e),
       );
     } finally {
       setBusy(null);

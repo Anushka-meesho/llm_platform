@@ -16,7 +16,7 @@ import (
 func (h *Handler) DemoUsers(w http.ResponseWriter, r *http.Request) {
 	list, err := h.Users.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list users: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "list users").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"users": list})
@@ -30,24 +30,24 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
-		writeError(w, http.StatusUnprocessableEntity, "user_id is required")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "user_id is required"))
 		return
 	}
 
 	u, err := h.Users.GetByID(r.Context(), req.UserID)
 	if err != nil {
 		if errors.Is(err, users.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "unknown user")
+			writeErr(w, r, Unauthorized(CodeUnauthorized, "unknown user"))
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "lookup failed: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "user lookup").WithCause(err))
 		return
 	}
 
 	authUser := &auth.User{Subject: u.ID, Email: u.Email, Name: u.Name, Role: u.Role}
 	token, err := auth.IssueToken(authUser, h.Auth.Secret, h.Auth.Issuer, h.Auth.TokenExpiry)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to issue token: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "issue token").WithCause(err))
 		return
 	}
 

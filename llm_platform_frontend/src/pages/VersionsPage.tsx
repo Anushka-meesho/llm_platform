@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Spinner, Typography, cn } from '@meesho/merlin-ui-tailwind';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
 import VersionHistory from '../components/VersionHistory';
+import ErrorState from '../components/ErrorState';
 import type { TPromptVersion, TTask } from '../types';
 
 // VersionsPage is a dedicated, task-agnostic home for prompt version history:
@@ -21,25 +22,34 @@ const VersionsPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const { tasks } = await api.listTasks();
-        setTasks(tasks);
-        setSelectedId((prev) => prev ?? tasks[0]?.id ?? null);
-      } catch {
-        setError('Could not load tasks.');
-      } finally {
-        setLoading(false);
-      }
-    })();
+  const loadTasks = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { tasks } = await api.listTasks();
+      setTasks(tasks);
+      setSelectedId((prev) => prev ?? tasks[0]?.id ?? null);
+      setError(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadTasks);
+  }, [loadTasks]);
 
   const selected = tasks.find((t) => t.id === selectedId) ?? null;
 
   const loadVersions = useCallback(async () => {
     if (!selectedId) return;
-    const data = await api.listVersions(selectedId).catch(() => null);
+    const data = await api
+      .listVersions(selectedId)
+      .catch((e) => {
+        console.error('load versions:', errorMessage(e));
+        return null;
+      });
     if (data) setVersions(data.versions);
   }, [selectedId]);
 
@@ -53,7 +63,10 @@ const VersionsPage = () => {
   // After a deploy the selected task's active version changes — refresh the
   // task list so the live flag and live-prompt comparison stay correct.
   const refreshTasks = useCallback(async () => {
-    const { tasks } = await api.listTasks().catch(() => ({ tasks: [] as TTask[] }));
+    const { tasks } = await api.listTasks().catch((e) => {
+      console.error('refresh tasks:', errorMessage(e));
+      return { tasks: [] as TTask[] };
+    });
     if (tasks.length) setTasks(tasks);
   }, []);
 
@@ -73,11 +86,7 @@ const VersionsPage = () => {
             Tasks
           </Typography>
         </div>
-        {error && (
-          <Typography variant="body" size="2" className="text-error-text px-4">
-            {error}
-          </Typography>
-        )}
+        {error && <ErrorState message={error} onRetry={loadTasks} compact />}
         {tasks.map((t) => (
           <button
             key={t.id}

@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Button, Typography, Spinner } from '@meesho/merlin-ui-tailwind';
 import type { TUser } from '../types';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import { useAuth } from '../auth/useAuth';
+import { useToast } from '../toast/context';
 
 const LoginScreen = () => {
   const { login } = useAuth();
+  const toast = useToast();
   const [users, setUsers] = useState<TUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [signingIn, setSigningIn] = useState<string | null>(null);
@@ -15,7 +17,7 @@ const LoginScreen = () => {
     api
       .demoUsers()
       .then((d) => setUsers(d.users))
-      .catch(() => setError('Could not reach the server. Is the Go backend running on port 8000?'))
+      .catch((e) => setError(errorMessage(e)))
       .finally(() => setLoading(false));
   }, []);
 
@@ -24,8 +26,10 @@ const LoginScreen = () => {
     setError(null);
     try {
       await login(userId);
-    } catch {
-      setError('Sign-in failed. Please try again.');
+    } catch (e) {
+      const msg = errorMessage(e);
+      setError(msg);
+      toast.error(msg);
       setSigningIn(null);
     }
   };

@@ -1,0 +1,15 @@
+# POST /v1/tasks/{task_id}/test — Studio test panel. Like predict, plus optional
+# overrides for a draft version and/or an alternative model.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Test task request
+type: object
+additionalProperties: false
+required: [inputs]
+properties:
+  inputs:
+    type: object
+  version:
+    type: integer
+    minimum: 0 # 0 / omitted → active version
+  model:
+    type: string

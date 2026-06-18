@@ -1,0 +1,55 @@
+# POST /v1/tasks — author a new task. Mirrors tasks.Task; deep checks
+# (known model, compilable schemas, template parse) still run in Task.Validate.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Create task request
+type: object
+additionalProperties: false
+required: [id, name, prompt_template, model]
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9-]{1,63}$"
+  name:
+    type: string
+    minLength: 1
+  description:
+    type: string
+  input_schema:
+    type: [object, "null"] # JSON Schema, or null/omitted for free-form input
+  output_schema:
+    type: [object, "null"] # JSON Schema, or null/omitted for raw-text output
+  prompt_template:
+    type: string
+    minLength: 1
+  system_prompt:
+    type: string
+  prompt_version:
+    type: integer
+    minimum: 0
+  model:
+    type: string
+    minLength: 1
+  fallback_models:
+    type: array
+    items: { type: string }
+  temperature:
+    type: number
+    minimum: 0
+    maximum: 2
+  max_tokens:
+    type: integer
+    minimum: 0 # 0 → backend default (1000)
+  daily_budget_usd:
+    type: number
+    minimum: 0
+  cache_enabled:
+    type: boolean
+  cache_ttl_seconds:
+    type: integer
+    minimum: 0
+  active:
+    type: boolean
+  created_at:
+    type: string
+  updated_at:
+    type: string

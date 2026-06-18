@@ -1,0 +1,17 @@
+# POST /feedback — manual 1–5 rating for one model's response in a run.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Feedback request
+type: object
+additionalProperties: false
+required: [run_id, model, rating]
+properties:
+  run_id:
+    type: string
+    minLength: 1
+  model:
+    type: string
+    minLength: 1
+  rating:
+    type: integer
+    minimum: 1
+    maximum: 5

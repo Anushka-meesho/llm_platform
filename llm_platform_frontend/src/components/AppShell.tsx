@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Typography, Button, cn } from '@meesho/merlin-ui-tailwind';
 import { useAuth } from '../auth/useAuth';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import { setPricing } from '../utils/tokens';
 import ComparePage from '../pages/ComparePage';
 import TasksPage from '../pages/TasksPage';
@@ -42,8 +42,9 @@ const AppShell = () => {
     api
       .pricing()
       .then((d) => setPricing(d.pricing))
-      .catch(() => {
-        /* keep fallback rates */
+      .catch((e) => {
+        // Non-critical: keep fallback rates, just log.
+        console.error('pricing sync failed:', errorMessage(e));
       });
   }, []);
 

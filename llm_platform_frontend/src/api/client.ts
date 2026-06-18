@@ -20,13 +20,19 @@ import type {
 
 const BASE = '';
 
-// ApiError carries the HTTP status so callers (e.g. the auth gate) can react to
-// 401s specifically.
+// ApiError carries everything needed to tell the user (and us) exactly what went
+// wrong: the HTTP status, the backend's machine-readable `code`, and the
+// `requestId` that correlates this failure with the server log line. status === 0
+// means the request never got an HTTP response — see `code` ('timeout'|'network').
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  requestId?: string;
+  constructor(status: number, message: string, code?: string, requestId?: string) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.requestId = requestId;
     this.name = 'ApiError';
   }
 }
@@ -38,24 +44,50 @@ async function fetchJSON<T>(
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       ...options,
       // Send/receive the session cookie across the dev proxy.
       credentials: 'include',
       signal: controller.signal,
     });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new ApiError(
-        res.status,
-        (data as { detail?: string }).detail ?? `HTTP ${res.status}`,
-      );
+  } catch (e) {
+    // No HTTP response: distinguish a client-side timeout (we aborted) from a
+    // genuine network/connection failure so the message says which happened.
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new ApiError(0, `Request timed out after ${Math.round(timeoutMs / 1000)}s`, 'timeout');
     }
-    return res.json() as Promise<T>;
+    throw new ApiError(0, "Can't reach the server — is it running?", 'network');
   } finally {
     clearTimeout(timer);
   }
+
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as {
+      detail?: string;
+      code?: string;
+      request_id?: string;
+    };
+    throw new ApiError(
+      res.status,
+      data.detail ?? `HTTP ${res.status}`,
+      data.code,
+      data.request_id ?? res.headers.get('X-Request-ID') ?? undefined,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
+// errorMessage turns any thrown value into a user-facing string. For an ApiError
+// it appends "(ref: <request_id>)" so the user can cite it and we can grep the
+// server logs for the exact failure.
+export function errorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    return err.requestId ? `${err.message} (ref: ${err.requestId})` : err.message;
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 const jsonPost = (body: unknown): RequestInit => ({

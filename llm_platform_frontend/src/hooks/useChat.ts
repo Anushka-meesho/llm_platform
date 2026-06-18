@@ -8,7 +8,8 @@ import type {
   TSessionDetail,
 } from '../types';
 import { DEFAULT_COMPARE_MODELS, MODELS } from '../types';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
 
 const emptyConversations = (): Record<string, TUIMessage[]> =>
   Object.fromEntries(MODELS.map((m) => [m, []]));
@@ -42,6 +43,7 @@ const buildApiContent = (
 };
 
 export const useChat = () => {
+  const toast = useToast();
   const [conversations, setConversations] = useState<Record<string, TUIMessage[]>>(
     emptyConversations,
   );
@@ -173,11 +175,9 @@ export const useChat = () => {
 
         if (failedIndices.length > 0) {
           const firstReason = (outcomes[failedIndices[0]] as PromiseRejectedResult).reason;
-          setError(
-            firstReason instanceof Error
-              ? firstReason.message
-              : 'Backend unreachable. Is the Go server running on port 8000?',
-          );
+          const msg = errorMessage(firstReason);
+          setError(msg);
+          toast.error(msg);
           setConversations((prev) => {
             const next = { ...prev };
             for (const i of failedIndices) {
@@ -188,9 +188,9 @@ export const useChat = () => {
           });
         }
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : 'Backend unreachable. Is the Go server running on port 8000?',
-        );
+        const msg = errorMessage(err);
+        setError(msg);
+        toast.error(msg);
         setConversations((prev) => {
           const next = { ...prev };
           for (const model of selectedModels) {
@@ -202,7 +202,7 @@ export const useChat = () => {
         setIsLoading(false);
       }
     },
-    [sessionId, selectedModels, temperature, systemPrompt, maxOutputTokens, conversations],
+    [sessionId, selectedModels, temperature, systemPrompt, maxOutputTokens, conversations, toast],
   );
 
   return {

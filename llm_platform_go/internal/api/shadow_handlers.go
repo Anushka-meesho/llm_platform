@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"reflect"
 	"sort"
@@ -61,22 +60,21 @@ func (h *Handler) ShadowCompare(w http.ResponseWriter, r *http.Request) {
 		Items  []shadowItem `json:"items"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 	if req.TaskID == "" || len(req.Items) == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "task_id and items are required")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "task_id and items are required"))
 		return
 	}
 	if len(req.Items) > shadowMaxItems {
-		writeError(w, http.StatusUnprocessableEntity,
-			fmt.Sprintf("too many items (max %d per request)", shadowMaxItems))
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "too many items (max %d per request)", shadowMaxItems))
 		return
 	}
 
 	task, err := h.Tasks.Get(req.TaskID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task not found"))
 		return
 	}
 
@@ -147,7 +145,7 @@ func (h *Handler) ShadowCompare(w http.ResponseWriter, r *http.Request) {
 		float64(report.P95LatencyMs), report.TotalCostUSD, string(details),
 		report.CreatedAt.Format("2006-01-02 15:04:05"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "persist report: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "persist shadow report").WithCause(err))
 		return
 	}
 	if id, err := res.LastInsertId(); err == nil {
@@ -176,7 +174,7 @@ func (h *Handler) runShadowItem(r *http.Request, task *tasks.Task, user *auth.Us
 	if herr != nil || !outcome.Result.Success || outcome.Output == nil {
 		reason := "prediction failed"
 		if herr != nil {
-			reason = herr.detail
+			reason = herr.Message
 		} else if outcome.Result.Error != nil {
 			reason = *outcome.Result.Error
 		} else if outcome.Output == nil {
@@ -259,7 +257,7 @@ func (h *Handler) ListShadowReports(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.DB.Query(query, args...)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list shadow reports").WithCause(err))
 		return
 	}
 	defer rows.Close()
@@ -271,7 +269,7 @@ func (h *Handler) ListShadowReports(w http.ResponseWriter, r *http.Request) {
 		var matchRate, avgLat, p95Lat, cost float64
 		if err := rows.Scan(&id, &tID, &items, &matchRate, &avgLat, &p95Lat, &cost,
 			&detailsStr, &createdAt); err != nil {
-			writeError(w, http.StatusInternalServerError, "scan error: "+err.Error())
+			writeErr(w, r, Internal(CodeInternal, "scan rows").WithCause(err))
 			return
 		}
 		var details map[string]any

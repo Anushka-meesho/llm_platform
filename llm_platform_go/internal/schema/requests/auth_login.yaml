@@ -1,0 +1,10 @@
+# POST /auth/login — demo SSO stand-in. Body: {"user_id": "..."}.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Login request
+type: object
+additionalProperties: false
+required: [user_id]
+properties:
+  user_id:
+    type: string
+    minLength: 1

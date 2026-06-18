@@ -7,11 +7,13 @@ import type {
   TTaskStatsDetail,
 } from '../types';
 import { MODELS, MODEL_GROUPS } from '../types';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
 import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
 import SchemaEditor, { type SchemaEditorState } from '../components/SchemaEditor';
 import VersionHistory from '../components/VersionHistory';
+import ErrorState from '../components/ErrorState';
 import { stableStringify } from '../utils/schema';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 
@@ -32,8 +34,8 @@ const TasksPage = () => {
       const { tasks } = await api.listTasks();
       setTasks(tasks);
       setError(null);
-    } catch {
-      setError('Could not load tasks.');
+    } catch (e) {
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -76,11 +78,7 @@ const TasksPage = () => {
             </Button>
           )}
         </div>
-        {error && (
-          <Typography variant="body" size="2" className="text-error-text px-4">
-            {error}
-          </Typography>
-        )}
+        {error && <ErrorState message={error} onRetry={refresh} compact />}
         {tasks.map((t) => (
           <button
             key={t.id}
@@ -150,6 +148,7 @@ const TaskDetail = ({
   onDeleted: () => Promise<void>;
 }) => {
   const { user } = useAuth();
+  const toast = useToast();
   const canWrite = can(user?.role, 'task:write');
   const canDeploy = can(user?.role, 'task:deploy');
   const canDelete = can(user?.role, 'task:delete');
@@ -162,13 +161,19 @@ const TaskDetail = ({
   const [flash, setFlash] = useState<string | null>(null);
 
   const loadVersions = useCallback(async () => {
-    const data = await api.listVersions(task.id).catch(() => null);
+    const data = await api.listVersions(task.id).catch((e) => {
+      console.error('load versions:', errorMessage(e));
+      return null;
+    });
     if (data) setVersions(data.versions);
   }, [task.id]);
 
   useEffect(() => {
     void Promise.resolve().then(loadVersions);
-    api.taskStats(task.id, 30).then(setStats).catch(() => {});
+    api
+      .taskStats(task.id, 30)
+      .then(setStats)
+      .catch((e) => console.error('load task stats:', errorMessage(e)));
   }, [task.id, loadVersions]);
 
   const draftDirty =
@@ -184,10 +189,11 @@ const TaskDetail = ({
     try {
       const { version } = await api.saveDraft(task.id, draft, draftSystem, note);
       setFlash(`Saved as draft v${version} — test it, then deploy.`);
+      toast.success(`Saved as draft v${version} — test it, then deploy.`);
       setNote('');
       await loadVersions();
     } catch (e) {
-      setFlash(e instanceof Error ? e.message : 'Save failed');
+      toast.error(errorMessage(e));
     } finally {
       setBusy(null);
     }
@@ -203,9 +209,10 @@ const TaskDetail = ({
     setBusy('delete');
     try {
       await api.deleteTask(task.id);
+      toast.success(`Task "${task.id}" deleted.`);
       await onDeleted();
     } catch (e) {
-      setFlash(e instanceof Error ? e.message : 'Delete failed');
+      toast.error(errorMessage(e));
       setBusy(null);
     }
   };
@@ -427,7 +434,7 @@ const CreateTaskForm = ({
       await api.createTask(payload);
       await onCreated(id);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Create failed');
+      setErr(errorMessage(e));
       setBusy(false);
     }
   };

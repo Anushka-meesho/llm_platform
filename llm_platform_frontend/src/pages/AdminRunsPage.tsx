@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Typography, Spinner, Button, cn } from '@meesho/merlin-ui-tailwind';
 import type {
   TRunListItem,
@@ -7,7 +7,8 @@ import type {
   TRunFilters,
   TTask,
 } from '../types';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, errorMessage } from '../api/client';
+import ErrorState from '../components/ErrorState';
 import { formatCost } from '../utils/tokens';
 
 // AdminRunsPage is the cross-tenant prompt history: every user's runs, newest
@@ -28,33 +29,41 @@ const AdminRunsPage = () => {
 
   // Filter dropdown options — best-effort, the page works without them.
   useEffect(() => {
-    api.listTasks().then((d) => setTasks(d.tasks)).catch(() => {});
-    api.adminRunModels().then((d) => setModels(d.models)).catch(() => {});
+    api
+      .listTasks()
+      .then((d) => setTasks(d.tasks))
+      .catch((e) => console.error('task options load failed:', errorMessage(e)));
+    api
+      .adminRunModels()
+      .then((d) => setModels(d.models))
+      .catch((e) => console.error('model options load failed:', errorMessage(e)));
   }, []);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api
+      .adminRuns(filters)
+      .then((d) => {
+        setData(d);
+        setError(null);
+        setForbidden(false);
+      })
+      .catch((e) => {
+        if (e instanceof ApiError && e.status === 403) {
+          setForbidden(true);
+        } else {
+          setError(errorMessage(e));
+        }
+      })
+      .finally(() => setLoading(false));
+  }, [filters]);
 
   // Debounced fetch: every filter change (incl. typing) settles for 300ms
   // before hitting the server, so fast typing doesn't spam requests.
   useEffect(() => {
-    const t = setTimeout(() => {
-      setLoading(true);
-      api
-        .adminRuns(filters)
-        .then((d) => {
-          setData(d);
-          setError(null);
-          setForbidden(false);
-        })
-        .catch((e) => {
-          if (e instanceof ApiError && e.status === 403) {
-            setForbidden(true);
-          } else {
-            setError('Could not load run history.');
-          }
-        })
-        .finally(() => setLoading(false));
-    }, 300);
+    const t = setTimeout(load, 300);
     return () => clearTimeout(t);
-  }, [filters]);
+  }, [load]);
 
   // Merge a filter patch; any change other than page resets to page 1.
   const patch = (p: Partial<TRunFilters>) =>
@@ -195,10 +204,8 @@ const AdminRunsPage = () => {
             </div>
           )}
           {error && (
-            <div className="py-6 text-center">
-              <Typography variant="body" size="3" className="text-error-text">
-                {error}
-              </Typography>
+            <div className="py-6">
+              <ErrorState message={error} onRetry={load} />
             </div>
           )}
         </div>
@@ -289,7 +296,7 @@ const RunDetailDrawer = ({ runId, onClose }: { runId: string; onClose: () => voi
     api
       .adminRun(runId)
       .then(setDetail)
-      .catch(() => setError('Could not load this run.'));
+      .catch((e) => setError(errorMessage(e)));
   }, [runId]);
 
   // Close on Escape.

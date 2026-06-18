@@ -55,7 +55,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 
 	runs, total, err := db.ListAllRuns(h.DB, filter, page, pageSize)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list runs").WithCause(err))
 		return
 	}
 
@@ -76,11 +76,11 @@ func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "run_id")
 	detail, err := db.GetRunDetail(h.DB, runID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load run %q", runID).WithCause(err))
 		return
 	}
 	if detail == nil {
-		writeError(w, http.StatusNotFound, "run not found")
+		writeErr(w, r, NotFound(CodeRunNotFound, "run not found"))
 		return
 	}
 	writeJSON(w, http.StatusOK, detail)
@@ -93,7 +93,7 @@ func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminRunModels(w http.ResponseWriter, r *http.Request) {
 	models, err := db.DistinctRunModels(h.DB)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list models").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
@@ -124,15 +124,15 @@ func (h *Handler) AdminResetModelHealth(w http.ResponseWriter, r *http.Request) 
 		Model  string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid JSON body")
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid JSON body"))
 		return
 	}
 	if req.TaskID == "" || req.Model == "" {
-		writeError(w, http.StatusUnprocessableEntity, "task_id and model are required")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "task_id and model are required"))
 		return
 	}
 	if h.Health == nil || !h.Health.Reset(req.TaskID, req.Model, user.Email) {
-		writeError(w, http.StatusNotFound, "no health state tracked for that task/model")
+		writeErr(w, r, NotFound(CodeHealthNotTracked, "no health state tracked for that task/model"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -164,7 +164,7 @@ func (h *Handler) AdminModelHealthEvents(w http.ResponseWriter, r *http.Request)
 
 	events, total, err := db.ListHealthEvents(h.DB, taskID, model, page, pageSize)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load health events").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, types.HealthEventsResponse{

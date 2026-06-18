@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -24,11 +23,11 @@ import (
 func (h *Handler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	var t tasks.Task
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 	if err := h.Tasks.Create(&t); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "%s", err.Error()))
 		return
 	}
 	writeJSON(w, http.StatusCreated, t)
@@ -42,7 +41,7 @@ func (h *Handler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := h.Tasks.List()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list tasks").WithCause(err))
 		return
 	}
 	out := make([]*tasks.Task, len(list))
@@ -60,11 +59,11 @@ func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := h.Tasks.Get(chi.URLParam(r, "task_id"))
 	if errors.Is(err, tasks.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task %q not found", chi.URLParam(r, "task_id")))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load task %q", chi.URLParam(r, "task_id")).WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, redactedTask(user, t))
@@ -76,11 +75,11 @@ func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.Tasks.Get(chi.URLParam(r, "task_id"))
 	if errors.Is(err, tasks.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task %q not found", chi.URLParam(r, "task_id")))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load task %q", chi.URLParam(r, "task_id")).WithCause(err))
 		return
 	}
 
@@ -91,13 +90,13 @@ func (h *Handler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 	// literally and then fail to compile).
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "could not read request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "could not read request body: %s", err.Error()))
 		return
 	}
 
 	t := *existing // start from current state; body overwrites what it carries
 	if err := json.Unmarshal(body, &t); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 
@@ -116,7 +115,7 @@ func (h *Handler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 
 	t.ID = existing.ID
 	if err := h.Tasks.Update(&t); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "%s", err.Error()))
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
@@ -135,11 +134,11 @@ func (h *Handler) DeleteTask(w http.ResponseWriter, r *http.Request) {
 	err := h.Tasks.Delete(id)
 	switch {
 	case errors.Is(err, tasks.ErrNotFound):
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task %q not found", id))
 	case errors.Is(err, tasks.ErrCannotDeletePlayground):
-		writeError(w, http.StatusConflict, err.Error())
+		writeErr(w, r, Conflict(CodePlaygroundProtected, "%s", err.Error()))
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "delete task %q", id).WithCause(err))
 	default:
 		writeJSON(w, http.StatusOK, map[string]string{"task_id": id, "status": "deleted"})
 	}
@@ -186,15 +185,15 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 
 	task, err := h.Tasks.Get(chi.URLParam(r, "task_id"))
 	if errors.Is(err, tasks.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task %q not found", chi.URLParam(r, "task_id")))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load task %q", chi.URLParam(r, "task_id")).WithCause(err))
 		return
 	}
 	if !task.Active {
-		writeError(w, http.StatusConflict, "task is inactive")
+		writeErr(w, r, Conflict(CodeTaskInactive, "task is inactive"))
 		return
 	}
 
@@ -203,13 +202,12 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 	if task.DailyBudgetUSD > 0 {
 		spend, err := h.currentSpend(task.ID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "budget check failed: "+err.Error())
+			writeErr(w, r, Internal(CodeInternal, "budget check").WithCause(err))
 			return
 		}
 		if spend >= task.DailyBudgetUSD {
 			w.Header().Set("Retry-After", strconv.Itoa(secondsToUTCMidnight()))
-			writeError(w, http.StatusTooManyRequests,
-				fmt.Sprintf("daily budget exhausted ($%.4f of $%.2f)", spend, task.DailyBudgetUSD))
+			writeErr(w, r, TooMany(CodeBudgetExhausted, "daily budget exhausted ($%.4f of $%.2f)", spend, task.DailyBudgetUSD))
 			return
 		}
 		if spend >= 0.8*task.DailyBudgetUSD {
@@ -220,13 +218,13 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 
 	var req predictRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 
 	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user, predictOptions{useCache: true})
 	if herr != nil {
-		writeError(w, herr.status, herr.detail)
+		writeErr(w, r, herr)
 		return
 	}
 
@@ -237,7 +235,10 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if !outcome.Result.Success {
-		status = http.StatusBadGateway // upstream model failure
+		// Upstream model failure — the predict response carries the Error detail;
+		// add the request id + a log line so it's traceable like any other error.
+		status = http.StatusBadGateway
+		logUpstreamFailure(w, r, task.ID, outcome)
 	}
 	writeJSON(w, status, shapePredictResponse(task, outcome))
 }
@@ -258,11 +259,11 @@ func (h *Handler) GetTaskRun(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := db.GetRunByID(h.DB, user.Subject, chi.URLParam(r, "run_id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load run").WithCause(err))
 		return
 	}
 	if len(rows) == 0 {
-		writeError(w, http.StatusNotFound, "run not found")
+		writeErr(w, r, NotFound(CodeRunNotFound, "run not found"))
 		return
 	}
 

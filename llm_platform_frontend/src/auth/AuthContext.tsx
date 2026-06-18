@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, errorMessage } from '../api/client';
 import { AuthContext } from './context';
 import type { TUser } from '../types';
 
@@ -16,8 +16,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         if (!cancelled) setUser(user);
       } catch (err) {
         if (!cancelled && !(err instanceof ApiError && err.status === 401)) {
-          // Network/other errors: stay logged out, but don't crash.
-          console.warn('auth bootstrap failed:', err);
+          // A 401 here is expected when signed out — stay quiet. Anything else
+          // is genuinely unexpected: stay logged out, but log for diagnosis.
+          console.error('auth bootstrap failed:', errorMessage(err));
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -34,7 +35,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const logout = useCallback(async () => {
-    await api.logout().catch(() => {});
+    await api.logout().catch((e) => console.error('logout failed:', errorMessage(e)));
     setUser(null);
   }, []);
 

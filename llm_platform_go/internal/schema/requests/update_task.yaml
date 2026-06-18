@@ -1,0 +1,55 @@
+# PUT /v1/tasks/{task_id} — partial update with merge semantics: every field is
+# optional, and only those present overwrite the stored task. An explicit null on
+# input_schema/output_schema clears that schema (handled in UpdateTask).
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Update task request
+type: object
+additionalProperties: false
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9-]{1,63}$"
+  name:
+    type: string
+    minLength: 1
+  description:
+    type: string
+  input_schema:
+    type: [object, "null"]
+  output_schema:
+    type: [object, "null"]
+  prompt_template:
+    type: string
+    minLength: 1
+  system_prompt:
+    type: string
+  prompt_version:
+    type: integer
+    minimum: 0
+  model:
+    type: string
+    minLength: 1
+  fallback_models:
+    type: array
+    items: { type: string }
+  temperature:
+    type: number
+    minimum: 0
+    maximum: 2
+  max_tokens:
+    type: integer
+    minimum: 0
+  daily_budget_usd:
+    type: number
+    minimum: 0
+  cache_enabled:
+    type: boolean
+  cache_ttl_seconds:
+    type: integer
+    minimum: 0
+  active:
+    type: boolean
+  created_at:
+    type: string
+  updated_at:
+    type: string
