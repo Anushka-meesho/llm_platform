@@ -153,12 +153,13 @@ const ModelHealthPage = () => {
                           {s.last_reason || '—'}
                         </span>
                       </Td>
-                      <Td>
+                      <Td nowrap>
                         {s.state !== 'healthy' ? (
                           <Button
                             variant="outline"
                             size="s"
                             disabled={busy === key}
+                            className="whitespace-nowrap"
                             onClick={(e) => {
                               e.stopPropagation();
                               markHealthy(s);
@@ -300,8 +301,8 @@ const Th = ({ children, right }: { children: ReactNode; right?: boolean }) => (
   </th>
 );
 
-const Td = ({ children, right }: { children: ReactNode; right?: boolean }) => (
-  <td className={`px-4 py-2.5 align-top ${right ? 'text-right tabular-nums whitespace-nowrap' : ''}`}>
+const Td = ({ children, right, nowrap }: { children: ReactNode; right?: boolean; nowrap?: boolean }) => (
+  <td className={cn('px-4 py-2.5 align-top', right && 'text-right tabular-nums whitespace-nowrap', nowrap && 'whitespace-nowrap')}>
     <Typography variant="body" size="2" className="text-primary-text">
       {children}
     </Typography>
