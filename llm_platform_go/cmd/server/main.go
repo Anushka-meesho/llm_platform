@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"llm_platform_go/internal/api"
 	"llm_platform_go/internal/cache"
@@ -47,16 +45,6 @@ func main() {
 	}
 
 	clients := llm.BuildClients(cfg)
-
-	// Recovery prober: production requests never probe a failing provider —
-	// they fail fast down the task's fallback chain. This background loop
-	// health-checks unhealthy providers (1-token ping every 15s) and closes
-	// their circuit on recovery, returning traffic to the highest-priority
-	// healthy model automatically.
-	proberCtx, stopProber := context.WithCancel(context.Background())
-	defer stopProber()
-	llm.StartRecoveryProber(proberCtx, clients, 15*time.Second)
-	log.Printf("recovery prober: started (15s interval, probe-only breakers)")
 
 	// Task registry — the DB is the single source of truth for tasks. Only the
 	// built-in playground task is seeded; all product tasks are authored at

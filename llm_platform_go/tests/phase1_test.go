@@ -9,7 +9,6 @@ import (
 	"time"
 
 	appdb "llm_platform_go/internal/db"
-	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/types"
 
 	_ "modernc.org/sqlite"
@@ -18,8 +17,6 @@ import (
 // ── Budget enforcement ───────────────────────────────────────────────────────
 
 func TestBudgetEnforcement(t *testing.T) {
-	llm.ResetBreakers()
-	t.Cleanup(llm.ResetBreakers)
 	srv, database := newPredictServer(t, `{"label":"positive"}`)
 
 	// Give the sentiment task a tiny budget.
@@ -76,8 +73,6 @@ func TestBudgetEnforcement(t *testing.T) {
 // that crosses the cap must therefore block the very next request — no DB
 // round-trip or refresh window in between.
 func TestBudgetIncrementsWithoutDBRefresh(t *testing.T) {
-	llm.ResetBreakers()
-	t.Cleanup(llm.ResetBreakers)
 	srv, _ := newPredictServer(t, `{"label":"positive"}`)
 
 	// Budget below one fake-model call's cost (42 in + 10 out tokens of
@@ -113,8 +108,6 @@ func TestBudgetIncrementsWithoutDBRefresh(t *testing.T) {
 // ── Prompt versions: draft → test → deploy ───────────────────────────────────
 
 func TestPromptVersionLifecycle(t *testing.T) {
-	llm.ResetBreakers()
-	t.Cleanup(llm.ResetBreakers)
 	srv, database := newPredictServer(t, `{"label":"positive"}`)
 
 	// Creating the task recorded version 1.
@@ -205,8 +198,6 @@ func TestPromptVersionLifecycle(t *testing.T) {
 // ── Shadow comparison ────────────────────────────────────────────────────────
 
 func TestShadowCompare(t *testing.T) {
-	llm.ResetBreakers()
-	t.Cleanup(llm.ResetBreakers)
 	// Model always answers {"label":"positive"} — one expected matches, one doesn't.
 	srv, _ := newPredictServer(t, `{"label":"positive"}`)
 
@@ -263,8 +254,6 @@ func TestShadowCompare(t *testing.T) {
 // ── Task stats endpoint ──────────────────────────────────────────────────────
 
 func TestTaskStatsEndpoint(t *testing.T) {
-	llm.ResetBreakers()
-	t.Cleanup(llm.ResetBreakers)
 	srv, _ := newPredictServer(t, `{"label":"positive"}`)
 
 	_, _ = http.DefaultClient.Do(authReq(t, http.MethodPost,

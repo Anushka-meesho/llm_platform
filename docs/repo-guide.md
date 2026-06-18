@@ -22,7 +22,7 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 **Current state — Phases 0 + 1 complete:**
 - Task registry (DB-backed, authored via the Studio API/UI), task-keyed prediction endpoint with schema enforcement
 - **Multimodal input:** a task may accept one image (`image`) or many (`images[]`) — base64 data URLs or image URLs — attached to vision models as OpenAI multimodal content blocks (the live `attribute-extraction` task uses this)
-- **Resilient routing:** fallback chains + a **per-provider** circuit breaker **and** a **per-(task, model)** health breaker that skips a model for one task after repeated failures (incl. schema-invalid output) with exponential-backoff cooldown + admin reset, `X-Platform-Degraded` contract
+- **Resilient routing:** fallback chains + a **per-(task, model)** health breaker that skips a model for one task after repeated failures (incl. schema-invalid output) with exponential-backoff cooldown + admin reset, `X-Platform-Degraded` contract
 - **Admin observability:** a cross-tenant **prompt-history** viewer (every user's runs, filterable + paginated) and a **model-health** console (live circuit states + persisted fallback/health events), both admin-only
 - **Budget enforcement:** per-task daily caps → 429 + `Retry-After` (0 = exempt)
 - **Service auth + RBAC:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready) with a role; role-based authorization enforced at the gateway (creator / approver / caller / viewer / admin — see §3.3)
@@ -101,18 +101,16 @@ llm_platform/
 3. `llm.LoadPricing(pricing.json)` — cost table into memory.
 4. `db.Open` (SQLite, WAL, single writer) → `db.Migrate` (idempotent).
 5. `llm.BuildClients` — one `Provider` per backend (OpenAI/Groq/Gemini/Anthropic).
-6. `llm.StartRecoveryProber(ctx, clients, 15s)` — enables probe-only breakers and
-   background health-checks unhealthy providers (see §3.6).
-7. `tasks.NewStore` → `tasks.SeedPlayground` — seeds only the built-in `playground` task.
+6. `tasks.NewStore` → `tasks.SeedPlayground` — seeds only the built-in `playground` task.
    Product tasks live in the DB and are authored at runtime via the Studio (no YAML seeding).
-8. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
-9. `db.NewRunWriter` — async observability writer; `Close()` flushes on shutdown.
-10. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) circuit
-    breaker (thresholds from config; transitions persisted via the async health writer).
-    See §3.6.
-11. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
+7. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
+8. `db.NewRunWriter` — async observability writer; `Close()` flushes on shutdown.
+9. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) health
+   breaker (thresholds from config; transitions persisted via the async health writer).
+   See §3.6.
+10. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
     memory / off.
-12. `api.NewRouter(RouterDeps{...})` → `http.ListenAndServe(:PORT)`.
+11. `api.NewRouter(RouterDeps{...})` → `http.ListenAndServe(:PORT)`.
 
 ### 3.2 Configuration — `internal/config`
 
@@ -291,23 +289,11 @@ execution path used by both the playground fan-out and `/predict`. Retries up to
 errors into human-readable strings (`classifyError`: timeouts, network, auth, rate-limit,
 provider-down). Never panics; failures come back as `ModelResult{Success: false, Error}`.
 
-**Circuit breaker** (`breaker.go`): per-provider state machine — closed → open after 3
-consecutive *infra* failures (`isInfraFailure`: 429/5xx/network/timeout; 4xx config
-errors and caller cancellation don't count) → half-open after 30s (one probe) → closed
-on success. Process-global `defaultBreakers`; `ResetBreakers()` for tests; injectable
-clock via `NewBreakerSetForTest`. Open circuit = instant errResult, no provider call.
-**Probe-only mode** (`SetProbeOnly`, enabled in production by the prober): open
-circuits never half-open for production traffic — recovery is owned entirely by
-the background prober.
-
-**Recovery prober** (`prober.go`, started in `main.go`, 15s interval): with
-probe-only breakers, production requests never pay to discover a recovery —
-a sick provider costs latency exactly once (the failures that tripped the
-breaker), then every request fails fast (<1ms) down the fallback chain. The
-prober sends a 1-token "ping" (5s timeout, no retries) to each provider whose
-circuit isn't closed; a completed exchange closes the circuit, and since
-`CallWithFallback` walks the chain from the front on every request, the very
-next prediction returns to the highest-priority healthy model automatically.
+**Error classification** (`failure.go`): `isInfraFailure` (429/5xx/network/timeout — 4xx
+config errors and caller cancellation don't count) and `shouldFallback` (infra *plus*
+401/403/404 provider-config errors) decide whether a failed call advances the chain. There
+is **no** per-provider circuit breaker or background recovery prober — provider failures are
+handled entirely by the per-(task, model) health breaker below, discovered in-band.
 
 **Fallback chain** (`fallback.go`): `CallWithFallbackOpts(models []string, …, FallbackOptions)`
 tries primary then fallbacks. `FallbackOptions` carries three optional hooks: the per-model
@@ -679,13 +665,9 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   retry rules + error classification, message building, OpenAI-compat wire format
   (headers, endpoint path, error-body mapping). `anthropic_test.go` — happy path,
   SDK-error → `APIError` mapping, refusals surface as 400-class content-level
-  errors (never trip the breaker or advance the fallback chain).
-- `internal/llm/breaker_test.go` — breaker state machine (fake clock), infra-failure
-  classification, fallback advance/stop rules, open-circuit fail-fast.
-- `internal/llm/prober_test.go` — probe-only breakers never admit production
-  traffic while open; prober closes the circuit only when the provider
-  recovers; end-to-end: outage → fallback serves (primary untouched) → probe
-  recovery → traffic back on the primary.
+  errors (never advance the fallback chain).
+- `internal/llm/breaker_test.go` — infra-failure classification (`isInfraFailure`)
+  and fallback advance/stop rules across infra/config/content errors and a dead chain.
 - `cache_predict_test.go` — cache hit serves without a provider call (zero cost,
   `cache_hit` row, spend unchanged), key sensitivity (inputs, deploy-with-identical-
   template invalidates), opt-in required, Studio test bypass, failures and
@@ -732,8 +714,7 @@ RBAC and admin 403 tests).
    the in-memory tracker (events persisted async). New per-request features must follow
    this — read from memory, write async.
 10. **Health is per-(task, model), live state in-memory, history persisted.** The
-    per-(task, model) breaker (`internal/health`) is orthogonal to the per-provider
-    breaker — keep both. Live circuit state resets on restart (matching the provider
-    breaker); only `model_health_events` is durable. Admin observability/override routes
+    per-(task, model) breaker (`internal/health`) is the platform's only breaker. Live
+    state resets on restart; only `model_health_events` is durable. Admin observability/override routes
     (`/v1/admin/*`) are gated on the `admin` *role* (`RequireAdmin`), not a task capability,
     because they expose cross-tenant data.

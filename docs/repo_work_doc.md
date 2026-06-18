@@ -2,7 +2,7 @@
 
 > A living reference for **everything the repo does today**: the architecture, every HTTP endpoint (what it accepts and returns), how a prediction flows end to end, the LLM routing/fallback machinery, caching, prompt versioning, auth/RBAC, the data model, configuration, and the frontend. Workflow diagrams are included throughout.
 
-The platform is a **task-keyed LLM prediction service** plus a **Studio** for authoring/versioning prompts and a **playground** for comparing models. A "task" bundles a prompt template, input/output JSON Schemas, a model routing chain (primary + fallbacks), sampling params, a daily budget, and cache settings. Callers invoke a task by id; the platform renders the prompt, attaches any image inputs for vision models, routes to a model (with fallback, a per-provider circuit breaker, **and** a per-(task, model) health breaker that routes around a model after repeated failures), validates output, caches, meters cost, and records every run. Admins get a cross-tenant **prompt-history** viewer and a **model-health** console.
+The platform is a **task-keyed LLM prediction service** plus a **Studio** for authoring/versioning prompts and a **playground** for comparing models. A "task" bundles a prompt template, input/output JSON Schemas, a model routing chain (primary + fallbacks), sampling params, a daily budget, and cache settings. Callers invoke a task by id; the platform renders the prompt, attaches any image inputs for vision models, routes to a model (with fallback **and** a per-(task, model) health breaker that routes around a model after repeated failures), validates output, caches, meters cost, and records every run. Admins get a cross-tenant **prompt-history** viewer and a **model-health** console.
 
 There are **three deployables**: the Go backend (single binary), the **Studio** frontend (`llm_platform_frontend`, :5173) for teams that *operate* the platform, and the **client portal** (`llm_platform_client`, :5174) for teams that *call* it (catalog + live Try-it predict against `/v1/tasks/*`, authenticated as a service token — see §11). The superseded Python prototype `llm_platform_v0` is out of scope.
 
@@ -11,10 +11,11 @@ There are **three deployables**: the Go backend (single binary), the **Studio** 
 ## 1. System architecture
 
 ```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 70, 'rankSpacing': 110, 'curve': 'basis', 'useMaxWidth': true}}}%%
 flowchart LR
   subgraph Client["Frontends (React + Vite)"]
-    UI["Studio :5173\nCompare / Tasks / Versions / Estimate / Dashboard\n+ History / Health (admin)"]
-    CP["Client portal :5174\nCatalog / Try-it (svc token)"]
+    UI["Studio :5173<br/>Compare / Tasks / Versions / Estimate / Dashboard<br/>+ History / Health (admin)"]
+    CP["Client portal :5174<br/>Catalog / Try-it (svc token)"]
   end
 
   subgraph API["Go API (chi router)"]
@@ -24,11 +25,9 @@ flowchart LR
   end
 
   subgraph LLMCORE["LLM execution layer"]
-    FB["CallWithFallbackOpts (chain walk:\nhealth gate + cache + output validator)"]
+    FB["CallWithFallbackOpts (chain walk:<br/>health gate + cache + output validator)"]
     REG["Model registry"]
-    BRK["Circuit breakers (per provider)"]
-    PRB["Recovery prober (15s)"]
-    HB["Health breaker (per task+model)\nincl. schema-invalid"]
+    HB["Health breaker (per task+model)<br/>incl. schema-invalid"]
   end
 
   subgraph Providers["Providers"]
@@ -37,9 +36,9 @@ flowchart LR
 
   subgraph State["State"]
     DB[("SQLite (WAL)")]
-    CACHE[("Prediction cache\nRedis | memory | off")]
-    STORE["Task config store\n(in-proc cache + editMu)"]
-    HEALTH["Health tracker\n(in-proc, per task+model)"]
+    CACHE[("Prediction cache<br/>Redis | memory | off")]
+    STORE["Task config store<br/>(in-proc cache + editMu)"]
+    HEALTH["Health tracker<br/>(in-proc, per task+model)"]
   end
 
   UI -->|"cookie-auth JSON"| MW --> H
@@ -49,12 +48,9 @@ flowchart LR
   H <-->|"admin: snapshot / reset"| HEALTH
   STORE <--> DB
   EP --> FB --> REG --> Providers
-  FB <--> BRK
   FB <-->|"allow / record"| HB
   HB <--> HEALTH
   HEALTH -->|"async events"| DB
-  PRB --> Providers
-  PRB <--> BRK
   EP <--> CACHE
   EP -->|"async run rows"| DB
 ```
@@ -89,6 +85,7 @@ flowchart LR
 Endpoint: `POST /v1/tasks/{task_id}/predict`. The same core (`executePrediction`) backs `/predict`, `/test`, and shadow comparison — differing only by options (test/shadow bypass the cache and don't count as production traffic in the same way).
 
 ```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 55, 'rankSpacing': 70, 'curve': 'basis', 'useMaxWidth': true}}}%%
 flowchart TD
   A["POST /predict {inputs}"] --> B{"Task exists & active?"}
   B -- "no" --> B1["404 / 409"]
@@ -99,14 +96,14 @@ flowchart TD
   D -- "valid" --> E["Render prompt (Go template + inputs)"]
   E --> F["Build messages (system + user)"]
   F --> G["Chain = [primary, ...fallbacks] (read fresh from config store)"]
-  G --> H["CallWithFallbackOpts walks the chain\n(health gate + cache + output validator)"]
+  G --> H["CallWithFallbackOpts walks the chain<br/>(health gate + cache + output validator)"]
 
   subgraph WALK["For each model in chain order (production)"]
-    H --> HG{"Healthy for this task?\n(per task+model breaker)"}
+    H --> HG{"Healthy for this task?<br/>(per task+model breaker)"}
     HG -- "no" --> K["Skip — no call · advance chain"]
-    HG -- "yes" --> I{"Per-model cache hit?\n(only if cacheable)"}
+    HG -- "yes" --> I{"Per-model cache hit?<br/>(only if cacheable)"}
     I -- "yes" --> I1["Serve cached answer · stop · zero cost"]
-    I -- "no" --> L["Call provider (≤3 tries, backoff on 429/5xx;\nprovider circuit open ⇒ fail fast)"]
+    I -- "no" --> L["Call provider (≤3 tries, backoff on 429/5xx)"]
     L --> M{"Outcome"}
     M -- "success + schema-valid" --> N["record healthy · stop"]
     M -- "success but schema-invalid" --> KR["record failure · advance"]
@@ -310,48 +307,29 @@ A single `registry` map is the source of truth for routing. Every model key maps
 - Serves a cached answer if the lookup hits.
 - Otherwise calls it live and decides:
   - **Stops** on a usable success — a provider success that passes the output validator (or no validator).
-  - **Advances** on provider-specific trouble — infra (`429/5xx`, network, timeout, open provider circuit) and provider-config errors (`401/403/404`, provider not configured) — **and on a schema-invalid output** (a "schematic" failure), recording the failure against health each time.
+  - **Advances** on provider-specific trouble — infra (`429/5xx`, network, timeout) and provider-config errors (`401/403/404`, provider not configured) — **and on a schema-invalid output** (a "schematic" failure), recording the failure against health each time.
   - **Returns immediately** on a `400/422` content error (bad input — retrying elsewhere just burns money; not counted against health).
 - Sets `FallbackUsed` (served by a non-primary) and `Degraded` (fallback used, or the whole chain failed) for the `X-Platform-Degraded` contract.
 
 `CallWithFallback`/`CallWithFallbackCached` remain thin wrappers (no gate, no validator) for callers that don't need health gating. The health gate + output validator are wired only for **production** predicts (`useCache`, no model override).
 
-### Circuit breaker (per provider)
-
-```mermaid
-stateDiagram-v2
-  [*] --> Closed
-  Closed --> Open: 3 consecutive infra failures
-  Open --> HalfOpen: cooldown 30s elapsed (admits 1 probe)\n(skipped in probe-only mode)
-  HalfOpen --> Closed: probe succeeds
-  HalfOpen --> Open: probe fails
-```
-
-- Trips after **3** consecutive infra failures; cooldown **30s**.
-- **Probe-only mode** (enabled in production via the recovery prober): open circuits never half-open on production traffic — they fail fast to the next model, and only an out-of-band probe success closes them.
-- Only infra failures count against the breaker; a `4xx` (except `429`) and a caller cancellation are "healthy" exchanges.
-
-### Recovery prober
-Background loop (default every **15s**, 5s probe timeout, no retries): pings each unhealthy provider's circuit with a 1-token request. Any completed exchange (even a `4xx`) proves the provider is reachable and closes the circuit, returning traffic to the highest-priority healthy model automatically.
-
 ### Per-(task, model) health breaker (`internal/health`)
-Orthogonal to the per-provider breaker above: keyed on a **specific task's use of a specific model**, so a model that misbehaves for one task is routed around only for that task. The `Tracker` is process-wide and mutex-guarded; the fallback walk feeds it through a task-bound `HealthGate` adapter built in `predict_core.go`.
+The single breaker in the platform: keyed on a **specific task's use of a specific model**, so a model that misbehaves for one task is routed around only for that task. The `Tracker` is process-wide and mutex-guarded; the fallback walk feeds it through a task-bound `HealthGate` adapter built in `predict_core.go`. Failures are discovered in-band — there is no separate per-provider circuit breaker or background prober; a model's recovery trial is the next production request after its cooldown elapses.
 
 ```mermaid
 stateDiagram-v2
   [*] --> healthy
-  healthy --> unhealthy: HEALTH_FAILURE_THRESHOLD consecutive failures\n(provider error OR schema-invalid output)
-  unhealthy --> probing: cooldown elapsed (1 trial allowed)
-  probing --> healthy: trial succeeds (counters reset)
-  probing --> unhealthy: trial fails (cooldown × 2, capped)
+  healthy --> unhealthy: threshold failures
+  unhealthy --> probing: cooldown elapsed
+  probing --> healthy: trial succeeds / admin reset
+  probing --> unhealthy: trial fails (cooldown ×2)
   unhealthy --> healthy: admin reset
-  probing --> healthy: admin reset
 ```
 
 - **Trip**: after `HEALTH_FAILURE_THRESHOLD` (default **3**) consecutive failures the model goes **unhealthy** and is **skipped — no call** — for `HEALTH_BASE_COOLDOWN` (default **30s**).
 - **Backoff**: each re-trip (a failed probe) **doubles** the cooldown, capped at `HEALTH_MAX_COOLDOWN` (default **30m**).
 - **Recover**: a successful probe (or an admin reset) returns it to healthy and resets the counters.
-- **What counts**: any provider error that advances the chain (network / `401/403` / `429` / `5xx` / timeout / open provider circuit) and any **schema-invalid** output. A `400/422` content error does not (bad input, not the model's fault).
+- **What counts**: any provider error that advances the chain (network / `401/403` / `429` / `5xx` / timeout) and any **schema-invalid** output. A `400/422` content error does not (bad input, not the model's fault).
 - **Scope**: production predicts only. Live state is **in-process** and resets on restart; every transition (`failure` / `tripped` / `recovered` / `manual_reset`) is persisted to `model_health_events` via an async writer. Admins view state and force a reset via `/v1/admin/model-health*` (§5.5).
 - **Config**: `HEALTH_BREAKER_ENABLED` (default `true`) turns the whole thing off — every model is then tried every time.
 
@@ -391,12 +369,13 @@ Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, 
 ### Prompt version lifecycle
 
 ```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 60, 'rankSpacing': 90, 'curve': 'basis', 'useMaxWidth': true}}}%%
 flowchart LR
-  E["Edit prompt in Studio"] -->|"write"| D["Save draft (POST /versions)\nversion = max+1, active:false"]
+  E["Edit prompt in Studio"] -->|"write"| D["Save draft (POST /versions)<br/>version = max+1, active:false"]
   D --> T["Test draft (POST /test, version override)"]
   T --> P{"Good?"}
   P -- "no" --> E
-  P -- "yes" --> DP["Deploy (POST /deploy)\n→ active_version, cache invalidates"]
+  P -- "yes" --> DP["Deploy (POST /deploy)<br/>→ active_version, cache invalidates"]
   DP --> L["Live: /predict uses the deployed version"]
   D -. "admin" .-> X["Delete a non-active version"]
 ```
@@ -419,7 +398,7 @@ flowchart LR
 
 - **Single writer** (`SetMaxOpenConns(1)`) + `busy_timeout=5000` avoid "database is locked".
 - **`RunWriter`**: a 1024-entry buffered channel drained by one goroutine; handlers submit run rows without blocking. If the buffer is full, the row is dropped and counted (a prediction is never blocked by observability). `Close()` flushes on shutdown.
-- **`HealthEventWriter`**: the same buffered-channel + drain-goroutine pattern for `model_health_events`, wired as the health tracker's event sink so circuit transitions persist off the request hot path.
+- **`HealthEventWriter`**: the same buffered-channel + drain-goroutine pattern for `model_health_events`, wired as the health tracker's event sink so health-state transitions persist off the request hot path.
 - The `image` column is written/read via `imagesToColumn`/`ParseImagesColumn` (JSON array; legacy single-string rows still parse), so one or many images share one column.
 
 ---

@@ -237,7 +237,7 @@ they become per-pod and need awareness (fine) or centralization (later):
 
 | Component | At N replicas | Action |
 |---|---|---|
-| Circuit breaker (`defaultBreakers`) | Each pod trips independently | Acceptable — document it. Centralize in Redis only if flapping is observed |
+| Health breaker (`internal/health`) | Each pod tracks per-(task, model) health independently | Acceptable — document it. Centralize in Redis only if flapping is observed |
 | Budget gate (`TaskSpendToday`) | Reads the shared DB — correct, but read-then-spend races can overshoot by in-flight calls | Acceptable overshoot (≤ concurrency × per-call cost). Tighten with `SELECT ... FOR UPDATE`-based reservation only if real overshoot matters |
 | RunWriter | Per-pod buffers — fine | Ensure graceful shutdown flush per §4 |
 | Schema/template caches (`internal/tasks`) | Per-pod content-hash caches — correct by construction | None |
