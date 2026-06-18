@@ -85,7 +85,7 @@ func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, o
 		"path", r.URL.Path,
 		"task", taskID,
 		"model", model,
-		"code", CodeUpstreamFailed,
+		"code", CodeNoModelAvailable,
 		"status", http.StatusBadGateway,
 		"error", detail,
 	)
@@ -401,6 +401,13 @@ func collectImages(inputMap map[string]any) []string {
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.
 func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
+	// A failed result means the whole model chain proved unusable for this task
+	// (every model failed, was unhealthy, or returned schema-invalid output) —
+	// surface a stable code so callers can branch on "no model worked".
+	errorCode := ""
+	if !o.Result.Success {
+		errorCode = CodeNoModelAvailable
+	}
 	return predictResponse{
 		TaskRunID:     o.RunID,
 		TaskID:        task.ID,
@@ -411,6 +418,7 @@ func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
 		OutputValid:   o.OutputValid,
 		RawResponse:   o.Result.Response,
 		Error:         o.Result.Error,
+		ErrorCode:     errorCode,
 		FallbackUsed:  o.Result.FallbackUsed,
 		Cached:        o.CacheHit,
 		Usage: predictUsage{

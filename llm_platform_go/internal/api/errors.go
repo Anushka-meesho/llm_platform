@@ -52,7 +52,7 @@ const (
 	CodeHealthNotTracked    = "health_not_tracked"
 	CodeNotFound            = "not_found"
 	CodeBudgetExhausted     = "budget_exhausted"
-	CodeUpstreamFailed      = "upstream_failed"
+	CodeNoModelAvailable    = "no_model_available"
 	CodeDBError             = "db_error"
 	CodeInternal            = "internal"
 )
