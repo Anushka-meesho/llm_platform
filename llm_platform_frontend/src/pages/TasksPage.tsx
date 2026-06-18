@@ -10,6 +10,7 @@ import { api, errorMessage } from '../api/client';
 import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
 import SchemaEditor, { type SchemaEditorState } from '../components/SchemaEditor';
+import OutputSchemaEditor from '../components/OutputSchemaEditor';
 import VersionHistory from '../components/VersionHistory';
 import ErrorState from '../components/ErrorState';
 import { stableStringify } from '../utils/schema';
@@ -279,6 +280,9 @@ const TaskDetail = ({
 
       {/* Model routing */}
       <ModelSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
+
+      {/* Sampling (max output tokens) */}
+      <SamplingSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
       {/* Input / output schema */}
       <SchemaSection key={task.id} task={task} onChanged={onChanged} setFlash={setFlash} canWrite={canWrite} />
@@ -672,12 +676,12 @@ const CreateTaskForm = ({
           </SchemaPane>
           <SchemaPane
             title="Output schema"
-            hint="Validates model output. Off = raw text output (no output_valid flag)."
+            hint="The API response contract: pick what the caller receives (string, number, JSON, …). The model's answer is coerced to that type. Off = raw text (no output_valid flag)."
             enabled={outputEnabled}
             onToggle={setOutputEnabled}
             canWrite={true}
           >
-            <SchemaEditor initial={output.schema} readOnly={false} onChange={setOutput} />
+            <OutputSchemaEditor initial={output.schema} readOnly={false} onChange={setOutput} />
           </SchemaPane>
         </div>
       </Section>
@@ -781,12 +785,12 @@ const SchemaSection = ({
         </SchemaPane>
         <SchemaPane
           title="Output schema"
-          hint="Validates model output. Off = raw text output (no output_valid flag)."
+          hint="The API response contract: pick what the caller receives (string, number, JSON, …). The model's answer is coerced to that type. Off = raw text (no output_valid flag)."
           enabled={outputEnabled}
           onToggle={setOutputEnabled}
           canWrite={canWrite}
         >
-          <SchemaEditor
+          <OutputSchemaEditor
             initial={output.schema}
             readOnly={!canWrite}
             onChange={setOutput}
@@ -994,6 +998,94 @@ const ModelSection = ({
           probe re-engages the higher-priority model once it recovers.
         </Typography>
       </div>
+    </Section>
+  );
+};
+
+// ── Sampling ──────────────────────────────────────────────────────────────────
+
+// SamplingSection edits the task's max output token cap on an existing task.
+// Saves via PUT merge semantics — only max_tokens changes; production traffic
+// picks up the new cap on the next predict. The prediction cache keys on
+// max_tokens, so a changed cap can't replay answers generated under the old one.
+const SamplingSection = ({
+  task,
+  onSaved,
+  setFlash,
+  canWrite,
+}: {
+  task: TTask;
+  onSaved: () => Promise<void>;
+  setFlash: (msg: string) => void;
+  canWrite: boolean;
+}) => {
+  const [maxTokens, setMaxTokens] = useState(String(task.max_tokens));
+  const [saving, setSaving] = useState(false);
+
+  const tokNum = Number(maxTokens);
+  const valid = Number.isInteger(tokNum) && tokNum > 0;
+  const dirty = maxTokens.trim() !== String(task.max_tokens);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateTask(task.id, { max_tokens: tokNum });
+      setFlash(`Max output tokens set to ${tokNum} — takes effect on the next predict.`);
+      await onSaved();
+    } catch (e) {
+      setFlash(e instanceof Error ? e.message : 'Max tokens change failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Sampling">
+      <label className="block max-w-xs">
+        <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+          Max output tokens
+        </Typography>
+        <input
+          className={INPUT_CLS}
+          type="number"
+          min={1}
+          step={1}
+          value={maxTokens}
+          disabled={!canWrite}
+          onChange={(e) => setMaxTokens(e.target.value)}
+        />
+        {maxTokens.trim() !== '' && !valid && (
+          <Typography variant="body" size="1" className="text-error-text mt-0.5">
+            Must be a positive whole number.
+          </Typography>
+        )}
+      </label>
+      {canWrite ? (
+        <div className="flex items-center gap-3 mt-3">
+          <Button variant="primary" size="s" disabled={!dirty || !valid || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+          {dirty && (
+            <Button
+              variant="ghost"
+              size="s"
+              disabled={saving}
+              onClick={() => setMaxTokens(String(task.max_tokens))}
+            >
+              Reset
+            </Button>
+          )}
+          {dirty && valid && (
+            <Typography variant="body" size="1" className="text-tertiary-text">
+              Unsaved — caps each model's response length on the next predict.
+            </Typography>
+          )}
+        </div>
+      ) : (
+        <Typography variant="body" size="1" className="text-tertiary-text mt-2">
+          Your role cannot edit task config.
+        </Typography>
+      )}
     </Section>
   );
 };
