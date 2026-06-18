@@ -11,6 +11,7 @@ import { useAuth } from '../auth/useAuth';
 import { can } from '../auth/permissions';
 import SchemaEditor, { type SchemaEditorState } from '../components/SchemaEditor';
 import VersionHistory from '../components/VersionHistory';
+import ErrorState from '../components/ErrorState';
 import { stableStringify } from '../utils/schema';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 
@@ -18,8 +19,11 @@ import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 // drafts, test any version against any model, and deploy — the
 // edit → test → deploy loop.
 const TasksPage = () => {
+  const { user } = useAuth();
+  const canWrite = can(user?.role, 'task:write');
   const [tasks, setTasks] = useState<TTask[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,8 +32,8 @@ const TasksPage = () => {
       const { tasks } = await api.listTasks();
       setTasks(tasks);
       setError(null);
-    } catch {
-      setError('Could not load tasks.');
+    } catch (e) {
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -54,23 +58,35 @@ const TasksPage = () => {
     <div className="flex flex-1 overflow-hidden">
       {/* Task list */}
       <aside className="w-72 flex-shrink-0 border-r border-solid border-primary-border bg-secondary-bg overflow-y-auto">
-        <div className="px-4 py-3">
+        <div className="px-4 py-3 flex items-center justify-between gap-2">
           <Typography variant="body" size="1" className="text-tertiary-text uppercase tracking-wider">
             Tasks
           </Typography>
+          {canWrite && (
+            <Button
+              variant="primary"
+              size="s"
+              onClick={() => {
+                setCreating(true);
+                setSelectedId(null);
+              }}
+              title="Author a new task"
+            >
+              + New
+            </Button>
+          )}
         </div>
-        {error && (
-          <Typography variant="body" size="2" className="text-error-text px-4">
-            {error}
-          </Typography>
-        )}
+        {error && <ErrorState message={error} onRetry={refresh} compact />}
         {tasks.map((t) => (
           <button
             key={t.id}
-            onClick={() => setSelectedId(t.id)}
+            onClick={() => {
+              setSelectedId(t.id);
+              setCreating(false);
+            }}
             className={cn(
               'w-full text-left px-4 py-3 border-b border-solid border-tertiary-border transition-colors',
-              selectedId === t.id ? 'bg-tertiary-bg' : 'hover:bg-tertiary-bg',
+              selectedId === t.id && !creating ? 'bg-tertiary-bg' : 'hover:bg-tertiary-bg',
             )}
           >
             <Typography variant="body" size="3" className="text-primary-text font-medium">
@@ -86,14 +102,32 @@ const TasksPage = () => {
 
       {/* Detail */}
       <div className="flex-1 overflow-y-auto bg-primary-bg p-6">
-        {!selected ? (
+        {creating ? (
+          <CreateTaskForm
+            existingIds={tasks.map((t) => t.id)}
+            onCancel={() => setCreating(false)}
+            onCreated={async (id) => {
+              setCreating(false);
+              await refresh();
+              setSelectedId(id);
+            }}
+          />
+        ) : !selected ? (
           <div className="h-full flex items-center justify-center">
             <Typography variant="body" size="3" className="text-tertiary-text">
               Select a task to view its config, prompt history, and test panel.
             </Typography>
           </div>
         ) : (
-          <TaskDetail key={selected.id} task={selected} onChanged={refresh} />
+          <TaskDetail
+            key={selected.id}
+            task={selected}
+            onChanged={refresh}
+            onDeleted={async () => {
+              setSelectedId(null);
+              await refresh();
+            }}
+          />
         )}
       </div>
     </div>
@@ -102,8 +136,17 @@ const TasksPage = () => {
 
 // ── Detail view ───────────────────────────────────────────────────────────────
 
-const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise<void> }) => {
+const TaskDetail = ({
+  task,
+  onChanged,
+  onDeleted,
+}: {
+  task: TTask;
+  onChanged: () => Promise<void>;
+  onDeleted: () => Promise<void>;
+}) => {
   const { user } = useAuth();
+  const toast = useToast();
   const canWrite = can(user?.role, 'task:write');
   const canDeploy = can(user?.role, 'task:deploy');
   const canDelete = can(user?.role, 'task:delete');
@@ -116,13 +159,19 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
   const [flash, setFlash] = useState<string | null>(null);
 
   const loadVersions = useCallback(async () => {
-    const data = await api.listVersions(task.id).catch(() => null);
+    const data = await api.listVersions(task.id).catch((e) => {
+      console.error('load versions:', errorMessage(e));
+      return null;
+    });
     if (data) setVersions(data.versions);
   }, [task.id]);
 
   useEffect(() => {
     void Promise.resolve().then(loadVersions);
-    api.taskStats(task.id, 30).then(setStats).catch(() => {});
+    api
+      .taskStats(task.id, 30)
+      .then(setStats)
+      .catch((e) => console.error('load task stats:', errorMessage(e)));
   }, [task.id, loadVersions]);
 
   const draftDirty =
@@ -138,31 +187,64 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
     try {
       const { version } = await api.saveDraft(task.id, draft, draftSystem, note);
       setFlash(`Saved as draft v${version} — test it, then deploy.`);
+      toast.success(`Saved as draft v${version} — test it, then deploy.`);
       setNote('');
       await loadVersions();
     } catch (e) {
-      setFlash(e instanceof Error ? e.message : 'Save failed');
+      toast.error(errorMessage(e));
     } finally {
+      setBusy(null);
+    }
+  };
+
+  const deleteTask = async () => {
+    if (
+      !window.confirm(
+        `Permanently delete task "${task.id}" and its entire prompt history? This cannot be undone.`,
+      )
+    )
+      return;
+    setBusy('delete');
+    try {
+      await api.deleteTask(task.id);
+      toast.success(`Task "${task.id}" deleted.`);
+      await onDeleted();
+    } catch (e) {
+      toast.error(errorMessage(e));
       setBusy(null);
     }
   };
 
   return (
     <div className="mx-auto max-w-4xl flex flex-col gap-6">
-      <div>
-        <Typography variant="heading" size="6" className="text-primary-text">
-          {task.name}
-        </Typography>
-        <Typography variant="body" size="2" className="text-tertiary-text">
-          {task.id} · {task.model}
-          {task.fallback_models?.length ? ` (fallback: ${task.fallback_models.join(', ')})` : ''} ·
-          active v{task.prompt_version}
-          {task.daily_budget_usd ? ` · budget $${task.daily_budget_usd}/day` : ' · no budget cap'}
-        </Typography>
-        {task.description && (
-          <Typography variant="body" size="2" className="text-secondary-text mt-1">
-            {task.description}
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <Typography variant="heading" size="6" className="text-primary-text">
+            {task.name}
           </Typography>
+          <Typography variant="body" size="2" className="text-tertiary-text">
+            {task.id} · {task.model}
+            {task.fallback_models?.length ? ` (fallback: ${task.fallback_models.join(', ')})` : ''} ·
+            active v{task.prompt_version}
+            {task.daily_budget_usd ? ` · budget $${task.daily_budget_usd}/day` : ' · no budget cap'}
+          </Typography>
+          {task.description && (
+            <Typography variant="body" size="2" className="text-secondary-text mt-1">
+              {task.description}
+            </Typography>
+          )}
+        </div>
+        {canDelete && task.id !== 'playground' && (
+          <Button
+            variant="ghost"
+            size="s"
+            className="flex-shrink-0 text-error-text"
+            disabled={busy !== null}
+            onClick={deleteTask}
+            title="Permanently delete this task (admin only)"
+          >
+            {busy === 'delete' ? 'Deleting…' : 'Delete task'}
+          </Button>
         )}
       </div>
 
@@ -259,10 +341,370 @@ const TaskDetail = ({ task, onChanged }: { task: TTask; onChanged: () => Promise
   );
 };
 
-// ── Schema editor ─────────────────────────────────────────────────────────────
+// ── Create task ─────────────────────────────────────────────────────────────
 
 const hasSchema = (s?: Record<string, unknown>) => !!s && Object.keys(s).length > 0;
 const EMPTY_OBJECT_SCHEMA = { type: 'object', properties: {} };
+
+const INPUT_CLS =
+  'w-full border border-solid border-primary-border rounded-md px-2 py-1.5 text-sm bg-primary-bg text-primary-text';
+// Task id contract — mirrors the backend slug rule (internal/tasks/task.go).
+const ID_SLUG = /^[a-z0-9][a-z0-9-]{1,63}$/;
+
+// CreateTaskForm authors a brand-new task and POSTs it to /v1/tasks. Now that
+// the YAML seed layer is gone, this is the only path that brings a task into
+// existence — it fills in every field that used to live in tasks.d/*.yaml.
+// Gated by task:write at the call site (creator/admin); the backend re-enforces
+// it and re-validates the slug, schemas, template, and model on submit.
+const CreateTaskForm = ({
+  existingIds,
+  onCreated,
+  onCancel,
+}: {
+  existingIds: string[];
+  onCreated: (id: string) => Promise<void>;
+  onCancel: () => void;
+}) => {
+  const [id, setId] = useState('');
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [systemPrompt, setSystemPrompt] = useState('');
+  const [promptTemplate, setPromptTemplate] = useState('');
+  const [model, setModel] = useState('');
+  const [fallbacks, setFallbacks] = useState<string[]>([]);
+  const [temperature, setTemperature] = useState('0.2');
+  const [maxTokens, setMaxTokens] = useState('1000');
+  const [dailyBudget, setDailyBudget] = useState('');
+  const [cacheEnabled, setCacheEnabled] = useState(true);
+  const [cacheTtlHours, setCacheTtlHours] = useState('24');
+
+  const [inputEnabled, setInputEnabled] = useState(false);
+  const [outputEnabled, setOutputEnabled] = useState(false);
+  const [input, setInput] = useState<SchemaEditorState>({ schema: EMPTY_OBJECT_SCHEMA, valid: true });
+  const [output, setOutput] = useState<SchemaEditorState>({ schema: EMPTY_OBJECT_SCHEMA, valid: true });
+
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const idTaken = existingIds.includes(id);
+  const idValid = ID_SLUG.test(id);
+  const schemaInvalid = (inputEnabled && !input.valid) || (outputEnabled && !output.valid);
+  const tempNum = Number(temperature);
+  const tokNum = Number(maxTokens);
+  const ready =
+    idValid &&
+    !idTaken &&
+    name.trim() !== '' &&
+    promptTemplate.trim() !== '' &&
+    model !== '' &&
+    tempNum >= 0 &&
+    tempNum <= 2 &&
+    Number.isFinite(tokNum) &&
+    tokNum > 0 &&
+    !schemaInvalid;
+
+  // Models still selectable as fallbacks: anything not already the primary or
+  // an existing fallback.
+  const usedModels = [model, ...fallbacks].filter(Boolean);
+
+  const submit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const payload: Partial<TTask> = {
+        id,
+        name,
+        description: description.trim() || undefined,
+        prompt_template: promptTemplate,
+        system_prompt: systemPrompt.trim() || undefined,
+        model,
+        fallback_models: fallbacks.length ? fallbacks : undefined,
+        temperature: tempNum,
+        max_tokens: tokNum,
+        daily_budget_usd: dailyBudget.trim() ? Number(dailyBudget) : undefined,
+        cache_enabled: cacheEnabled,
+        cache_ttl_seconds: cacheEnabled && cacheTtlHours.trim()
+          ? Math.round(Number(cacheTtlHours) * 3600)
+          : undefined,
+        input_schema: inputEnabled ? (input.schema as Record<string, unknown>) : undefined,
+        output_schema: outputEnabled ? (output.schema as Record<string, unknown>) : undefined,
+      };
+      await api.createTask(payload);
+      await onCreated(id);
+    } catch (e) {
+      setErr(errorMessage(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-4xl flex flex-col gap-6">
+      <div className="flex items-center justify-between">
+        <Typography variant="heading" size="6" className="text-primary-text">
+          New task
+        </Typography>
+        <Button variant="ghost" size="s" onClick={onCancel} disabled={busy}>
+          Cancel
+        </Button>
+      </div>
+
+      <Section title="Identity">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <label className="block">
+            <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+              Task id (slug — lowercase, digits, hyphens)
+            </Typography>
+            <input
+              className={INPUT_CLS}
+              value={id}
+              onChange={(e) => setId(e.target.value)}
+              placeholder="e.g. attribute-extraction"
+            />
+            {id !== '' && !idValid && (
+              <Typography variant="body" size="1" className="text-error-text mt-0.5">
+                Must match {`^[a-z0-9][a-z0-9-]{1,63}$`} (no spaces or uppercase).
+              </Typography>
+            )}
+            {id !== '' && idValid && idTaken && (
+              <Typography variant="body" size="1" className="text-error-text mt-0.5">
+                A task with this id already exists.
+              </Typography>
+            )}
+          </label>
+          <label className="block">
+            <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+              Name
+            </Typography>
+            <input
+              className={INPUT_CLS}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Human-readable name"
+            />
+          </label>
+        </div>
+        <label className="block mt-3">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Description (optional)
+          </Typography>
+          <TextArea value={description} onChange={({ value }) => setDescription(value)} rows={2} />
+        </label>
+      </Section>
+
+      <Section title="Model routing">
+        <label className="block max-w-md">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Primary model
+          </Typography>
+          <select
+            className={INPUT_CLS}
+            value={model}
+            onChange={(e) => {
+              const m = e.target.value;
+              setModel(m);
+              // Drop it from fallbacks if it was there.
+              setFallbacks((prev) => prev.filter((f) => f !== m));
+            }}
+          >
+            <option value="">Select a model…</option>
+            {MODEL_GROUPS.map((group) => (
+              <optgroup key={group.provider} label={group.provider}>
+                {group.models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+
+        {fallbacks.length > 0 && (
+          <div className="flex flex-col gap-1 max-w-md mt-3">
+            {fallbacks.map((m, i) => (
+              <div
+                key={m}
+                className="flex items-center gap-3 px-3 py-2 rounded-md border border-solid border-primary-border bg-primary-bg"
+              >
+                <Typography variant="body" size="3" className="text-primary-text font-medium flex-1">
+                  {m}
+                </Typography>
+                <Typography variant="body" size="1" className="text-tertiary-text uppercase tracking-wider">
+                  fallback #{i + 1}
+                </Typography>
+                <Button
+                  variant="ghost"
+                  size="s"
+                  onClick={() => setFallbacks((prev) => prev.filter((f) => f !== m))}
+                >
+                  ✕
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-2 max-w-md">
+          <select
+            value=""
+            disabled={!model}
+            onChange={(e) => {
+              if (e.target.value) setFallbacks((prev) => [...prev, e.target.value]);
+            }}
+            className={INPUT_CLS}
+          >
+            <option value="">+ Add fallback model…</option>
+            {MODEL_GROUPS.map((group) => {
+              const avail = group.models.filter((m) => !usedModels.includes(m));
+              if (avail.length === 0) return null;
+              return (
+                <optgroup key={group.provider} label={group.provider}>
+                  {avail.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            })}
+          </select>
+          <Typography variant="body" size="1" className="text-tertiary-text mt-1">
+            Fallbacks are tried in order when the primary fails or its circuit is open.
+          </Typography>
+        </div>
+      </Section>
+
+      <Section title="Sampling & budget">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+          <label className="block">
+            <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+              Temperature (0–2)
+            </Typography>
+            <input
+              className={INPUT_CLS}
+              type="number"
+              min={0}
+              max={2}
+              step={0.1}
+              value={temperature}
+              onChange={(e) => setTemperature(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+              Max output tokens
+            </Typography>
+            <input
+              className={INPUT_CLS}
+              type="number"
+              min={1}
+              step={1}
+              value={maxTokens}
+              onChange={(e) => setMaxTokens(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+              Daily budget USD (optional, blank = no cap)
+            </Typography>
+            <input
+              className={INPUT_CLS}
+              type="number"
+              min={0}
+              step={1}
+              value={dailyBudget}
+              onChange={(e) => setDailyBudget(e.target.value)}
+              placeholder="no cap"
+            />
+          </label>
+        </div>
+        <div className="flex items-center gap-3 mt-3">
+          <label className="flex items-center gap-2 select-none">
+            <input
+              type="checkbox"
+              checked={cacheEnabled}
+              onChange={(e) => setCacheEnabled(e.target.checked)}
+            />
+            <Typography variant="body" size="2" className="text-primary-text">
+              Cache predictions
+            </Typography>
+          </label>
+          {cacheEnabled && (
+            <label className="flex items-center gap-2">
+              <Typography variant="body" size="1" className="text-tertiary-text">
+                TTL (hours)
+              </Typography>
+              <input
+                className={cn(INPUT_CLS, 'w-24')}
+                type="number"
+                min={1}
+                step={1}
+                value={cacheTtlHours}
+                onChange={(e) => setCacheTtlHours(e.target.value)}
+              />
+            </label>
+          )}
+        </div>
+      </Section>
+
+      <Section title="Prompt">
+        <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+          System prompt (optional)
+        </Typography>
+        <TextArea value={systemPrompt} onChange={({ value }) => setSystemPrompt(value)} rows={2} />
+        <Typography variant="body" size="1" className="text-tertiary-text mb-1 mt-3">
+          Prompt template (Go template: {'{{.field}}'}) — required
+        </Typography>
+        <TextArea value={promptTemplate} onChange={({ value }) => setPromptTemplate(value)} rows={8} />
+      </Section>
+
+      <Section title="Input & output schema (optional)">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <SchemaPane
+            title="Input schema"
+            hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Off = free-form."
+            enabled={inputEnabled}
+            onToggle={setInputEnabled}
+            canWrite={true}
+          >
+            <SchemaEditor initial={input.schema} readOnly={false} onChange={setInput} />
+          </SchemaPane>
+          <SchemaPane
+            title="Output schema"
+            hint="Validates model output. Off = raw text output (no output_valid flag)."
+            enabled={outputEnabled}
+            onToggle={setOutputEnabled}
+            canWrite={true}
+          >
+            <SchemaEditor initial={output.schema} readOnly={false} onChange={setOutput} />
+          </SchemaPane>
+        </div>
+      </Section>
+
+      {err && (
+        <Typography variant="body" size="2" className="text-error-text">
+          {err}
+        </Typography>
+      )}
+
+      <div className="flex items-center gap-3">
+        <Button variant="primary" size="m" disabled={!ready || busy} onClick={submit}>
+          {busy ? 'Creating…' : 'Create task'}
+        </Button>
+        <Button variant="ghost" size="m" onClick={onCancel} disabled={busy}>
+          Cancel
+        </Button>
+        {!ready && (
+          <Typography variant="body" size="1" className="text-tertiary-text">
+            Fill in a valid id, name, model, and prompt template to continue.
+          </Typography>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ── Schema editor ─────────────────────────────────────────────────────────────
 
 // SchemaSection edits a task's input and output JSON Schemas. Each schema can be
 // toggled off entirely (free-form input / raw-text output) or edited via the

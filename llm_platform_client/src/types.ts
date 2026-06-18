@@ -55,7 +55,8 @@ export type TPredictResult = {
   fallback_used: boolean;
   cached: boolean; // served from the prediction cache — zero cost
   usage: TUsage;
-  latency_ms: number;
+  latency_ms: number; // winning model's call time
+  gateway_latency_ms: number; // end-to-end platform wall-clock (fallback walk + validation + overhead)
 };
 
 export type TTaskStats = {

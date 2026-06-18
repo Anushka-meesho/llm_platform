@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Typography, Spinner, Button, cn } from '@meesho/merlin-ui-tailwind';
 import type { TModelHealthStatus, THealthEvent } from '../types';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
+import ErrorState from '../components/ErrorState';
 
 // ModelHealthPage is the admin view of the per-(task, model) circuit breaker:
 // a live table of which models are healthy / unhealthy / probing for each task,
@@ -13,9 +15,12 @@ const ModelHealthPage = () => {
   const [events, setEvents] = useState<THealthEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [forbidden, setForbidden] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   // When set, the events log is filtered to one (task, model).
   const [focus, setFocus] = useState<{ task: string; model: string } | null>(null);
+
+  const toast = useToast();
 
   const refresh = useCallback(() => {
     api
@@ -24,9 +29,11 @@ const ModelHealthPage = () => {
         setEnabled(d.enabled);
         setStatuses(d.statuses);
         setForbidden(false);
+        setError(null);
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 403) setForbidden(true);
+        else setError(errorMessage(e));
       })
       .finally(() => setLoading(false));
   }, []);
@@ -35,7 +42,8 @@ const ModelHealthPage = () => {
     api
       .modelHealthEvents(focus?.task ?? '', focus?.model ?? '', 1, 50)
       .then((d) => setEvents(d.events))
-      .catch(() => {});
+      // 4s poll — don't toast on every failure; just log.
+      .catch((e) => console.error('health events refresh failed:', errorMessage(e)));
   }, [focus]);
 
   // Poll live state every 4s; refetch events alongside.
@@ -55,8 +63,8 @@ const ModelHealthPage = () => {
       await api.resetModelHealth(s.task_id, s.model);
       refresh();
       refreshEvents();
-    } catch {
-      /* surfaced by the row staying unhealthy */
+    } catch (e) {
+      toast.error(errorMessage(e));
     } finally {
       setBusy(null);
     }
@@ -76,6 +84,16 @@ const ModelHealthPage = () => {
     return (
       <div className="flex-1 flex items-center justify-center bg-primary-bg">
         <Spinner />
+      </div>
+    );
+  }
+
+  // Non-403 load failure with nothing to show yet — offer a retry. Transient
+  // poll failures while a table is already rendered are kept quiet (logged).
+  if (error && statuses.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-primary-bg">
+        <ErrorState message={error} onRetry={refresh} />
       </div>
     );
   }
@@ -153,12 +171,13 @@ const ModelHealthPage = () => {
                           {s.last_reason || '—'}
                         </span>
                       </Td>
-                      <Td>
+                      <Td nowrap>
                         {s.state !== 'healthy' ? (
                           <Button
                             variant="outline"
                             size="s"
                             disabled={busy === key}
+                            className="whitespace-nowrap"
                             onClick={(e) => {
                               e.stopPropagation();
                               markHealthy(s);
@@ -300,8 +319,8 @@ const Th = ({ children, right }: { children: ReactNode; right?: boolean }) => (
   </th>
 );
 
-const Td = ({ children, right }: { children: ReactNode; right?: boolean }) => (
-  <td className={`px-4 py-2.5 align-top ${right ? 'text-right tabular-nums whitespace-nowrap' : ''}`}>
+const Td = ({ children, right, nowrap }: { children: ReactNode; right?: boolean; nowrap?: boolean }) => (
+  <td className={cn('px-4 py-2.5 align-top', right && 'text-right tabular-nums whitespace-nowrap', nowrap && 'whitespace-nowrap')}>
     <Typography variant="body" size="2" className="text-primary-text">
       {children}
     </Typography>

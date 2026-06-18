@@ -1,12 +1,11 @@
 package main
 
 import (
-	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"llm_platform_go/internal/api"
 	"llm_platform_go/internal/cache"
@@ -23,6 +22,15 @@ import (
 func main() {
 	// Load .env — ignore error so the binary works with real env vars too.
 	_ = godotenv.Load()
+
+	// Structured logging: every handled error is logged as JSON keyed by the
+	// request id, so a failure surfaced to a client (which carries the same id)
+	// is findable in the logs. LOG_LEVEL=debug widens it.
+	logLevel := slog.LevelInfo
+	if strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug") {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -48,30 +56,12 @@ func main() {
 
 	clients := llm.BuildClients(cfg)
 
-	// Recovery prober: production requests never probe a failing provider —
-	// they fail fast down the task's fallback chain. This background loop
-	// health-checks unhealthy providers (1-token ping every 15s) and closes
-	// their circuit on recovery, returning traffic to the highest-priority
-	// healthy model automatically.
-	proberCtx, stopProber := context.WithCancel(context.Background())
-	defer stopProber()
-	llm.StartRecoveryProber(proberCtx, clients, 15*time.Second)
-	log.Printf("recovery prober: started (15s interval, probe-only breakers)")
-
-	// Task registry — seed the built-in playground task and any tasks.d/*.yaml
-	// configs (the plug-and-play onboarding contract).
+	// Task registry — the DB is the single source of truth for tasks. Only the
+	// built-in playground task is seeded; all product tasks are authored at
+	// runtime through the Studio (POST /v1/tasks) and persist in the DB.
 	taskStore := tasks.NewStore(database)
 	if err := tasks.SeedPlayground(taskStore); err != nil {
 		log.Fatalf("seed playground task: %v", err)
-	}
-	tasksDir := os.Getenv("TASKS_DIR")
-	if tasksDir == "" {
-		tasksDir = "./tasks.d"
-	}
-	if n, err := tasks.LoadYAMLDir(taskStore, tasksDir); err != nil {
-		log.Fatalf("load task configs from %s: %v", tasksDir, err)
-	} else if n > 0 {
-		log.Printf("loaded %d task config(s) from %s", n, tasksDir)
 	}
 
 	// User store — the swap seam. Replace NewDemoStore with a real Store impl

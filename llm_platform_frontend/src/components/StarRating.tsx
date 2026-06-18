@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
+import { useToast } from '../toast/context';
 
 type TStarRatingProps = {
   runId: string;
@@ -9,6 +10,7 @@ type TStarRatingProps = {
 
 // A 1–5 star rating for one model response. Persists to the backend on click.
 const StarRating = ({ runId, model, initial = 0 }: TStarRatingProps) => {
+  const toast = useToast();
   const [rating, setRating] = useState(initial);
   const [hover, setHover] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -21,9 +23,10 @@ const StarRating = ({ runId, model, initial = 0 }: TStarRatingProps) => {
     setError(false);
     try {
       await api.feedback(runId, model, value);
-    } catch {
+    } catch (e) {
       setRating(prev); // revert on failure
-      setError(true);
+      setError(true); // keep the inline indicator
+      toast.error(errorMessage(e)); // ...and show the actual reason
     } finally {
       setSaving(false);
     }

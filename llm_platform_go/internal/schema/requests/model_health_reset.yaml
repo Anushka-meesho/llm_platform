@@ -1,0 +1,13 @@
+# POST /v1/admin/model-health/reset — force one (task, model) back to healthy.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Model health reset request
+type: object
+additionalProperties: false
+required: [task_id, model]
+properties:
+  task_id:
+    type: string
+    minLength: 1
+  model:
+    type: string
+    minLength: 1

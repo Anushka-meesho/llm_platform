@@ -3,8 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
+
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"llm_platform_go/internal/auth"
 	"llm_platform_go/internal/cache"
@@ -52,28 +55,59 @@ type predictOutcome struct {
 	Output        json.RawMessage // parsed JSON when output schema validates
 	OutputValid   *bool           // nil when the task has no output schema
 	CacheHit      bool            // served from the prediction cache, no provider call
+	// GatewayLatencyMs is the end-to-end wall-clock the platform spent on this
+	// prediction: input validation, prompt render, the whole fallback walk
+	// (including any failed/skipped models and retries), output validation, and
+	// cache work. Result.LatencyMs, by contrast, is only the winning model's
+	// call. Gateway ≥ model; the gap is the platform's own overhead + losers.
+	GatewayLatencyMs int
 }
 
-// httpError carries an HTTP status + detail out of executePrediction.
-type httpError struct {
-	status int
-	detail string
+// logUpstreamFailure records a 502 (the model chain produced no usable result)
+// with the request id, task, attributed model, and the provider error, and
+// echoes the request id in the response header — so an upstream failure is as
+// traceable as any other error even though the body is the predict response.
+func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, outcome *predictOutcome) {
+	reqID := chimw.GetReqID(r.Context())
+	if reqID != "" {
+		w.Header().Set("X-Request-ID", reqID)
+	}
+	detail := "unknown upstream error"
+	model := ""
+	if outcome != nil {
+		if outcome.Result.Error != nil {
+			detail = *outcome.Result.Error
+		}
+		model = outcome.Result.Model
+	}
+	slog.Error("upstream prediction failed",
+		"request_id", reqID,
+		"path", r.URL.Path,
+		"task", taskID,
+		"model", model,
+		"code", CodeUpstreamFailed,
+		"status", http.StatusBadGateway,
+		"error", detail,
+	)
 }
 
 // executePrediction is the single prediction pipeline:
 // validate input → render prompt → call model chain → validate output → log run.
-// It never writes to the ResponseWriter — callers shape their own responses.
-func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, inputs json.RawMessage, user *auth.User, opts predictOptions) (*predictOutcome, *httpError) {
+// It never writes to the ResponseWriter — callers shape their own responses. On a
+// client-side problem it returns an *AppError (input/prompt validation); a usable
+// but failed model chain is reported via the returned outcome, not an error.
+func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, inputs json.RawMessage, user *auth.User, opts predictOptions) (*predictOutcome, *AppError) {
+	gatewayStart := time.Now()
 	if len(inputs) == 0 {
-		return nil, &httpError{http.StatusUnprocessableEntity, "inputs is required"}
+		return nil, Unprocessable(CodeInputValidation, "inputs is required")
 	}
 	if err := tasks.ValidateInput(task, inputs); err != nil {
-		return nil, &httpError{http.StatusUnprocessableEntity, "input validation failed: " + err.Error()}
+		return nil, Unprocessable(CodeInputValidation, "input validation failed: %s", err.Error())
 	}
 
 	var inputMap map[string]any
 	if err := json.Unmarshal(inputs, &inputMap); err != nil {
-		return nil, &httpError{http.StatusUnprocessableEntity, "inputs must be a JSON object: " + err.Error()}
+		return nil, Unprocessable(CodeInputValidation, "inputs must be a JSON object: %s", err.Error())
 	}
 
 	// Resolve the prompt: active task config, or an override version under test.
@@ -89,7 +123,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 
 	prompt, err := tasks.RenderPrompt(renderTask, inputMap)
 	if err != nil {
-		return nil, &httpError{http.StatusUnprocessableEntity, err.Error()}
+		return nil, Unprocessable(CodeValidationFailed, "prompt render failed: %s", err.Error())
 	}
 
 	// Multimodal input: image fields (base64 data URLs or https URLs) are not
@@ -191,7 +225,9 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		return h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry), nil
+		cached := h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
+		cached.GatewayLatencyMs = int(time.Since(gatewayStart).Milliseconds())
+		return cached, nil
 	}
 
 	// Output schema validation (flag only; correction retry lands in Phase 2).
@@ -268,11 +304,12 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	h.addSpend(task.ID, result.CostUSD)
 
 	return &predictOutcome{
-		RunID:         runID,
-		PromptVersion: promptVersion,
-		Result:        result,
-		Output:        output,
-		OutputValid:   outputValid,
+		RunID:            runID,
+		PromptVersion:    promptVersion,
+		Result:           result,
+		Output:           output,
+		OutputValid:      outputValid,
+		GatewayLatencyMs: int(time.Since(gatewayStart).Milliseconds()),
 	}, nil
 }
 
@@ -382,6 +419,7 @@ func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
 			TotalTokens:  o.Result.TotalTokens,
 			CostUSD:      o.Result.CostUSD,
 		},
-		LatencyMs: o.Result.LatencyMs,
+		LatencyMs:        o.Result.LatencyMs,
+		GatewayLatencyMs: o.GatewayLatencyMs,
 	}
 }

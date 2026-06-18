@@ -1,0 +1,34 @@
+# POST /run — multi-model Compare playground. Mirrors types.RunRequest.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Run request
+type: object
+additionalProperties: false
+required: [prompt]
+properties:
+  prompt:
+    type: string
+    minLength: 1
+  models:
+    type: array
+    items: { type: string }
+  model_conversations:
+    type: object
+    additionalProperties:
+      type: array
+      items:
+        type: object
+        required: [role]
+        properties:
+          role: { type: string }
+          content: {} # string or multimodal array
+  temperature:
+    type: number
+    minimum: 0
+    maximum: 2
+  max_tokens:
+    type: integer
+    minimum: 1
+  session_id:
+    type: string
+  system_prompt:
+    type: string

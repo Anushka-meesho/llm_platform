@@ -172,7 +172,7 @@ Batch (Airflow + provider Batch APIs), RAG service, priority queuing, Kafka → 
 
 ## 7. Phase 0/1 Success Criteria (from the doc, made checkable)
 
-- [ ] `attribute-extraction` task registered via YAML; endpoint auto-available at `/v1/tasks/attribute-extraction/predict`
+- [ ] `attribute-extraction` task registered via the Studio (`POST /v1/tasks`); endpoint auto-available at `/v1/tasks/attribute-extraction/predict`
 - [ ] Output schema enforced; malformed-output rate <0.5% with structured-output mode + 1 correction retry
 - [ ] Shadow report: accuracy within 2% and latency within 200ms of direct-Gemini on 100% of shadow traffic
 - [ ] Per-task cost dashboard live; every run attributed to a task from day 1

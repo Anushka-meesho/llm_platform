@@ -3,9 +3,6 @@ package tests
 import (
 	"database/sql"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	appdb "llm_platform_go/internal/db"
@@ -171,117 +168,5 @@ func TestRenderPrompt(t *testing.T) {
 	bad := &tasks.Task{PromptTemplate: "{{.missing}}"}
 	if _, err := tasks.RenderPrompt(bad, map[string]any{}); err == nil {
 		t.Error("expected error for undeclared template key")
-	}
-}
-
-func TestLoadYAMLDir(t *testing.T) {
-	store := newTaskStore(t)
-	dir := t.TempDir()
-
-	yaml := `
-id: yaml-task
-name: YAML Task
-model: gpt-4o-mini
-prompt_template: "Extract from {{.text}}"
-input_schema:
-  type: object
-  required: [text]
-  properties:
-    text: {type: string}
-`
-	if err := os.WriteFile(filepath.Join(dir, "task.yaml"), []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	n, err := tasks.LoadYAMLDir(store, dir)
-	if err != nil {
-		t.Fatalf("LoadYAMLDir: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("loaded count: got %d, want 1", n)
-	}
-
-	got, err := store.Get("yaml-task")
-	if err != nil {
-		t.Fatalf("Get yaml-task: %v", err)
-	}
-	if got.PromptVersion != 1 {
-		t.Errorf("version: got %d, want 1", got.PromptVersion)
-	}
-
-	// Re-seed with a changed prompt → upsert bumps version.
-	changed := strings.Replace(yaml, "Extract from {{.text}}", "Pull from {{.text}}", 1)
-	if err := os.WriteFile(filepath.Join(dir, "task.yaml"), []byte(changed), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tasks.LoadYAMLDir(store, dir); err != nil {
-		t.Fatalf("re-seed: %v", err)
-	}
-	got2, _ := store.Get("yaml-task")
-	if got2.PromptVersion != 2 {
-		t.Errorf("version after prompt change: got %d, want 2", got2.PromptVersion)
-	}
-	if !got2.Active {
-		t.Error("re-seeding must not deactivate a task (regression)")
-	}
-
-	// Missing dir is not an error.
-	if n, err := tasks.LoadYAMLDir(store, filepath.Join(dir, "nope")); err != nil || n != 0 {
-		t.Errorf("missing dir: n=%d err=%v", n, err)
-	}
-}
-
-// TestReseedPreservesLiveRouting pins the fix: a YAML re-seed at startup must
-// not clobber a model chain that was changed at runtime. Routing is seeded only
-// at first creation and then persists until changed via the API.
-func TestReseedPreservesLiveRouting(t *testing.T) {
-	store := newTaskStore(t)
-	dir := t.TempDir()
-
-	yaml := `
-id: routed-task
-name: Routed Task
-model: gpt-4o-mini
-fallback_models: [llama-groq]
-prompt_template: "Extract from {{.text}}"
-input_schema:
-  type: object
-  required: [text]
-  properties:
-    text: {type: string}
-`
-	path := filepath.Join(dir, "task.yaml")
-	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tasks.LoadYAMLDir(store, dir); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	// Live routing edit (what the UI's "save routing" does).
-	got, err := store.Get("routed-task")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	edited := *got
-	edited.Model = "gemini-2.5-flash"
-	edited.FallbackModels = []string{"gpt-4o-mini"}
-	if err := store.Update(&edited); err != nil {
-		t.Fatalf("Update routing: %v", err)
-	}
-
-	// Re-seed the unchanged YAML (a server restart). Routing must NOT revert.
-	if _, err := tasks.LoadYAMLDir(store, dir); err != nil {
-		t.Fatalf("re-seed: %v", err)
-	}
-	after, err := store.Get("routed-task")
-	if err != nil {
-		t.Fatalf("Get after re-seed: %v", err)
-	}
-	if after.Model != "gemini-2.5-flash" {
-		t.Errorf("re-seed clobbered the live primary: got %q, want gemini-2.5-flash", after.Model)
-	}
-	if len(after.FallbackModels) != 1 || after.FallbackModels[0] != "gpt-4o-mini" {
-		t.Errorf("re-seed clobbered the live fallback chain: got %v, want [gpt-4o-mini]", after.FallbackModels)
 	}
 }

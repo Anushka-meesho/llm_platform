@@ -1,0 +1,13 @@
+# POST /v1/tasks/{task_id}/versions — save a prompt draft without activating it.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Save draft version request
+type: object
+additionalProperties: false
+required: [prompt_template]
+properties:
+  prompt_template:
+    type: string
+  system_prompt:
+    type: string
+  note:
+    type: string

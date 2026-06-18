@@ -1,7 +1,8 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Typography, Spinner } from '@meesho/merlin-ui-tailwind';
 import type { TDashboard } from '../types';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
+import ErrorState from '../components/ErrorState';
 import { formatCost } from '../utils/tokens';
 
 const DashboardPage = () => {
@@ -9,13 +10,27 @@ const DashboardPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  // State updates live only in the promise callbacks (never synchronously in the
+  // effect body) so the loader can be reused for retry without cascading renders.
+  const load = useCallback(() => {
     api
       .dashboard()
-      .then(setData)
-      .catch(() => setError('Could not load dashboard data.'))
+      .then((d) => {
+        setData(d);
+        setError(null);
+      })
+      .catch((e) => setError(errorMessage(e)))
       .finally(() => setLoading(false));
   }, []);
+
+  const retry = useCallback(() => {
+    setLoading(true);
+    load();
+  }, [load]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   if (loading) {
     return (
@@ -28,9 +43,7 @@ const DashboardPage = () => {
   if (error || !data) {
     return (
       <div className="flex-1 flex items-center justify-center bg-primary-bg">
-        <Typography variant="body" size="3" className="text-error-text">
-          {error ?? 'No data.'}
-        </Typography>
+        <ErrorState message={error ?? 'No data.'} onRetry={retry} />
       </div>
     );
   }

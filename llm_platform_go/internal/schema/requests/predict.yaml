@@ -1,0 +1,10 @@
+# POST /v1/tasks/{task_id}/predict — the envelope only. The inputs object is
+# validated again, more deeply, against the task's own input_schema downstream.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Predict request
+type: object
+additionalProperties: false
+required: [inputs]
+properties:
+  inputs:
+    type: object

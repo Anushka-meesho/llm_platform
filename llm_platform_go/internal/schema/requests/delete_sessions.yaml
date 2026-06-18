@@ -1,0 +1,10 @@
+# DELETE /sessions — bulk delete the caller's own sessions.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Delete sessions request
+type: object
+additionalProperties: false
+required: [session_ids]
+properties:
+  session_ids:
+    type: array
+    items: { type: string }

@@ -17,11 +17,11 @@ import (
 func (h *Handler) resolveTask(w http.ResponseWriter, r *http.Request) (*tasks.Task, bool) {
 	t, err := h.Tasks.Get(chi.URLParam(r, "task_id"))
 	if errors.Is(err, tasks.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErr(w, r, NotFound(CodeTaskNotFound, "task %q not found", chi.URLParam(r, "task_id")))
 		return nil, false
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load task %q", chi.URLParam(r, "task_id")).WithCause(err))
 		return nil, false
 	}
 	return t, true
@@ -39,7 +39,7 @@ func (h *Handler) ListPromptVersions(w http.ResponseWriter, r *http.Request) {
 	}
 	versions, err := h.Tasks.ListVersions(task.ID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "list versions").WithCause(err))
 		return
 	}
 	// Callers (no task:view_prompt) get version metadata but not the prompt
@@ -75,13 +75,13 @@ func (h *Handler) SaveDraftVersion(w http.ResponseWriter, r *http.Request) {
 		Note           string `json:"note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 
 	version, err := h.Tasks.SaveDraft(task.ID, req.PromptTemplate, req.SystemPrompt, req.Note, user.Subject)
 	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "%s", err.Error()))
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -103,7 +103,7 @@ func (h *Handler) DeployVersion(w http.ResponseWriter, r *http.Request) {
 		Version int `json:"version"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Version <= 0 {
-		writeError(w, http.StatusUnprocessableEntity, "version (positive integer) is required")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "version (positive integer) is required"))
 		return
 	}
 
@@ -113,10 +113,10 @@ func (h *Handler) DeployVersion(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.Tasks.Deploy(task.ID, req.Version); err != nil {
 		if errors.Is(err, tasks.ErrVersionNotFound) {
-			writeError(w, http.StatusNotFound, "version not found")
+			writeErr(w, r, NotFound(CodeVersionNotFound, "version not found"))
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "deploy failed: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "deploy version").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -136,7 +136,7 @@ func (h *Handler) DeleteVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	version, err := strconv.Atoi(chi.URLParam(r, "version"))
 	if err != nil || version <= 0 {
-		writeError(w, http.StatusUnprocessableEntity, "version must be a positive integer")
+		writeErr(w, r, Unprocessable(CodeValidationFailed, "version must be a positive integer"))
 		return
 	}
 
@@ -148,11 +148,11 @@ func (h *Handler) DeleteVersion(w http.ResponseWriter, r *http.Request) {
 			"status":  "deleted",
 		})
 	case errors.Is(err, tasks.ErrVersionNotFound):
-		writeError(w, http.StatusNotFound, "version not found")
+		writeErr(w, r, NotFound(CodeVersionNotFound, "version not found"))
 	case errors.Is(err, tasks.ErrVersionActive):
-		writeError(w, http.StatusConflict, "cannot delete the active version — deploy another version first")
+		writeErr(w, r, Conflict(CodeVersionActive, "cannot delete the active version — deploy another version first"))
 	default:
-		writeError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+		writeErr(w, r, Internal(CodeInternal, "delete version").WithCause(err))
 	}
 }
 
@@ -176,7 +176,7 @@ func (h *Handler) TestTask(w http.ResponseWriter, r *http.Request) {
 		Model   string          `json:"model,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid request body: "+err.Error())
+		writeErr(w, r, Unprocessable(CodeInvalidBody, "invalid request body: %s", err.Error()))
 		return
 	}
 
@@ -184,11 +184,11 @@ func (h *Handler) TestTask(w http.ResponseWriter, r *http.Request) {
 	if req.Version > 0 && req.Version != task.PromptVersion {
 		v, err := h.Tasks.GetVersion(task.ID, req.Version)
 		if errors.Is(err, tasks.ErrVersionNotFound) {
-			writeError(w, http.StatusNotFound, "version not found")
+			writeErr(w, r, NotFound(CodeVersionNotFound, "version not found"))
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+			writeErr(w, r, Internal(CodeDBError, "load version").WithCause(err))
 			return
 		}
 		opts.overrideVersion = v
@@ -196,13 +196,14 @@ func (h *Handler) TestTask(w http.ResponseWriter, r *http.Request) {
 
 	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user, opts)
 	if herr != nil {
-		writeError(w, herr.status, herr.detail)
+		writeErr(w, r, herr)
 		return
 	}
 
 	status := http.StatusOK
 	if !outcome.Result.Success {
 		status = http.StatusBadGateway
+		logUpstreamFailure(w, r, task.ID, outcome)
 	}
 	writeJSON(w, status, shapePredictResponse(task, outcome))
 }
@@ -220,7 +221,7 @@ func (h *Handler) TaskStats(w http.ResponseWriter, r *http.Request) {
 
 	daily, totals, err := db.TaskDailyStats(h.DB, task.ID, days)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error: "+err.Error())
+		writeErr(w, r, Internal(CodeDBError, "load task stats").WithCause(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -139,14 +139,6 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		return r
 	}
 
-	// Circuit breaker: fail fast while the provider's circuit is open.
-	if !defaultBreakers.Allow(cfg.provider) {
-		r := errResult(modelName, start, "provider circuit open — recent failures, retry shortly")
-		r.infraFailure = true     // open circuit counts as infra trouble
-		r.fallbackEligible = true // and advances the fallback chain
-		return r
-	}
-
 	apiReq := chatRequest{
 		Model:       cfg.modelID,
 		Messages:    messages,
@@ -179,14 +171,6 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
-
-	// Feed the breaker: infra failures count against the provider; any
-	// completed exchange (success or a 4xx config error) counts as healthy.
-	if isInfraFailure(err) {
-		defaultBreakers.RecordFailure(cfg.provider)
-	} else {
-		defaultBreakers.RecordSuccess(cfg.provider)
-	}
 
 	if err != nil {
 		r := errResult(modelName, start, classifyError(err))

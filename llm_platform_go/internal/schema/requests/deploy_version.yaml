@@ -1,0 +1,10 @@
+# POST /v1/tasks/{task_id}/deploy — activate a previously saved version.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Deploy version request
+type: object
+additionalProperties: false
+required: [version]
+properties:
+  version:
+    type: integer
+    minimum: 1

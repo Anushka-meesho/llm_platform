@@ -220,32 +220,32 @@ func (s *Store) updateLocked(t *Task) error {
 	return nil
 }
 
-// Upsert creates the task if absent, otherwise updates it. Used by YAML seeding.
-//
-// For an existing task the YAML seed must not clobber state that's owned at
-// runtime, so re-seeding preserves:
-//   - the active flag (YAML doesn't model activation; a fresh create is active);
-//   - the model routing — model + fallback chain. Routing is operational config
-//     tuned live via the API, so the YAML value seeds it only at first creation
-//     and never overwrites a saved chain. It then persists across restarts until
-//     someone changes it through the API.
-//
-// Prompt/schema edits in YAML do still re-apply on restart (the onboarding
-// contract: edit the prompt, restart, version bumps).
-func (s *Store) Upsert(t *Task) error {
+// ErrCannotDeletePlayground guards the built-in Compare task: the /run endpoint
+// attributes its usage to it and SeedPlayground recreates it on restart, so
+// deleting it would only break the playground until the next boot.
+var ErrCannotDeletePlayground = errors.New("the built-in playground task cannot be deleted")
+
+// Delete permanently removes a task and its prompt version history. Irreversible
+// and admin-only (gated at the route with task:delete). Run rows are left intact
+// as historical audit — they carry task_id for attribution but no longer resolve
+// to a live task. Returns ErrNotFound if the task doesn't exist.
+func (s *Store) Delete(id string) error {
+	if id == PlaygroundTaskID {
+		return ErrCannotDeletePlayground
+	}
 	s.editMu.Lock()
 	defer s.editMu.Unlock()
-	existing, err := s.getRaw(t.ID)
-	if errors.Is(err, ErrNotFound) {
-		return s.createLocked(t)
+	if _, err := s.getRaw(id); err != nil {
+		return err // ErrNotFound or a real DB error
 	}
-	if err != nil {
+	if _, err := s.db.Exec(`DELETE FROM prompt_versions WHERE task_id = ?`, id); err != nil {
 		return err
 	}
-	t.Active = existing.Active
-	t.Model = existing.Model
-	t.FallbackModels = existing.FallbackModels
-	return s.updateLocked(t)
+	if _, err := s.db.Exec(`DELETE FROM tasks WHERE id = ?`, id); err != nil {
+		return err
+	}
+	s.invalidate(id)
+	return nil
 }
 
 // ── scanning helpers ─────────────────────────────────────────────────────────

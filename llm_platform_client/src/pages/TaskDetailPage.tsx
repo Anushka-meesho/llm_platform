@@ -147,18 +147,12 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
                   <span className="text-neutral-400"> — {f.schema.description}</span>
                 )}
               </div>
-              {imageFieldMode(f) === 'multi' ? (
-                <MultiImageField
+              {imageFieldMode(f) ? (
+                <ImagePicker
                   value={values[f.name] ?? ''}
-                  onChange={(json) =>
-                    setValues((prev) => ({ ...prev, [f.name]: json }))
-                  }
-                />
-              ) : imageFieldMode(f) === 'single' ? (
-                <ImageField
-                  value={values[f.name] ?? ''}
-                  onChange={(dataUrl) =>
-                    setValues((prev) => ({ ...prev, [f.name]: dataUrl }))
+                  multi={imageFieldMode(f) === 'multi'}
+                  onChange={(next) =>
+                    setValues((prev) => ({ ...prev, [f.name]: next }))
                   }
                 />
               ) : (
@@ -249,78 +243,45 @@ function imageFieldMode(f: Field): 'single' | 'multi' | null {
   return 'single';
 }
 
-// ImageField lets a seller pick a photo; it's read into a base64 data URL (the
-// string the predict API expects) and previewed inline.
-const ImageField = ({
+// ImagePicker is the single image-input control for the Try-it panel. It backs
+// both single-image fields (a bare data-URL string, one photo) and multi-image
+// fields (a JSON-array string, many photos) with one grid UI — `multi` toggles
+// the value encoding and whether more than one file can be added. Each thumbnail
+// carries a corner ✕ to remove it, and clicking a thumbnail opens a zoomed
+// lightbox that also offers removal.
+const ImagePicker = ({
   value,
+  multi,
   onChange,
 }: {
   value: string;
-  onChange: (dataUrl: string) => void;
+  multi: boolean;
+  onChange: (next: string) => void;
 }) => {
-  const [name, setName] = useState<string | null>(null);
+  const [zoom, setZoom] = useState<number | null>(null);
 
-  const onPick = (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setName(file.name);
-    const reader = new FileReader();
-    reader.onload = () => onChange(typeof reader.result === 'string' ? reader.result : '');
-    reader.readAsDataURL(file);
-  };
-
-  return (
-    <div className="flex flex-col gap-2">
-      <input
-        type="file"
-        accept="image/*"
-        onChange={onPick}
-        className="text-sm text-neutral-700 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
-      />
-      {value && (
-        <div className="flex items-center gap-3">
-          <img src={value} alt="preview" className="h-20 w-20 object-cover rounded-md border border-neutral-200" />
-          <button
-            type="button"
-            onClick={() => {
-              setName(null);
-              onChange('');
-            }}
-            className="text-xs text-neutral-500 underline bg-transparent border-none cursor-pointer p-0"
-          >
-            Remove {name ? `(${name})` : ''}
-          </button>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// MultiImageField lets a seller pick one OR many photos; each is read into a
-// base64 data URL and the set is stored as a JSON array string (coerce() parses
-// it back to a real array for the array-typed input field). Previews show as a
-// grid with per-image removal, so large selections stay manageable.
-const MultiImageField = ({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (json: string) => void;
-}) => {
-  // value is a JSON-encoded string[]; tolerate empty / malformed as [].
+  // Decode the current value into a url list, tolerating empty / malformed
+  // input. Single: the raw string is the only url. Multi: a JSON-encoded
+  // string[].
   let urls: string[] = [];
   if (value) {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) urls = parsed.filter((x): x is string => typeof x === 'string');
-    } catch {
-      urls = [];
+    if (multi) {
+      try {
+        const parsed = JSON.parse(value);
+        if (Array.isArray(parsed)) urls = parsed.filter((x): x is string => typeof x === 'string');
+      } catch {
+        urls = [];
+      }
+    } else {
+      urls = [value];
     }
   }
 
-  // Serialize back: an empty set becomes '' so the field is omitted from the
-  // request rather than sent as an empty array.
-  const commit = (next: string[]) => onChange(next.length ? JSON.stringify(next) : '');
+  // Serialize back to the field's expected shape. Both encodings collapse an
+  // empty set to '' so the field is omitted from the request rather than sent
+  // as an empty value.
+  const commit = (next: string[]) =>
+    onChange(multi ? (next.length ? JSON.stringify(next) : '') : (next[0] ?? ''));
 
   const onPick = (e: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
@@ -334,9 +295,18 @@ const MultiImageField = ({
             reader.readAsDataURL(file);
           }),
       ),
-    ).then((dataUrls) => commit([...urls, ...dataUrls.filter(Boolean)]));
+    ).then((dataUrls) => {
+      const picked = dataUrls.filter(Boolean);
+      // Multi appends to the existing set; single replaces with the first pick.
+      commit(multi ? [...urls, ...picked] : picked.slice(0, 1));
+    });
     // Allow re-picking the same file(s) after a removal.
     e.target.value = '';
+  };
+
+  const removeAt = (i: number) => {
+    commit(urls.filter((_, j) => j !== i));
+    setZoom(null);
   };
 
   return (
@@ -344,7 +314,7 @@ const MultiImageField = ({
       <input
         type="file"
         accept="image/*"
-        multiple
+        multiple={multi}
         onChange={onPick}
         className="text-sm text-neutral-700 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
       />
@@ -355,11 +325,13 @@ const MultiImageField = ({
               <img
                 src={src}
                 alt={`image ${i + 1}`}
-                className="h-20 w-20 object-cover rounded-md border border-neutral-200"
+                onClick={() => setZoom(i)}
+                title="Click to zoom"
+                className="h-20 w-20 object-cover rounded-md border border-neutral-200 cursor-zoom-in"
               />
               <button
                 type="button"
-                onClick={() => commit(urls.filter((_, j) => j !== i))}
+                onClick={() => removeAt(i)}
                 title="Remove"
                 className="absolute -top-1.5 -right-1.5 h-5 w-5 rounded-full bg-neutral-900 text-white text-xs leading-none border-none cursor-pointer flex items-center justify-center"
               >
@@ -367,6 +339,40 @@ const MultiImageField = ({
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {zoom !== null && urls[zoom] && (
+        <div
+          onClick={() => setZoom(null)}
+          className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-6"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="flex flex-col items-center gap-3 max-w-[90vw] max-h-[90vh]"
+          >
+            <img
+              src={urls[zoom]}
+              alt={`image ${zoom + 1}`}
+              className="max-w-[90vw] max-h-[80vh] object-contain rounded-md"
+            />
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => removeAt(zoom)}
+                className="bg-red-600 text-white text-sm font-medium px-4 py-1.5 rounded-md border-none cursor-pointer"
+              >
+                Remove picture
+              </button>
+              <button
+                type="button"
+                onClick={() => setZoom(null)}
+                className="bg-white text-neutral-800 text-sm font-medium px-4 py-1.5 rounded-md border border-neutral-300 cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -389,8 +395,19 @@ const ResultCard = ({ outcome }: { outcome: PredictOutcome }) => {
         {outcome.degraded && <Badge tone="warn">degraded</Badge>}
         {r.cached && <Badge tone="neutral">cached — zero cost</Badge>}
         <span className="text-xs text-neutral-500">
-          v{r.prompt_version} · {r.model} ({r.provider}) · {r.latency_ms}ms ·{' '}
-          {r.usage.total_tokens} tok · {formatCost(r.usage.cost_usd)}
+          v{r.prompt_version} · {r.model} ({r.provider}) ·{' '}
+          <span title="End-to-end platform wall-clock (incl. fallback attempts + validation)">
+            {r.gateway_latency_ms}ms gateway
+          </span>{' '}
+          /{' '}
+          <span title="Winning model's call time">{r.latency_ms}ms model</span>{' '}
+          <span
+            className="text-neutral-400"
+            title="Platform overhead: gateway − model (fallback attempts, validation, queueing)"
+          >
+            (+{Math.max(0, r.gateway_latency_ms - r.latency_ms)}ms overhead)
+          </span>{' '}
+          · {r.usage.total_tokens} tok · {formatCost(r.usage.cost_usd)}
         </span>
         <span className="text-xs text-neutral-400 ml-auto font-mono">{r.task_run_id}</span>
       </div>
