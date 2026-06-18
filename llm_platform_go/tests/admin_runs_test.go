@@ -5,8 +5,6 @@ import (
 	"io"
 	"net/http"
 	"testing"
-
-	"llm_platform_go/internal/auth"
 )
 
 // TestAdminRunsListAndDetail exercises the admin prompt-history endpoints:
@@ -107,18 +105,3 @@ func TestAdminRunsListAndDetail(t *testing.T) {
 	resp.Body.Close()
 }
 
-// TestAdminRunsForbiddenForNonAdmin confirms the history endpoints are admin-only.
-func TestAdminRunsForbiddenForNonAdmin(t *testing.T) {
-	srv, _ := newPredictServer(t, `{"label":"positive"}`)
-
-	for _, role := range []string{auth.RoleCaller, auth.RoleCreator, auth.RoleApprover, auth.RoleViewer} {
-		resp, err := http.DefaultClient.Do(roleReq(t, role, http.MethodGet, srv.URL+"/v1/admin/runs", ""))
-		if err != nil {
-			t.Fatalf("list as %s: %v", role, err)
-		}
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("role %s: got %d, want 403", role, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-}

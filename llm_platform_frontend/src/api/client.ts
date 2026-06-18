@@ -96,6 +96,10 @@ const jsonPost = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
+// Bundles the predict response body with the degraded-mode signal, which the
+// platform delivers as an X-Platform-Degraded response header.
+export type PredictOutcome = { result: TPredictResult; degraded: boolean };
+
 export const api = {
   // ── Auth ──────────────────────────────────────────────────────────────
   me: () => fetchJSON<{ user: TUser }>(`${BASE}/auth/me`),
@@ -196,6 +200,40 @@ export const api = {
       jsonPost({ inputs, version: opts?.version, model: opts?.model }),
       60_000,
     ),
+
+  // Call the real production predict endpoint and return the result together
+  // with the degraded-mode flag from the X-Platform-Degraded response header.
+  // Uses cookie auth like all other calls in this client.
+  predict: async (id: string, inputs: Record<string, unknown>): Promise<PredictOutcome> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/v1/tasks/${id}/predict`, {
+        ...jsonPost({ inputs }),
+        credentials: 'include',
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        throw new ApiError(0, 'Request timed out after 60s', 'timeout');
+      }
+      throw new ApiError(0, "Can't reach the server — is it running?", 'network');
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+      const data = (await res.json().catch(() => ({}))) as { detail?: string };
+      const retryAfter = res.status === 429 ? res.headers.get('Retry-After') : null;
+      throw new ApiError(
+        res.status,
+        data.detail ?? `HTTP ${res.status}`,
+        res.status === 429 && retryAfter ? `retry_after:${retryAfter}` : undefined,
+      );
+    }
+    const result = (await res.json()) as TPredictResult;
+    return { result, degraded: res.headers.get('X-Platform-Degraded') === 'true' };
+  },
 
   taskStats: (id: string, days = 30) =>
     fetchJSON<TTaskStatsDetail>(`${BASE}/v1/tasks/${id}/stats?days=${days}`),

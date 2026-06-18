@@ -1,0 +1,6 @@
+#!/Users/anushka.gupta/Desktop/INTERN/llm_platform_v0/venv/bin/python
+import sys
+from huggingface_hub.inference._mcp.cli import app
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(app())

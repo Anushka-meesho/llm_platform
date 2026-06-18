@@ -63,6 +63,9 @@ func main() {
 	if err := tasks.SeedPlayground(taskStore); err != nil {
 		log.Fatalf("seed playground task: %v", err)
 	}
+	if err := tasks.SeedAttributeExtraction(taskStore); err != nil {
+		log.Fatalf("seed attribute-extraction task: %v", err)
+	}
 
 	// User store — the swap seam. Replace NewDemoStore with a real Store impl
 	// (Postgres, internal SSO/IdP, …) to point the platform at production

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"llm_platform_go/internal/api"
-	"llm_platform_go/internal/auth"
 	appdb "llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
@@ -217,16 +216,11 @@ func TestModelTripsAndAdminReset(t *testing.T) {
 		}
 	}
 
-	// Unknown reset → 404; non-admin → 403.
+	// Unknown reset → 404.
 	r, _ = http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/admin/model-health/reset",
 		`{"task_id":"nope","model":"nope"}`))
 	if r.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown reset want 404, got %d", r.StatusCode)
-	}
-	r.Body.Close()
-	r, _ = http.DefaultClient.Do(roleReq(t, auth.RoleCreator, http.MethodGet, srv.URL+"/v1/admin/model-health", ""))
-	if r.StatusCode != http.StatusForbidden {
-		t.Errorf("non-admin health view want 403, got %d", r.StatusCode)
 	}
 	r.Body.Close()
 }

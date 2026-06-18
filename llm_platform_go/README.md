@@ -1,103 +1,105 @@
-# LLM Platform — Go Backend
+# LLM Platform — Backend
 
-A production-ready backend that lets you call multiple LLM providers (OpenAI, Gemini, Groq, Anthropic via Meesho's gateway), compare their outputs, track costs down to the cent, and build reliable product features on top of them — with automatic failover, circuit breakers, prompt versioning, and caching.
+Go-based backend service for routing, running, and managing LLM predictions at scale. Built for the Meesho cataloging team.
 
----
+## Tech Stack
 
-## How it fits together
+| | |
+|---|---|
+| Language | Go 1.24 |
+| Router | [Chi v5](https://github.com/go-chi/chi) |
+| Database | SQLite 3 (WAL mode via `modernc.org/sqlite`) |
+| Auth | JWT (`golang-jwt/jwt v5`) + RBAC |
+| Cache | In-memory or Redis (`go-redis v9`) |
+| LLM Provider | Anthropic SDK (`anthropics/anthropic-sdk-go v1.50.1`) |
+| Schema Validation | JSON Schema (`santhosh-tekuri/jsonschema v6`) |
 
-```mermaid
-graph LR
-    U([User / Browser]) -->|HTTP| F[React Frontend]
-    F -->|REST API| G[Go Backend<br/>:8000]
-    G -->|task predict| PC{Prediction<br/>Cache}
-    PC -->|miss| FB[Fallback Chain]
-    FB -->|primary| ME[Meesho Gateway<br/>GPT-4o · Gemini · Claude]
-    FB -->|groq route| GR[Groq API<br/>Llama-3.3-70B]
-    G -->|async| DB[(SQLite DB)]
-    G -->|health probe| ME
-    G -->|health probe| GR
+## Project Layout
+
+```
+cmd/
+  server/main.go          — HTTP server entry point (:8000)
+  issue-token/main.go     — CLI: generate JWT tokens for users
+
+internal/
+  api/                    — HTTP handlers, router, middleware
+  llm/                    — Provider interface, fallback chain, circuit breaker
+  tasks/                  — Task config, prompt versioning, template rendering
+  health/                 — Per-task circuit breaker tracker
+  cache/                  — In-memory and Redis prediction cache
+  db/                     — SQLite schema, queries, async writers
+  auth/                   — JWT parsing + RBAC middleware
+  config/                 — .env loader
+  users/                  — User store + demo data
+  schema/                 — JSON Schema registry + request schemas (YAML)
+  types/                  — Shared request/response DTOs
+
+tests/                    — Integration tests
+pricing.json              — Per-model token costs (USD per 1M tokens)
 ```
 
-The Go backend sits between the frontend and every LLM provider. It validates inputs, renders prompts, walks the fallback chain, caches results, logs every call, and enforces budgets — all so product features are reliable even when individual providers have outages.
+## Setup
 
----
+### 1. Create environment file
 
-## Quick start
+Create a `.env` file in the project root:
+
+```env
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
+DB_PATH=./llm_platform.db
+JWT_SECRET=your_jwt_secret_here
+PORT=8000
+REDIS_URL=                  # optional — omit for in-memory cache
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `DB_PATH` | Yes | SQLite file path |
+| `JWT_SECRET` | Yes | Secret for signing JWT tokens |
+| `PORT` | No | HTTP port (default: `8000`) |
+| `REDIS_URL` | No | Redis URL; omit to use in-memory cache |
+
+### 2. Run the server
 
 ```bash
-# 1. Copy the sample env file
-cp .env.example .env   # or edit .env directly — fill in your provider keys
-
-# 2. Run the server (Go 1.22+ required)
 go run ./cmd/server
-
-# 3. Check it's alive
-curl http://localhost:8000/health
-# → {"status":"ok"}
 ```
 
-The database (`llm_platform.db`) and task configs (`tasks.d/`) are created automatically on first run.
+Server starts on `http://localhost:8000`.
 
----
+### 3. Issue a JWT token (for testing)
 
-## Key vocabulary
-
-| Term | Plain-English meaning |
-|------|----------------------|
-| **Task** | A named, versioned prediction configuration — input/output schema + prompt template + model routing. Like a named function that calls an LLM. |
-| **Run** | One execution of one model call. If a task calls 3 models, that's 3 runs. |
-| **Session** | A group of runs from the same user in the same conversation thread. |
-| **Provider** | A company or gateway that serves LLM APIs (OpenAI, Google Gemini, Groq, Meesho bifrost). |
-| **Fallback chain** | An ordered list of models to try. If the first fails, try the second, and so on. |
-| **Circuit breaker** | An automatic switch that stops sending requests to a broken provider — like a fuse that blows before the wiring catches fire. |
-| **Prompt version** | A numbered snapshot of a task's prompt template. You can draft new versions and deploy them like a software release. |
-| **Cache hit** | When an identical request was already answered before, so the stored answer is returned — free of charge, instantly. |
-
----
-
-## Learning guide
-
-These docs explain every part of the codebase from scratch — no Go experience needed:
-
-| File | What you'll learn |
-|------|-------------------|
-| [docs/00-big-picture.md](docs/00-big-picture.md) | Why this system exists, what problems it solves, and why Go/SQLite were chosen over the alternatives |
-| [docs/01-server-startup.md](docs/01-server-startup.md) | How the server boots step-by-step, why order matters, and what happens if something fails |
-| [docs/02-config.md](docs/02-config.md) | Every config field, every environment variable, and the 12-factor philosophy behind it |
-| [docs/03-models-and-routing.md](docs/03-models-and-routing.md) | How model routing works, the Provider interface, why the registry map is a single source of truth |
-| [docs/04-prediction-flow.md](docs/04-prediction-flow.md) | **The full lifecycle** of one prediction — from HTTP request to DB row |
-| [docs/05-fallback-chain.md](docs/05-fallback-chain.md) | How the fallback walk decides which model to try next and when to give up |
-| [docs/06-circuit-breaker.md](docs/06-circuit-breaker.md) | The two-layer circuit breaker system and the background recovery prober |
-| [docs/07-tasks.md](docs/07-tasks.md) | Task anatomy, JSON Schema validation, Go prompt templates, and versioning |
-| [docs/08-database.md](docs/08-database.md) | SQLite, WAL mode, every table, and why DB writes are done asynchronously |
-| [docs/09-auth-and-rbac.md](docs/09-auth-and-rbac.md) | JWT authentication, HttpOnly cookies, and the five-role permission model |
-| [docs/10-caching-and-cost.md](docs/10-caching-and-cost.md) | The prediction cache, what makes a cache key unique, and how token costs are calculated |
-
-**Suggested reading order:** 00 → 01 → 03 → 04 → 05 → 06 → rest in any order.
-
----
-
-## Directory map
-
+```bash
+go run ./cmd/issue-token
 ```
-llm_platform_go/
-├── cmd/
-│   ├── server/main.go         ← entry point — wires everything together
-│   └── issue-token/main.go    ← CLI tool for minting auth tokens
-├── internal/
-│   ├── api/                   ← HTTP handlers, router, middleware
-│   ├── llm/                   ← provider clients, registry, fallback, circuit breaker
-│   ├── tasks/                 ← task config, validation, versioning, store
-│   ├── health/                ← per-(task, model) circuit breaker tracker
-│   ├── cache/                 ← prediction cache (Redis or memory)
-│   ├── db/                    ← SQLite setup, migrations, queries, async writers
-│   ├── auth/                  ← JWT, cookies, RBAC
-│   ├── users/                 ← user store (demo swap seam)
-│   ├── config/                ← environment variable loading
-│   └── types/                 ← shared request/response types
-├── tasks.d/                   ← YAML task definitions (loaded at startup)
-├── pricing.json               ← per-model token pricing (USD per 1M tokens)
-├── .env                       ← local secrets (gitignored — never commit this)
-└── docs/                      ← this learning guide
+
+### 4. Run tests
+
+```bash
+go test ./...
 ```
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/auth/login` | — | Exchange credentials for JWT |
+| `POST` | `/run` | JWT | Run an LLM prediction |
+| `GET` | `/v1/tasks` | JWT | List tasks |
+| `POST` | `/v1/tasks` | JWT | Create a task |
+| `GET/PUT/DELETE` | `/v1/tasks/:id` | JWT | Read / update / delete a task |
+| `POST` | `/v1/tasks/:id/test` | JWT | Test a task prompt |
+| `GET/POST` | `/v1/tasks/:id/versions` | JWT | List / save draft versions |
+| `POST` | `/v1/tasks/:id/versions/:v/deploy` | JWT | Deploy a prompt version |
+| `POST` | `/v1/shadow/compare` | JWT | A/B shadow comparison |
+| `GET` | `/v1/admin/runs` | JWT (admin) | View run history |
+| `GET` | `/health/models` | JWT | Circuit breaker status per task+model |
+| `POST` | `/health/reset` | JWT (admin) | Reset circuit breaker |
+| `POST` | `/feedback` | JWT | Submit run feedback / star rating |
+| `GET` | `/pricing` | JWT | Per-model token pricing |
+| `GET` | `/dashboard` | JWT | Usage dashboard stats |
+
+## Related
+
+- [Frontend repo](https://github.com/Meesho/cataloging_llm_platform-frontend)

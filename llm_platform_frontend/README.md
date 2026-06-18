@@ -1,73 +1,79 @@
-# React + TypeScript + Vite
+# LLM Platform — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript frontend for the Meesho cataloging LLM platform. Provides a chat interface, side-by-side model comparison, task management, prompt versioning, circuit breaker status, and admin views.
 
-Currently, two official plugins are available:
+## Tech Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| | |
+|---|---|
+| Framework | React 19 + TypeScript |
+| Build tool | Vite 8 |
+| Styling | Tailwind CSS 4 + `@meesho/merlin-ui-tailwind` |
+| Token counting | `js-tiktoken` |
 
-## React Compiler
+## Setup
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### 1. Install dependencies
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### 2. Start the backend
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+The frontend proxies all API calls to `http://localhost:8000` via Vite's dev server proxy. Make sure the [backend](https://github.com/Meesho/cataloging_llm_platform-backend) is running on that port before starting the frontend.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+### 3. Start the dev server
+
+```bash
+npm run dev
 ```
+
+App runs at `http://localhost:5173`.
+
+### 4. Build for production
+
+```bash
+npm run build
+```
+
+Output goes to `dist/`. For production deployments, configure your reverse proxy or CDN to forward API paths (`/run`, `/sessions`, `/auth`, `/v1`, `/health`, `/pricing`, `/feedback`, `/dashboard`) to the backend service.
+
+### 5. Lint
+
+```bash
+npm run lint
+```
+
+## Project Structure
+
+```
+src/
+  api/client.ts           — HTTP client (uses Vite proxy → backend :8000)
+  auth/                   — Auth context, RBAC permissions, useAuth hook
+  components/             — Reusable UI (ChatArea, ModelColumn, Sidebar, MessageBubble…)
+  pages/                  — Route-level pages:
+                              DashboardPage, ComparePage, TasksPage,
+                              VersionsPage, ModelHealthPage, AdminRunsPage,
+                              ClientPortalPage
+  hooks/                  — useChat, useSessions
+  toast/                  — Toast notification provider
+  types/index.ts          — Shared TypeScript types
+  utils/                  — Schema + token utilities
+```
+
+## Pages
+
+| Page | Route | Description |
+|---|---|---|
+| Dashboard | `/` | Usage stats and recent runs |
+| Compare | `/compare` | Side-by-side multi-model comparison |
+| Tasks | `/tasks` | Task list and management |
+| Versions | `/tasks/:id/versions` | Prompt versioning and deployment |
+| Model Health | `/health` | Circuit breaker status per task+model |
+| Admin Runs | `/admin/runs` | Full run history (admin only) |
+| Client Portal | `/client` | Simplified client-facing interface |
+
+## Related
+
+- [Backend repo](https://github.com/Meesho/cataloging_llm_platform-backend)

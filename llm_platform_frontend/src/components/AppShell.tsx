@@ -8,13 +8,15 @@ import TasksPage from '../pages/TasksPage';
 import DashboardPage from '../pages/DashboardPage';
 import AdminRunsPage from '../pages/AdminRunsPage';
 import ModelHealthPage from '../pages/ModelHealthPage';
+import ClientPortalPage from '../pages/ClientPortalPage';
 
 type TView =
   | 'compare'
   | 'tasks'
   | 'dashboard'
   | 'history'
-  | 'health';
+  | 'health'
+  | 'test';
 
 const NAV: { key: TView; label: string; icon: string; adminOnly?: boolean }[] = [
   { key: 'compare', label: 'Compare', icon: '💬' },
@@ -22,6 +24,7 @@ const NAV: { key: TView; label: string; icon: string; adminOnly?: boolean }[] = 
   { key: 'dashboard', label: 'Dashboard', icon: '📊' },
   { key: 'history', label: 'History', icon: '🗂', adminOnly: true },
   { key: 'health', label: 'Health', icon: '🫀', adminOnly: true },
+  { key: 'test', label: 'Test', icon: '🧪', adminOnly: true },
 ];
 
 const AppShell = () => {
@@ -101,6 +104,7 @@ const AppShell = () => {
       {view === 'dashboard' && <DashboardPage />}
       {view === 'history' && isAdmin && <AdminRunsPage />}
       {view === 'health' && isAdmin && <ModelHealthPage />}
+      {view === 'test' && isAdmin && <ClientPortalPage />}
     </div>
   );
 };

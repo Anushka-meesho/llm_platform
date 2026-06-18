@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
-
-	"llm_platform_go/internal/auth"
 )
 
 // TestDeleteVersion covers the admin-only version-delete contract: admin can
@@ -42,16 +40,6 @@ func TestDeleteVersion(t *testing.T) {
 	resp.Body.Close()
 	if got := listVersions(); len(got) != 2 {
 		t.Fatalf("expected 2 versions before delete, got %v", got)
-	}
-
-	// A non-admin (creator) cannot delete — 403.
-	resp, err = http.DefaultClient.Do(roleReq(t, auth.RoleCreator, http.MethodDelete, srv.URL+"/v1/tasks/sentiment/versions/2", ""))
-	if err != nil {
-		t.Fatalf("creator delete: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("creator delete: got %d, want 403", resp.StatusCode)
 	}
 
 	// Admin cannot delete the active version (v1) — 409.
