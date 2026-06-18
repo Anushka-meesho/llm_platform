@@ -353,7 +353,7 @@ func TestPredictCachesFallbackAnswer(t *testing.T) {
 	primaryFail, primaryCalls := countingModelServer(t, "", http.StatusUnauthorized)
 	fallbackOK, fallbackCalls := countingModelServer(t, `{"label":"positive"}`, http.StatusOK)
 	clients := &llm.Clients{
-		OpenAI: llm.NewOpenAICompatProvider(primaryFail.URL, ""),   // primary gpt-4o-mini → 401
+		Meesho: llm.NewOpenAICompatProvider(primaryFail.URL, ""),   // primary gpt-4o-mini → 401 (gateway-routed)
 		Groq:   llm.NewOpenAICompatProvider(fallbackOK.URL, "k"),   // fallback llama-groq → ok
 	}
 	srv, _ := newTestServerWithCache(t, clients, cache.NewMemory())
