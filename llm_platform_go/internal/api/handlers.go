@@ -70,6 +70,39 @@ func redactedTask(user *auth.User, t *tasks.Task) *tasks.Task {
 	return &cp
 }
 
+// imagesFromConversations extracts image URLs from the last user message in any
+// model_conversations entry. All models receive the same user message, so the
+// first match is sufficient.
+func imagesFromConversations(convs map[string][]types.Message) []string {
+	for _, msgs := range convs {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role != "user" {
+				continue
+			}
+			parts, ok := msgs[i].Content.([]interface{})
+			if !ok {
+				return nil
+			}
+			var out []string
+			for _, part := range parts {
+				pm, ok := part.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if pm["type"] == "image_url" {
+					if iu, ok := pm["image_url"].(map[string]interface{}); ok {
+						if url, ok := iu["url"].(string); ok && url != "" {
+							out = append(out, url)
+						}
+					}
+				}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
 // POST /run
 func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
@@ -101,6 +134,7 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	playgroundID := tasks.PlaygroundTaskID
+	images := imagesFromConversations(req.ModelConversations)
 
 	for _, mr := range runResult.Results {
 		var sessionID *string
@@ -118,6 +152,7 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 			SessionID:    sessionID,
 			Prompt:       req.Prompt,
 			SystemPrompt: sysPrompt,
+			Images:       images,
 			Model:        mr.Model,
 			Response:     mr.Response,
 			LatencyMs:    mr.LatencyMs,
@@ -235,6 +270,7 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 				RunID:        row.RunID,
 				Prompt:       row.Prompt,
 				SystemPrompt: row.SystemPrompt,
+				Images:       row.Images,
 				CreatedAt:    row.CreatedAt,
 				Results:      []types.TurnResult{},
 			})

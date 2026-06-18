@@ -55,6 +55,7 @@ type SessionTurn struct {
 	RunID        string       `json:"run_id"`
 	Prompt       string       `json:"prompt"`
 	SystemPrompt *string      `json:"system_prompt"`
+	Images       []string     `json:"images"`
 	CreatedAt    time.Time    `json:"created_at"`
 	Results      []TurnResult `json:"results"`
 }
@@ -83,7 +84,6 @@ type LeaderboardResponse struct {
 
 // RunRow is the internal DB representation — one row in the runs table.
 type RunRow struct {
-	ID           int
 	RunID        string
 	SessionID    *string
 	Prompt       string

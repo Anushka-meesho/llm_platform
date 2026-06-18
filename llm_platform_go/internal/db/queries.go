@@ -134,10 +134,11 @@ func GetRunByID(db *sql.DB, userID, runID string) ([]types.RunRow, error) {
 	var result []types.RunRow
 	for rows.Next() {
 		var r types.RunRow
+		var dbID int
 		var successInt, fallbackInt, cacheInt int
 		var createdAtStr string
 		err := rows.Scan(
-			&r.ID, &r.RunID, &r.SessionID, &r.Prompt, &r.SystemPrompt,
+			&dbID, &r.RunID, &r.SessionID, &r.Prompt, &r.SystemPrompt,
 			&r.Model, &r.Response,
 			&r.LatencyMs, &r.InputTokens, &r.OutputTokens, &r.TotalTokens,
 			&r.CostUSD, &successInt, &r.Error, &r.UserID, &r.UserEmail,
@@ -588,7 +589,7 @@ func ListSessions(db *sql.DB, userID string, page, pageSize int) ([]types.Sessio
 // GetSession returns all runs for one user's session in chronological order.
 func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 	rows, err := db.Query(`
-		SELECT id, run_id, session_id, prompt, system_prompt, model, response,
+		SELECT id, run_id, session_id, prompt, system_prompt, image, model, response,
 		       latency_ms, input_tokens, output_tokens, total_tokens,
 		       cost_usd, success, error, user_id, user_email, created_at
 		FROM runs
@@ -602,11 +603,13 @@ func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 	var result []types.RunRow
 	for rows.Next() {
 		var r types.RunRow
+		var dbID int
 		var successInt int
 		var createdAtStr string
+		var image sql.NullString
 		err := rows.Scan(
-			&r.ID, &r.RunID, &r.SessionID, &r.Prompt, &r.SystemPrompt,
-			&r.Model, &r.Response,
+			&dbID, &r.RunID, &r.SessionID, &r.Prompt, &r.SystemPrompt,
+			&image, &r.Model, &r.Response,
 			&r.LatencyMs, &r.InputTokens, &r.OutputTokens, &r.TotalTokens,
 			&r.CostUSD, &successInt, &r.Error, &r.UserID, &r.UserEmail, &createdAtStr,
 		)
@@ -615,6 +618,9 @@ func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 		}
 		r.Success = successInt == 1
 		r.CreatedAt = parseTime(createdAtStr)
+		if image.Valid {
+			r.Images = ParseImagesColumn(image.String)
+		}
 		result = append(result, r)
 	}
 	return result, rows.Err()
