@@ -310,8 +310,10 @@ prediction demonstrably uses taxonomy context; CIS removes Gemini code (their si
   instead of code.
 - **New teams:** onboarding = create a task in the Studio (`POST /v1/tasks`, creator/admin)
   + roles + dataset. Document the task contract (repo-guide §3.5) as the onboarding doc.
-- **Native Anthropic provider** when Claude models are added (non-OpenAI wire format —
-  implement `Provider` directly).
+- **Native Anthropic provider** — *no longer planned.* Claude models were added through
+  the Meesho gateway over its OpenAI-compatible wire (`claude-sonnet-4-6`), so the
+  existing `openAICompatProvider` covers them and no native Messages-API provider was
+  needed. Revisit only if we ever call Anthropic's API directly, bypassing the gateway.
 - **Postgres migration** when QPS demands it: `internal/db` + `tasks.Store` are the
   contained surfaces; SQLite remains the dev default.
 - **Orchestration:** only revisit if 3+ callers duplicate the same call sequence

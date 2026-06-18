@@ -4,7 +4,6 @@ go 1.24
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
-	github.com/anthropics/anthropic-sdk-go v1.50.1
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/go-chi/cors v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.0.0
@@ -17,8 +16,6 @@ require (
 )
 
 require (
-	github.com/bahlo/generic-list-go v0.2.0 // indirect
-	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect

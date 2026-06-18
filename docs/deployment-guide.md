@@ -97,7 +97,7 @@ COOKIE_SECURE=true
 COOKIE_DOMAIN=llm-platform.meesho.internal     # or leave empty for host-only
 TOKEN_EXPIRY=8h                                # shorter than the 12h dev default
 ALLOWED_ORIGINS=https://llm-platform.meesho.internal
-OPENAI_API_KEY / GROQ_API_KEY / GEMINI_API_KEY # from secret manager
+MEESHO_GATEWAY_VK / GROQ_API_KEY               # from secret manager (gateway VK serves all non-Groq models)
 DB_*            # see §3
 PRICING_PATH=/etc/llm-platform/pricing.json
 ```

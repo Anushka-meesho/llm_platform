@@ -1,6 +1,8 @@
 # LLM Platform — Go Backend
 
-A production-ready backend that lets you call multiple LLM providers (OpenAI, Gemini, Groq, Anthropic via Meesho's gateway), compare their outputs, track costs down to the cent, and build reliable product features on top of them — with automatic failover, circuit breakers, prompt versioning, and caching.
+A production-ready backend that lets you call multiple LLM models — GPT-4o, Gemini 2.5, and Claude served through **Meesho's bifrost gateway**, plus Llama-3.3 served **directly by Groq** — compare their outputs, track costs down to the cent, and build reliable product features on top of them — with automatic failover, circuit breakers, prompt versioning, and caching.
+
+All models except Groq's Llama reach us through the one Meesho gateway (an OpenAI-compatible endpoint); the vendor names below — OpenAI, Google, Anthropic — are cost-attribution labels, not separate direct integrations.
 
 ---
 
@@ -21,13 +23,26 @@ graph LR
 
 The Go backend sits between the frontend and every LLM provider. It validates inputs, renders prompts, walks the fallback chain, caches results, logs every call, and enforces budgets — all so product features are reliable even when individual providers have outages.
 
+### Available models
+
+These are the models wired up today. Five of the six reach us through the single Meesho gateway over its OpenAI-compatible wire; only Groq's Llama is a direct vendor API. The vendor column is the attribution recorded on each run, not a separate integration.
+
+| Model key | Served via | Provider attribution |
+|-----------|-----------|----------------------|
+| `gpt-4o`, `gpt-4o-mini` | Meesho gateway | `openai` |
+| `gemini-2.5-pro`, `gemini-2.5-flash` | Meesho gateway | `gemini` |
+| `claude-sonnet-4-6` | Meesho gateway | `anthropic` |
+| `llama-groq` (Llama-3.3-70B) | Groq API (direct) | `groq` |
+
+The routing registry in [internal/llm/runner.go](internal/llm/runner.go) is the single source of truth. It also carries several more vendor models (other GPT, Gemini, and Claude variants) commented out — because they share the gateway's OpenAI-compatible wire, enabling one is a one-line uncomment, no new provider code.
+
 ---
 
 ## Quick start
 
 ```bash
-# 1. Copy the sample env file
-cp .env.example .env   # or edit .env directly — fill in your provider keys
+# 1. Copy the sample env file and fill in your keys
+cp .env.example .env   # set MEESHO_GATEWAY_VK and/or GROQ_API_KEY (at least one)
 
 # 2. Run the server (Go 1.22+ required)
 go run ./cmd/server
@@ -48,7 +63,7 @@ The database (`llm_platform.db`) and task configs (`tasks.d/`) are created autom
 | **Task** | A named, versioned prediction configuration — input/output schema + prompt template + model routing. Like a named function that calls an LLM. |
 | **Run** | One execution of one model call. If a task calls 3 models, that's 3 runs. |
 | **Session** | A group of runs from the same user in the same conversation thread. |
-| **Provider** | A company or gateway that serves LLM APIs (OpenAI, Google Gemini, Groq, Meesho bifrost). |
+| **Provider** | The backend that actually serves a model call. This platform wires up just two: the **Meesho bifrost gateway** (OpenAI-compatible — serves the GPT-4o, Gemini, and Claude models) and **Groq** (direct API — serves Llama-3.3). Each run also records a vendor *attribution* (`openai` / `gemini` / `anthropic` / `groq`) for cost reporting. |
 | **Fallback chain** | An ordered list of models to try. If the first fails, try the second, and so on. |
 | **Circuit breaker** | An automatic switch that stops sending requests to a broken provider — like a fuse that blows before the wiring catches fire. |
 | **Prompt version** | A numbered snapshot of a task's prompt template. You can draft new versions and deploy them like a software release. |
@@ -58,23 +73,17 @@ The database (`llm_platform.db`) and task configs (`tasks.d/`) are created autom
 
 ## Learning guide
 
-These docs explain every part of the codebase from scratch — no Go experience needed:
+These docs (in the repo-root [`docs/`](../docs) folder) explain the codebase and how to run it:
 
 | File | What you'll learn |
 |------|-------------------|
-| [docs/00-big-picture.md](docs/00-big-picture.md) | Why this system exists, what problems it solves, and why Go/SQLite were chosen over the alternatives |
-| [docs/01-server-startup.md](docs/01-server-startup.md) | How the server boots step-by-step, why order matters, and what happens if something fails |
-| [docs/02-config.md](docs/02-config.md) | Every config field, every environment variable, and the 12-factor philosophy behind it |
-| [docs/03-models-and-routing.md](docs/03-models-and-routing.md) | How model routing works, the Provider interface, why the registry map is a single source of truth |
-| [docs/04-prediction-flow.md](docs/04-prediction-flow.md) | **The full lifecycle** of one prediction — from HTTP request to DB row |
-| [docs/05-fallback-chain.md](docs/05-fallback-chain.md) | How the fallback walk decides which model to try next and when to give up |
-| [docs/06-circuit-breaker.md](docs/06-circuit-breaker.md) | The two-layer circuit breaker system and the background recovery prober |
-| [docs/07-tasks.md](docs/07-tasks.md) | Task anatomy, JSON Schema validation, Go prompt templates, and versioning |
-| [docs/08-database.md](docs/08-database.md) | SQLite, WAL mode, every table, and why DB writes are done asynchronously |
-| [docs/09-auth-and-rbac.md](docs/09-auth-and-rbac.md) | JWT authentication, HttpOnly cookies, and the five-role permission model |
-| [docs/10-caching-and-cost.md](docs/10-caching-and-cost.md) | The prediction cache, what makes a cache key unique, and how token costs are calculated |
+| [../docs/repo-guide.md](../docs/repo-guide.md) | **Start here.** The full walkthrough — boot sequence, config, the model/provider layer, fallback chain, circuit breaker, tasks, database, auth, and caching |
+| [../docs/repo_work_doc.md](../docs/repo_work_doc.md) | Implementation work doc — architecture decisions and a component-by-component breakdown |
+| [../docs/deployment-guide.md](../docs/deployment-guide.md) | Production deployment — environment config, secrets, CORS, and rollout |
+| [../docs/gap-analysis-roadmap.md](../docs/gap-analysis-roadmap.md) | Where the demo is today vs. the target Task-keyed prediction platform, and the roadmap to get there |
+| [../docs/phase-workflow.md](../docs/phase-workflow.md) | The phased build plan and development workflow |
 
-**Suggested reading order:** 00 → 01 → 03 → 04 → 05 → 06 → rest in any order.
+**Suggested reading order:** repo-guide → repo_work_doc → the rest as needed.
 
 ---
 

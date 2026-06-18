@@ -68,7 +68,7 @@ flowchart LR
 - Go, [chi](https://github.com/go-chi/chi) router + CORS middleware, request-id/logger/recoverer.
 - SQLite via `modernc.org/sqlite` (pure-Go, no cgo), WAL mode, single writer connection.
 - JWT sessions (HS256), httpOnly cookie.
-- Providers: direct HTTP for OpenAI-compatible backends; `anthropic-sdk-go` for the native Messages API.
+- Providers: direct HTTP to OpenAI-compatible backends — one client for Groq's direct API and one for the Meesho gateway (which serves every non-Groq model). No native vendor SDKs.
 - Prediction cache: `redis/go-redis/v9` or in-process memory.
 - JSON Schema validation: `santhosh-tekuri/jsonschema/v6`. Prompt templating: Go `text/template`.
 
@@ -285,21 +285,24 @@ Gated by the `RequireAdmin` middleware — the **`admin` role**, not a task capa
 ### Model registry
 A single `registry` map is the source of truth for routing. Every model key maps to `{modelID, provider, clientFn, reasoning}`:
 
-| Provider | Model keys (friendly) |
-|---|---|
-| OpenAI | `gpt-5.1, gpt-5, gpt-5-mini, gpt-5-nano, gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, gpt-4o, gpt-4o-mini` |
-| Groq | `llama-groq` (→ llama-3.3-70b-versatile) |
-| Gemini | `gemini-3-pro, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, gemini-flash` |
-| Anthropic | `claude-fable-5, claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5` |
-| Meesho gateway | `meesho-gemini-2.5-flash` (→ vertex/gemini-2.5-flash) |
+All non-Groq models route through the Meesho gateway (`clientFn: meeshoC`); only `llama-groq` calls a vendor API directly. The active model keys today:
 
-- **`reasoning` flag** (gpt-5 family): the chat-completions wire rejects `max_tokens`/`temperature`, so `CallModel` sends `max_completion_tokens` and omits temperature.
+| Provider attribution | Served via | Model keys (friendly) |
+|---|---|---|
+| `openai` | Meesho gateway | `gpt-4o, gpt-4o-mini` |
+| `gemini` | Meesho gateway | `gemini-2.5-pro, gemini-2.5-flash` (→ `vertex/gemini-2.5-pro` / `vertex/gemini-2.5-flash`) |
+| `anthropic` | Meesho gateway | `claude-sonnet-4-6` (→ `anthropic/claude-sonnet-4-6`) |
+| `groq` | Groq API (direct) | `llama-groq` (→ `llama-3.3-70b-versatile`) |
+
+The registry also carries more vendor variants commented out; since they all share the gateway's OpenAI-compatible wire, enabling one is a one-line uncomment with no new provider code.
+
+- **`reasoning` flag** (OpenAI reasoning family): the chat-completions wire rejects `max_tokens`/`temperature`, so `CallModel` sends `max_completion_tokens` and omits temperature. The flag exists in `providerConfig` but no currently-active model sets it.
 
 ### Providers
 - **`Provider` interface**: `Call(ctx, *chatRequest) (*chatResponse, error)`.
-- **OpenAI-compatible provider** covers OpenAI, Groq, Gemini, and the Meesho gateway (POST `{baseURL}/chat/completions`). Auth is `Authorization: Bearer <key>`, except the Meesho gateway which uses the `x-bf-vk` virtual-key header.
-- **Anthropic provider** uses the native Messages API (SDK retries disabled — the platform owns retry policy). System prompt → `system`, temperature not forwarded (current models reject it), `thinking` left at model default. A `refusal` stop reason maps to a `400`.
-- `BuildClients` wires one provider per backend. Anthropic is left `nil` when its key is absent (so a missing key is a normal "not configured" call error, not a tripped breaker).
+- **OpenAI-compatible provider** is the *only* implementation — it serves both Groq (direct) and the Meesho gateway (POST `{baseURL}/chat/completions`). Auth is `Authorization: Bearer <key>` for Groq and the `x-bf-vk` virtual-key header for the Meesho gateway.
+- There is **no native Anthropic/Gemini provider** — OpenAI, Gemini, and Claude models are all reached over the Meesho gateway's OpenAI-compatible wire.
+- `BuildClients` wires two backends: `Groq` and `Meesho`. Either is left `nil` when its key is absent (so a missing key is a normal "not configured" call error, not a tripped breaker).
 
 ### Fallback semantics
 `CallWithFallbackOpts` walks `[primary, …fallbacks]` in order, with three optional hooks — a per-model cache `Lookup`, a `HealthGate` (the per-(task, model) breaker), and an `OutputValidator`. For each model it:
@@ -410,11 +413,8 @@ flowchart LR
 | `PORT` | `8000` | HTTP port |
 | `DB_PATH` | `./llm_platform.db` | SQLite file |
 | `PRICING_PATH` | `./pricing.json` | cost table |
-| `OPENAI_API_KEY` / `_BASE_URL` | — / `api.openai.com/v1` | OpenAI |
-| `GROQ_API_KEY` / `_BASE_URL` | — / `api.groq.com/openai/v1` | Groq |
-| `GEMINI_API_KEY` / `_BASE_URL` | — / Gemini OpenAI-compat endpoint | Gemini |
-| `ANTHROPIC_API_KEY` / `_BASE_URL` | — / SDK default | Anthropic |
-| `MEESHO_GATEWAY_VK` / `_BASE_URL` | — / internal gateway URL | Meesho gateway (x-bf-vk) |
+| `GROQ_API_KEY` / `GROQ_BASE_URL` | — / `api.groq.com/openai/v1` | Groq (direct API) |
+| `MEESHO_GATEWAY_VK` / `MEESHO_GATEWAY_BASE_URL` | — / internal gateway URL | Meesho gateway (`x-bf-vk`) — serves every non-Groq model (GPT-4o, Gemini, Claude). At least one of this or `GROQ_API_KEY` is required at boot. |
 | `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | — / — / `0` | Redis cache |
 | `CACHE_BACKEND` | `redis` if `REDIS_ADDR` set, else `off` | `redis` \| `memory` \| `off` |
 | `HEALTH_BREAKER_ENABLED` | `true` | per-(task, model) health breaker on/off |

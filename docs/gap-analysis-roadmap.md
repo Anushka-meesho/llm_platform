@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-The current repo is a working **multi-model playground**: demo SSO login, fan-out prompt execution across OpenAI/Groq/Gemini, per-call token/cost/latency capture, star-rating feedback, client-side cost estimation, and a per-user usage dashboard. It was built as a UI-first demo, keyed by **user/session**.
+The current repo is a working **multi-model playground**: demo SSO login, fan-out prompt execution across GPT-4o, Gemini, and Claude (served through the Meesho gateway) plus Groq's Llama (direct), per-call token/cost/latency capture, star-rating feedback, client-side cost estimation, and a per-user usage dashboard. It was built as a UI-first demo, keyed by **user/session**.
 
 The design doc describes a **prediction factory** keyed by **Task**. That is the single biggest structural gap: today the system answers *"what did this user spend?"*; Phase 1 must answer *"what does this task cost, at which prompt version, with what accuracy?"*
 
@@ -157,7 +157,7 @@ Batch (Airflow + provider Batch APIs), RAG service, priority queuing, Kafka → 
 ## 6. Decisions Taken / Still Open
 
 1. **✅ DECIDED (2026-06-12): Pure Go — no LiteLLM, no Langfuse.** The design doc's §8 "buy" position is overridden. Rationale: single binary in the hot path, no Python service dependency, full control over routing/fallback/circuit-breaking, and the Go `Provider` seam already exists. Consequences this repo now owns:
-   - **Model routing:** extend `internal/llm` with fallback chains (primary → fallback-1 → fallback-2) and a per-provider circuit breaker (error-rate window, auto-open/half-open). Provider normalization (Gemini/OpenAI/Anthropic/vLLM API shapes) is ours forever — the existing OpenAI-compatible `Provider` interface is the seam; Anthropic needs a native implementation.
+   - **Model routing:** extend `internal/llm` with fallback chains (primary → fallback-1 → fallback-2) and a circuit breaker. *(Update: shipped as a per-(task, model) health breaker — the originally-planned per-provider breaker was removed.)* Provider normalization is the seam we own via the OpenAI-compatible `Provider` interface. *(Update: in practice all non-Groq models — including Claude — route through the Meesho gateway over that same OpenAI-compatible wire, so the originally-anticipated native Anthropic implementation was not needed.)*
    - **Prompt management:** prompt versions table + diff/deploy API + Studio UI are **built**, not configured. The existing React app is the Studio.
    - **Tracing/eval:** the `runs` table is the trace store (extend per §3.5); the eval plane is built in Go (Phase 1 minimal slice stands).
    - The doc's §8 revisit-trigger inverts: revisit *adopting* LiteLLM/Langfuse only if provider normalization or eval tooling maintenance becomes a measurable drag.

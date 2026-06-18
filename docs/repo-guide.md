@@ -100,7 +100,9 @@ llm_platform/
    keys log a warning and that provider fails at call time.
 3. `llm.LoadPricing(pricing.json)` — cost table into memory.
 4. `db.Open` (SQLite, WAL, single writer) → `db.Migrate` (idempotent).
-5. `llm.BuildClients` — one `Provider` per backend (OpenAI/Groq/Gemini/Anthropic).
+5. `llm.BuildClients` — one `Provider` per backend. There are **two**: `Groq` (direct
+   API) and `Meesho` (the internal bifrost gateway, OpenAI-compatible with `x-bf-vk`
+   auth). Every non-Groq model is served through the Meesho gateway.
 6. `tasks.NewStore` → `tasks.SeedPlayground` — seeds only the built-in `playground` task.
    Product tasks live in the DB and are authored at runtime via the Studio (no YAML seeding).
 7. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
@@ -116,9 +118,9 @@ llm_platform/
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | Provider keys; at least one of these or `MEESHO_GATEWAY_VK` required |
-| `OPENAI_BASE_URL` / `GROQ_BASE_URL` / `GEMINI_BASE_URL` / `ANTHROPIC_BASE_URL` | public APIs | Provider base URLs — override for proxies/gateways/self-hosted (Anthropic empty = SDK default) |
-| `MEESHO_GATEWAY_VK` | — | Virtual key for the Meesho internal LLM gateway (sent as the `x-bf-vk` header); powers the `meesho-gemini-2.5-flash` model |
+| `GROQ_API_KEY` | — | Groq API key (direct); at least one of this or `MEESHO_GATEWAY_VK` is required at boot |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq base URL — override for a proxy/self-hosted endpoint |
+| `MEESHO_GATEWAY_VK` | — | Virtual key for the Meesho internal LLM gateway (sent as the `x-bf-vk` header); serves every non-Groq model (GPT-4o, Gemini 2.5, Claude) |
 | `MEESHO_GATEWAY_BASE_URL` | `http://llm-gateway.prd.meesho.int/v1` | Meesho gateway base URL (OpenAI-compatible `/chat/completions`) |
 | `DB_PATH` | `./llm_platform.db` | SQLite file |
 | `PORT` | `8000` | HTTP port |
@@ -249,34 +251,31 @@ data URLs or image URLs and is attached to the vision model as multimodal conten
 ### 3.6 Model layer — `internal/llm`
 
 **`Provider` interface** (`client.go`): `Call(ctx, *chatRequest) (*chatResponse, error)`
-over the OpenAI-compatible chat completions wire format. `openAICompatProvider`
-covers OpenAI, Groq, and Gemini (all expose compatible endpoints);
+over the OpenAI-compatible chat completions wire format. There is a single
+implementation, `openAICompatProvider`, which serves **both** backends: Groq's
+direct API (`Authorization: Bearer`) and the Meesho gateway (the `x-bf-vk`
+virtual-key header instead of Bearer — `openAICompatProvider.authHeader`).
 `NewOpenAICompatProvider(baseURL, apiKey)` is exported for vLLM/self-hosted/
-test fakes. **`anthropicProvider`** (`anthropic.go`) is the native Messages-API
-implementation via the official `anthropic-sdk-go` (SDK retries disabled — the
-platform owns retry/breaker policy): system messages → `system`, temperature
-never forwarded (current Anthropic models 400 on sampling params), thinking
-blocks filtered from output, safety-classifier refusals surfaced as 400-class
-`APIError` (definitive: no retry/breaker/fallback), SDK errors normalized to
-`APIError{HTTPStatusCode, Message}` so classification is provider-uniform. The
-provider is nil when `ANTHROPIC_API_KEY` is unset → standard "LLM client not
-configured" per-call error.
+test fakes. There is **no native Anthropic/Gemini SDK provider** — the OpenAI,
+Gemini, and Claude models are all reached over the gateway's OpenAI-compatible
+wire, so no vendor-specific provider code is needed.
 
 **Routing registry** (`runner.go`): friendly key → concrete model ID + provider
-attribution + client + flags. **20 models across 5 providers**, registered
-whether or not the provider's key is configured (missing key = graceful
-per-call error, never a boot failure):
-- **OpenAI:** `gpt-5.1`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano` (reasoning wire:
-  `max_completion_tokens`, no temperature — `reasoning: true` flag), `gpt-4.1`,
-  `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`
-- **Groq:** `llama-groq` (llama-3.3-70b-versatile)
-- **Gemini:** `gemini-3-pro` (preview), `gemini-2.5-pro`, `gemini-2.5-flash`,
-  `gemini-2.5-flash-lite`, `gemini-flash` (2.0)
-- **Anthropic (native):** `claude-fable-5`, `claude-opus-4-8`,
-  `claude-sonnet-4-6`, `claude-haiku-4-5`
-- **Meesho gateway:** `meesho-gemini-2.5-flash` (model id `vertex/gemini-2.5-flash`)
-  — OpenAI-compatible endpoint authenticated with the `x-bf-vk` virtual-key header
-  instead of Bearer (`openAICompatProvider.authHeader`)
+attribution + client + flags. It is the single source of truth for routing, and
+**all non-Groq models route through the Meesho gateway** (`clientFn: meeshoC`);
+only `llama-groq` calls a vendor API directly. Six models are active today
+(more vendor variants are present but commented out — because they share the
+gateway wire, enabling one is a one-line uncomment, no new provider code):
+- **`openai` (via Meesho gateway):** `gpt-4o`, `gpt-4o-mini`
+- **`gemini` (via Meesho gateway):** `gemini-2.5-pro`, `gemini-2.5-flash`
+  (model ids `vertex/gemini-2.5-pro` / `vertex/gemini-2.5-flash`)
+- **`anthropic` (via Meesho gateway):** `claude-sonnet-4-6`
+  (model id `anthropic/claude-sonnet-4-6`)
+- **`groq` (direct API):** `llama-groq` (`llama-3.3-70b-versatile`)
+
+The bracketed name is the `provider` attribution string recorded on each run. The
+`reasoning` flag (for OpenAI reasoning-family models that reject `max_tokens` /
+temperature) still exists in `providerConfig`, but no currently-active model sets it.
 
 Helpers: `ProviderName(model)`, `KnownModel(model)`, `AllModels()` (sorted keys —
 backs `/health` `models_available`; `DefaultModels` stays the small /run
@@ -663,9 +662,8 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   flush/drop semantics.
 - `internal/llm/runner_test.go` / `provider_test.go` — registry↔pricing.json parity,
   retry rules + error classification, message building, OpenAI-compat wire format
-  (headers, endpoint path, error-body mapping). `anthropic_test.go` — happy path,
-  SDK-error → `APIError` mapping, refusals surface as 400-class content-level
-  errors (never advance the fallback chain).
+  (headers, endpoint path, error-body mapping) — exercising the single
+  `openAICompatProvider` that serves both the Groq and Meesho-gateway backends.
 - `internal/llm/breaker_test.go` — infra-failure classification (`isInfraFailure`)
   and fallback advance/stop rules across infra/config/content errors and a dead chain.
 - `cache_predict_test.go` — cache hit serves without a provider call (zero cost,
