@@ -1,31 +1,22 @@
-# LLM Platform — Go Backend
+# LLM Platform — Backend
 
-A production-ready backend that lets you call multiple LLM models — GPT-4o, Gemini 2.5, and Claude served through **Meesho's bifrost gateway**, plus Llama-3.3 served **directly by Groq** — compare their outputs, track costs down to the cent, and build reliable product features on top of them — with automatic failover, circuit breakers, prompt versioning, and caching.
+Go-based backend service for routing, running, and managing LLM predictions at scale. Built for the Meesho cataloging team.
 
-All models except Groq's Llama reach us through the one Meesho gateway (an OpenAI-compatible endpoint); the vendor names below — OpenAI, Google, Anthropic — are cost-attribution labels, not separate direct integrations.
+## Tech Stack
 
----
+| | |
+|---|---|
+| Language | Go 1.24 |
+| Router | [Chi v5](https://github.com/go-chi/chi) |
+| Database | SQLite 3 (WAL mode via `modernc.org/sqlite`) |
+| Auth | JWT (`golang-jwt/jwt v5`) + RBAC |
+| Cache | In-memory or Redis (`go-redis v9`) |
+| LLM Providers | Meesho bifrost gateway (OpenAI-compatible) + Groq direct API |
+| Schema Validation | JSON Schema (`santhosh-tekuri/jsonschema v6`) |
 
-## How it fits together
+## Models & Providers
 
-```mermaid
-graph LR
-    U([User / Browser]) -->|HTTP| F[React Frontend]
-    F -->|REST API| G[Go Backend<br/>:8000]
-    G -->|task predict| PC{Prediction<br/>Cache}
-    PC -->|miss| FB[Fallback Chain]
-    FB -->|primary| ME[Meesho Gateway<br/>GPT-4o · Gemini · Claude]
-    FB -->|groq route| GR[Groq API<br/>Llama-3.3-70B]
-    G -->|async| DB[(SQLite DB)]
-    G -->|health probe| ME
-    G -->|health probe| GR
-```
-
-The Go backend sits between the frontend and every LLM provider. It validates inputs, renders prompts, walks the fallback chain, caches results, logs every call, and enforces budgets — all so product features are reliable even when individual providers have outages.
-
-### Available models
-
-These are the models wired up today. Five of the six reach us through the single Meesho gateway over its OpenAI-compatible wire; only Groq's Llama is a direct vendor API. The vendor column is the attribution recorded on each run, not a separate integration.
+All models except Groq's Llama are served through the single **Meesho bifrost gateway** — an OpenAI-compatible endpoint authenticated with the `x-bf-vk` header. The vendor names are cost-attribution labels recorded on each run, **not** separate direct integrations: there is no native OpenAI/Gemini/Anthropic SDK in the codebase.
 
 | Model key | Served via | Provider attribution |
 |-----------|-----------|----------------------|
@@ -34,79 +25,102 @@ These are the models wired up today. Five of the six reach us through the single
 | `claude-sonnet-4-6` | Meesho gateway | `anthropic` |
 | `llama-groq` (Llama-3.3-70B) | Groq API (direct) | `groq` |
 
-The routing registry in [internal/llm/runner.go](internal/llm/runner.go) is the single source of truth. It also carries several more vendor models (other GPT, Gemini, and Claude variants) commented out — because they share the gateway's OpenAI-compatible wire, enabling one is a one-line uncomment, no new provider code.
+The routing registry in [internal/llm/runner.go](internal/llm/runner.go) is the single source of truth; more vendor variants are present but commented out (they share the gateway's OpenAI-compatible wire, so enabling one is a one-line uncomment — no new provider code).
 
----
+## Project Layout
 
-## Quick start
+```
+cmd/
+  server/main.go          — HTTP server entry point (:8000)
+  issue-token/main.go     — CLI: generate JWT tokens for users
+
+internal/
+  api/                    — HTTP handlers, router, middleware
+  llm/                    — Provider interface, fallback chain, circuit breaker
+  tasks/                  — Task config, prompt versioning, template rendering
+  health/                 — Per-task circuit breaker tracker
+  cache/                  — In-memory and Redis prediction cache
+  db/                     — SQLite schema, queries, async writers
+  auth/                   — JWT parsing + RBAC middleware
+  config/                 — .env loader
+  users/                  — User store + demo data
+  schema/                 — JSON Schema registry + request schemas (YAML)
+  types/                  — Shared request/response DTOs
+
+tests/                    — Integration tests
+pricing.json              — Per-model token costs (USD per 1M tokens)
+```
+
+## Setup
+
+### 1. Create environment file
+
+Copy the sample and fill in your keys (at least one provider key is required):
 
 ```bash
-# 1. Copy the sample env file and fill in your keys
-cp .env.example .env   # set MEESHO_GATEWAY_VK and/or GROQ_API_KEY (at least one)
+cp .env.example .env   # set MEESHO_GATEWAY_VK and/or GROQ_API_KEY
+```
 
-# 2. Run the server (Go 1.22+ required)
+Minimum `.env`:
+
+```env
+MEESHO_GATEWAY_VK=          # serves GPT-4o, Gemini, Claude (gateway)
+GROQ_API_KEY=               # serves llama-groq (direct)
+DB_PATH=./llm_platform.db
+JWT_SECRET=your_jwt_secret_here
+PORT=8000
+REDIS_URL=                  # optional — omit for in-memory cache
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `MEESHO_GATEWAY_VK` | One of these two | Virtual key for the Meesho gateway (`x-bf-vk`); serves every non-Groq model |
+| `GROQ_API_KEY` | One of these two | Groq API key; serves `llama-groq` (direct) |
+| `DB_PATH` | Yes | SQLite file path |
+| `JWT_SECRET` | Yes | Secret for signing JWT tokens |
+| `PORT` | No | HTTP port (default: `8000`) |
+| `REDIS_URL` | No | Redis URL; omit to use in-memory cache |
+
+### 2. Run the server
+
+```bash
 go run ./cmd/server
-
-# 3. Check it's alive
-curl http://localhost:8000/health
-# → {"status":"ok"}
 ```
 
-The database (`llm_platform.db`) and task configs (`tasks.d/`) are created automatically on first run.
+Server starts on `http://localhost:8000`.
 
----
+### 3. Issue a JWT token (for testing)
 
-## Key vocabulary
-
-| Term | Plain-English meaning |
-|------|----------------------|
-| **Task** | A named, versioned prediction configuration — input/output schema + prompt template + model routing. Like a named function that calls an LLM. |
-| **Run** | One execution of one model call. If a task calls 3 models, that's 3 runs. |
-| **Session** | A group of runs from the same user in the same conversation thread. |
-| **Provider** | The backend that actually serves a model call. This platform wires up just two: the **Meesho bifrost gateway** (OpenAI-compatible — serves the GPT-4o, Gemini, and Claude models) and **Groq** (direct API — serves Llama-3.3). Each run also records a vendor *attribution* (`openai` / `gemini` / `anthropic` / `groq`) for cost reporting. |
-| **Fallback chain** | An ordered list of models to try. If the first fails, try the second, and so on. |
-| **Circuit breaker** | An automatic switch that stops sending requests to a broken provider — like a fuse that blows before the wiring catches fire. |
-| **Prompt version** | A numbered snapshot of a task's prompt template. You can draft new versions and deploy them like a software release. |
-| **Cache hit** | When an identical request was already answered before, so the stored answer is returned — free of charge, instantly. |
-
----
-
-## Learning guide
-
-These docs (in the repo-root [`docs/`](../docs) folder) explain the codebase and how to run it:
-
-| File | What you'll learn |
-|------|-------------------|
-| [../docs/repo-guide.md](../docs/repo-guide.md) | **Start here.** The full walkthrough — boot sequence, config, the model/provider layer, fallback chain, circuit breaker, tasks, database, auth, and caching |
-| [../docs/repo_work_doc.md](../docs/repo_work_doc.md) | Implementation work doc — architecture decisions and a component-by-component breakdown |
-| [../docs/deployment-guide.md](../docs/deployment-guide.md) | Production deployment — environment config, secrets, CORS, and rollout |
-| [../docs/gap-analysis-roadmap.md](../docs/gap-analysis-roadmap.md) | Where the demo is today vs. the target Task-keyed prediction platform, and the roadmap to get there |
-| [../docs/phase-workflow.md](../docs/phase-workflow.md) | The phased build plan and development workflow |
-
-**Suggested reading order:** repo-guide → repo_work_doc → the rest as needed.
-
----
-
-## Directory map
-
+```bash
+go run ./cmd/issue-token
 ```
-llm_platform_go/
-├── cmd/
-│   ├── server/main.go         ← entry point — wires everything together
-│   └── issue-token/main.go    ← CLI tool for minting auth tokens
-├── internal/
-│   ├── api/                   ← HTTP handlers, router, middleware
-│   ├── llm/                   ← provider clients, registry, fallback, circuit breaker
-│   ├── tasks/                 ← task config, validation, versioning, store
-│   ├── health/                ← per-(task, model) circuit breaker tracker
-│   ├── cache/                 ← prediction cache (Redis or memory)
-│   ├── db/                    ← SQLite setup, migrations, queries, async writers
-│   ├── auth/                  ← JWT, cookies, RBAC
-│   ├── users/                 ← user store (demo swap seam)
-│   ├── config/                ← environment variable loading
-│   └── types/                 ← shared request/response types
-├── tasks.d/                   ← YAML task definitions (loaded at startup)
-├── pricing.json               ← per-model token pricing (USD per 1M tokens)
-├── .env                       ← local secrets (gitignored — never commit this)
-└── docs/                      ← this learning guide
+
+### 4. Run tests
+
+```bash
+go test ./...
 ```
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/auth/login` | — | Exchange credentials for JWT |
+| `POST` | `/run` | JWT | Run an LLM prediction |
+| `GET` | `/v1/tasks` | JWT | List tasks |
+| `POST` | `/v1/tasks` | JWT | Create a task |
+| `GET/PUT/DELETE` | `/v1/tasks/:id` | JWT | Read / update / delete a task |
+| `POST` | `/v1/tasks/:id/test` | JWT | Test a task prompt |
+| `GET/POST` | `/v1/tasks/:id/versions` | JWT | List / save draft versions |
+| `POST` | `/v1/tasks/:id/versions/:v/deploy` | JWT | Deploy a prompt version |
+| `POST` | `/v1/shadow/compare` | JWT | A/B shadow comparison |
+| `GET` | `/v1/admin/runs` | JWT (admin) | View run history |
+| `GET` | `/health/models` | JWT | Circuit breaker status per task+model |
+| `POST` | `/health/reset` | JWT (admin) | Reset circuit breaker |
+| `POST` | `/feedback` | JWT | Submit run feedback / star rating |
+| `GET` | `/pricing` | JWT | Per-model token pricing |
+| `GET` | `/dashboard` | JWT | Usage dashboard stats |
+
+## Related
+
+- [Frontend repo](https://github.com/Meesho/cataloging_llm_platform-frontend)

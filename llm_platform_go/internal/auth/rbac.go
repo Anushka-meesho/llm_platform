@@ -43,26 +43,14 @@ const (
 
 // Defined roles.
 const (
-	RoleAdmin    = "admin"    // superuser: every capability
-	RoleCreator  = "creator"  // prompt creator: author + iterate, but cannot publish
-	RoleApprover = "approver" // owns the publish gate: read/predict/deploy
-	RoleCaller   = "caller"   // service principal / integration: read + predict only
-	RoleViewer   = "viewer"   // view-only share access (PFS step 7)
+	RoleAdmin = "admin" // superuser: every capability
 )
 
-// DefaultRole is assigned when a token carries no role claim — legacy session
-// tokens and service principals minted before RBAC. It is the least-privilege
-// role that can still call the product predict API and read task config, which
-// is exactly what a backend-engineer integration needs, so existing service
-// tokens keep working without being re-minted.
-const DefaultRole = RoleCaller
+// DefaultRole is assigned when a token carries no role claim.
+const DefaultRole = RoleAdmin
 
 var rolePermissions = map[string]map[Permission]bool{
-	RoleAdmin:    {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskDeploy: true, PermTaskDelete: true, PermTaskViewPrompt: true},
-	RoleCreator:  {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskViewPrompt: true},
-	RoleApprover: {PermTaskRead: true, PermTaskPredict: true, PermTaskDeploy: true, PermTaskViewPrompt: true},
-	RoleCaller:   {PermTaskRead: true, PermTaskPredict: true},
-	RoleViewer:   {PermTaskRead: true, PermTaskViewPrompt: true},
+	RoleAdmin: {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskDeploy: true, PermTaskDelete: true, PermTaskViewPrompt: true},
 }
 
 // KnownRole reports whether role is a defined role. Used to validate the

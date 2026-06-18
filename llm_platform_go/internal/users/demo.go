@@ -24,13 +24,8 @@ type DemoStore struct {
 
 // NewDemoStore returns a DemoStore seeded with the default demo users.
 func NewDemoStore() *DemoStore {
-	// One user per RBAC role so the demo login screen can exercise the full
-	// authorization matrix (see internal/auth/rbac.go).
 	seed := []*User{
 		{ID: "u-admin", Email: "admin@demo.local", Name: "Admin", Role: auth.RoleAdmin},
-		{ID: "u-creator", Email: "creator@demo.local", Name: "Maya (Creator)", Role: auth.RoleCreator},
-		{ID: "u-approver", Email: "approver@demo.local", Name: "Sam (Approver)", Role: auth.RoleApprover},
-		{ID: "u-viewer", Email: "viewer@demo.local", Name: "Vee (Viewer)", Role: auth.RoleViewer},
 	}
 	s := &DemoStore{byID: make(map[string]*User, len(seed))}
 	for _, u := range seed {

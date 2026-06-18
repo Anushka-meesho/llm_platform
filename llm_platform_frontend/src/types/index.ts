@@ -386,6 +386,7 @@ export type TPredictResult = {
     cost_usd: number;
   };
   latency_ms: number;
+  gateway_latency_ms?: number;
 };
 
 export type TTaskStatsDetail = {

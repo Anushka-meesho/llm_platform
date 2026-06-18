@@ -8,10 +8,9 @@ import (
 	"llm_platform_go/internal/auth"
 )
 
-// TestPromptRedaction verifies that service callers (no task:view_prompt) get
-// task metadata and schemas but NOT the prompt template / system prompt, while
-// roles that work on tasks (creator, viewer, admin) see the full prompt.
-func TestPromptRedaction(t *testing.T) {
+// TestPromptVisibility verifies that admin (the only role) can see the full
+// prompt template and system prompt in both task and version responses.
+func TestPromptVisibility(t *testing.T) {
 	srv, _ := newPredictServer(t, `{"label":"positive"}`)
 
 	type taskResp struct {
@@ -30,27 +29,19 @@ func TestPromptRedaction(t *testing.T) {
 		return tr
 	}
 
-	// Caller: prompt blanked, but the contract (input schema) preserved.
-	caller := getTask(auth.RoleCaller)
-	if caller.PromptTemplate != "" || caller.SystemPrompt != "" {
-		t.Errorf("caller should not see prompt text, got template=%q system=%q", caller.PromptTemplate, caller.SystemPrompt)
+	// Admin sees full prompt text and the input schema.
+	got := getTask(auth.RoleAdmin)
+	if got.PromptTemplate == "" {
+		t.Errorf("admin should see the prompt template")
 	}
-	if len(caller.InputSchema) == 0 {
-		t.Errorf("caller should still see the input schema (the task contract)")
-	}
-
-	// Creator and viewer: full prompt visible.
-	for _, role := range []string{auth.RoleCreator, auth.RoleViewer, auth.RoleAdmin} {
-		got := getTask(role)
-		if got.PromptTemplate == "" {
-			t.Errorf("%s should see the prompt template", role)
-		}
+	if len(got.InputSchema) == 0 {
+		t.Errorf("admin should see the input schema")
 	}
 
-	// Version history: caller gets metadata but not the prompt bodies.
-	resp, err := http.DefaultClient.Do(roleReq(t, auth.RoleCaller, http.MethodGet, srv.URL+"/v1/tasks/sentiment/versions", ""))
+	// Admin sees version prompt bodies.
+	resp, err := http.DefaultClient.Do(roleReq(t, auth.RoleAdmin, http.MethodGet, srv.URL+"/v1/tasks/sentiment/versions", ""))
 	if err != nil {
-		t.Fatalf("caller versions: %v", err)
+		t.Fatalf("admin versions: %v", err)
 	}
 	defer resp.Body.Close()
 	var vr struct {
@@ -61,27 +52,9 @@ func TestPromptRedaction(t *testing.T) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&vr)
 	if len(vr.Versions) == 0 {
-		t.Fatalf("caller should still see version metadata")
+		t.Fatalf("admin should see version metadata")
 	}
-	for _, v := range vr.Versions {
-		if v.PromptTemplate != "" {
-			t.Errorf("caller should not see prompt body for v%d", v.Version)
-		}
-	}
-
-	// Creator sees the version prompt body.
-	resp2, err := http.DefaultClient.Do(roleReq(t, auth.RoleCreator, http.MethodGet, srv.URL+"/v1/tasks/sentiment/versions", ""))
-	if err != nil {
-		t.Fatalf("creator versions: %v", err)
-	}
-	defer resp2.Body.Close()
-	var vr2 struct {
-		Versions []struct {
-			PromptTemplate string `json:"prompt_template"`
-		} `json:"versions"`
-	}
-	_ = json.NewDecoder(resp2.Body).Decode(&vr2)
-	if len(vr2.Versions) == 0 || vr2.Versions[0].PromptTemplate == "" {
-		t.Errorf("creator should see version prompt bodies")
+	if vr.Versions[0].PromptTemplate == "" {
+		t.Errorf("admin should see version prompt body for v%d", vr.Versions[0].Version)
 	}
 }
