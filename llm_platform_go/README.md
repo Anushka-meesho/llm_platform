@@ -11,8 +11,21 @@ Go-based backend service for routing, running, and managing LLM predictions at s
 | Database | SQLite 3 (WAL mode via `modernc.org/sqlite`) |
 | Auth | JWT (`golang-jwt/jwt v5`) + RBAC |
 | Cache | In-memory or Redis (`go-redis v9`) |
-| LLM Provider | Anthropic SDK (`anthropics/anthropic-sdk-go v1.50.1`) |
+| LLM Providers | Meesho bifrost gateway (OpenAI-compatible) + Groq direct API |
 | Schema Validation | JSON Schema (`santhosh-tekuri/jsonschema v6`) |
+
+## Models & Providers
+
+All models except Groq's Llama are served through the single **Meesho bifrost gateway** — an OpenAI-compatible endpoint authenticated with the `x-bf-vk` header. The vendor names are cost-attribution labels recorded on each run, **not** separate direct integrations: there is no native OpenAI/Gemini/Anthropic SDK in the codebase.
+
+| Model key | Served via | Provider attribution |
+|-----------|-----------|----------------------|
+| `gpt-4o`, `gpt-4o-mini` | Meesho gateway | `openai` |
+| `gemini-2.5-pro`, `gemini-2.5-flash` | Meesho gateway | `gemini` |
+| `claude-sonnet-4-6` | Meesho gateway | `anthropic` |
+| `llama-groq` (Llama-3.3-70B) | Groq API (direct) | `groq` |
+
+The routing registry in [internal/llm/runner.go](internal/llm/runner.go) is the single source of truth; more vendor variants are present but commented out (they share the gateway's OpenAI-compatible wire, so enabling one is a one-line uncomment — no new provider code).
 
 ## Project Layout
 
@@ -42,10 +55,17 @@ pricing.json              — Per-model token costs (USD per 1M tokens)
 
 ### 1. Create environment file
 
-Create a `.env` file in the project root:
+Copy the sample and fill in your keys (at least one provider key is required):
+
+```bash
+cp .env.example .env   # set MEESHO_GATEWAY_VK and/or GROQ_API_KEY
+```
+
+Minimum `.env`:
 
 ```env
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
+MEESHO_GATEWAY_VK=          # serves GPT-4o, Gemini, Claude (gateway)
+GROQ_API_KEY=               # serves llama-groq (direct)
 DB_PATH=./llm_platform.db
 JWT_SECRET=your_jwt_secret_here
 PORT=8000
@@ -54,7 +74,8 @@ REDIS_URL=                  # optional — omit for in-memory cache
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `MEESHO_GATEWAY_VK` | One of these two | Virtual key for the Meesho gateway (`x-bf-vk`); serves every non-Groq model |
+| `GROQ_API_KEY` | One of these two | Groq API key; serves `llama-groq` (direct) |
 | `DB_PATH` | Yes | SQLite file path |
 | `JWT_SECRET` | Yes | Secret for signing JWT tokens |
 | `PORT` | No | HTTP port (default: `8000`) |

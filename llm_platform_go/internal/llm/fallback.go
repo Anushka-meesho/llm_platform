@@ -1,6 +1,9 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // ModelCacheLookup is consulted before each live model call during a fallback
 // walk. Returning (result, true) supplies a cached answer for that model: the
@@ -132,13 +135,27 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 	}
 
 	if !attempted {
-		// Every model in the chain was skipped as unhealthy.
+		// Every model in the chain was skipped as unhealthy (circuit open) — no
+		// model was even callable, so there is nothing usable to serve this task.
 		return ModelResult{Success: false, Degraded: true,
-			Error: strPtr("all models are unhealthy for this task — circuit open")}
+			Error: strPtr(fmt.Sprintf(
+				"no usable model for this task — all %d configured model(s) are unhealthy (circuit open)",
+				len(models)))}
 	}
 
-	// Whole chain failed (infra errors and/or schema-invalid everywhere).
+	// Whole chain failed (infra errors and/or schema-invalid everywhere). Lead
+	// with the no-usable-model summary so the caller can tell the entire chain is
+	// down — not just one model — while keeping the last model's reason for
+	// diagnosis.
 	last.Degraded = true
+	if last.Error != nil {
+		last.Error = strPtr(fmt.Sprintf(
+			"no usable model for this task — all %d configured model(s) failed; last error: %s",
+			len(models), *last.Error))
+	} else {
+		last.Error = strPtr(fmt.Sprintf(
+			"no usable model for this task — all %d configured model(s) failed", len(models)))
+	}
 	return last
 }
 

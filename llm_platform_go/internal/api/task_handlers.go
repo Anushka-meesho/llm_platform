@@ -167,6 +167,7 @@ type predictResponse struct {
 	OutputValid      *bool           `json:"output_valid"` // null when task has no output schema
 	RawResponse      *string         `json:"raw_response"`
 	Error            *string         `json:"error"`
+	ErrorCode        string          `json:"error_code,omitempty"` // stable code on failure (e.g. no_model_available); empty on success
 	FallbackUsed     bool            `json:"fallback_used"`
 	Cached           bool            `json:"cached"` // served from the prediction cache (zero cost)
 	Usage            predictUsage    `json:"usage"`
