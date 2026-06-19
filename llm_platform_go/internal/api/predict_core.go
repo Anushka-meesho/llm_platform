@@ -14,6 +14,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
 
@@ -44,6 +45,7 @@ type predictOptions struct {
 	overrideVersion *tasks.PromptVersion // test a specific prompt version instead of the active one
 	overrideModel   string               // test a specific model instead of the task's chain
 	useCache        bool                 // production predicts only — test/shadow always run fresh
+	enforceLimits   bool                 // apply the per-task request/token rate limiter (production predicts)
 }
 
 // predictOutcome is everything a prediction produced, shared by the Predict,
@@ -61,6 +63,35 @@ type predictOutcome struct {
 	// cache work. Result.LatencyMs, by contrast, is only the winning model's
 	// call. Gateway ≥ model; the gap is the platform's own overhead + losers.
 	GatewayLatencyMs int
+}
+
+// limiterError maps a rate-limiter rejection to the right HTTP error: an
+// oversized input is a deterministic 413 (retrying won't help — shrink it),
+// while a request-rate or token-budget breach is a transient 429 carrying a
+// Retry-After hint for when the task's window refills.
+func limiterError(d ratelimit.Decision) *AppError {
+	switch d.Code {
+	case ratelimit.InputTooLarge:
+		return PayloadTooLarge(CodeInputTooLarge, "%s", d.Message)
+	case ratelimit.RequestRate:
+		return TooMany(CodeRateLimited, "%s", d.Message).
+			WithRetryAfter(retryAfterSeconds(d.RetryAfter))
+	case ratelimit.TokenBudget:
+		return TooMany(CodeTokenBudget, "%s", d.Message).
+			WithRetryAfter(retryAfterSeconds(d.RetryAfter))
+	default:
+		return TooMany(CodeRateLimited, "%s", d.Message)
+	}
+}
+
+// retryAfterSeconds rounds a sub-second window remainder up to at least 1, so a
+// Retry-After is never 0 ("retry immediately") when the window hasn't refilled.
+func retryAfterSeconds(d time.Duration) int {
+	s := int(d / time.Second)
+	if d%time.Second > 0 || s == 0 {
+		s++
+	}
+	return s
 }
 
 // servedValid reports whether the prediction produced an answer that is safe to
@@ -247,8 +278,35 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
+	// Per-task rate limiter (production predicts only). Estimate the input cost
+	// from the rendered system+user prompt and any images, then reserve it: an
+	// oversized single input is rejected (413), and the task's per-window request
+	// and token budgets are enforced up front (429). The reservation is settled
+	// to the tokens actually consumed after the walk — see Reconcile below.
+	var reservation ratelimit.Reservation
+	if opts.enforceLimits && h.Limiter.Enabled() {
+		est := h.Limiter.Estimate(renderTask.SystemPrompt+"\n"+prompt, len(images))
+		res, dec := h.Limiter.Reserve(task.ID, est)
+		if !dec.Allowed {
+			return nil, limiterError(dec)
+		}
+		reservation = res
+	}
+
 	result := llm.CallWithFallbackOpts(ctx, h.Clients, models, messages,
 		float32(task.Temperature), task.MaxTokens, fbOpts)
+
+	// Settle the rate-limit reservation against the tokens actually consumed:
+	// the sum across every attempt (winner + failed/fallback + schema-invalid),
+	// which is the true input+output spend even when the request ultimately
+	// failed. A cache hit consumed nothing upstream, so its attempts total ~0.
+	if reservation.Active() {
+		actualTokens := 0
+		for _, a := range result.Attempts {
+			actualTokens += a.TotalTokens
+		}
+		h.Limiter.Reconcile(reservation, actualTokens)
+	}
 
 	// One run id ties the answer (runs row) to its full gateway trace (one
 	// gateway_attempts row per model the walk touched). Generated before the

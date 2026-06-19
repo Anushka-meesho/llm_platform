@@ -9,6 +9,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/schema"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
@@ -28,6 +29,7 @@ type RouterDeps struct {
 	Attempts       *db.GatewayAttemptWriter // optional async gateway-trace writer
 	Cache          cache.Cache              // optional prediction cache; nil → caching off
 	Health         *health.Tracker          // optional per-(task, model) circuit breaker
+	Limiter        *ratelimit.Limiter       // optional per-task request/token rate limiter
 	Auth           AuthConfig
 	AllowedOrigins []string // CORS — the frontend origin(s)
 }
@@ -42,6 +44,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		Attempts: deps.Attempts,
 		Cache:    deps.Cache,
 		Health:   deps.Health,
+		Limiter:  deps.Limiter,
 		Auth:     deps.Auth,
 	}
 

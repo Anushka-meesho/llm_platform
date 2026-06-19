@@ -13,6 +13,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
 
@@ -107,6 +108,25 @@ func main() {
 		log.Printf("model health breaker: off")
 	}
 
+	// Per-task request/token rate limiter — rejects oversized inputs (413) and
+	// throttles requests and token throughput per task per window (429), counting
+	// the tokens actually consumed (incl. failed/fallback attempts).
+	limiter := ratelimit.New(ratelimit.Config{
+		Enabled:        cfg.RateLimitEnabled,
+		Window:         cfg.RateWindow,
+		MaxRequests:    cfg.RateMaxRequests,
+		MaxTokens:      cfg.RateMaxTokens,
+		MaxInputTokens: cfg.RateMaxInputTokens,
+		CharsPerToken:  cfg.RateCharsPerToken,
+		TokensPerImage: cfg.RateTokensPerImage,
+	})
+	if cfg.RateLimitEnabled {
+		log.Printf("rate limiter: on (per task, window %s — max %d req, %d tok; max %d input tok/request)",
+			cfg.RateWindow, cfg.RateMaxRequests, cfg.RateMaxTokens, cfg.RateMaxInputTokens)
+	} else {
+		log.Printf("rate limiter: off")
+	}
+
 	// Prediction cache — Redis in production, in-process memory for dev boxes
 	// without Redis, off otherwise. Tasks opt in via cache_enabled.
 	var predictionCache cache.Cache
@@ -134,6 +154,7 @@ func main() {
 		Attempts: attemptWriter,
 		Cache:    predictionCache,
 		Health:   healthTracker,
+		Limiter:  limiter,
 		Auth: api.AuthConfig{
 			Secret:      []byte(cfg.JWTSecret),
 			CookieName:  cfg.AuthCookieName,

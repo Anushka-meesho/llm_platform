@@ -223,7 +223,8 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user, predictOptions{useCache: true})
+	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user,
+		predictOptions{useCache: true, enforceLimits: true})
 	if herr != nil {
 		writeErr(w, r, herr)
 		return
