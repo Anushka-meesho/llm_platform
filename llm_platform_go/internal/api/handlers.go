@@ -36,10 +36,11 @@ type Handler struct {
 	Clients *llm.Clients
 	Users   users.Store
 	Tasks   *tasks.Store
-	Runs    *db.RunWriter   // async observability writer; nil → synchronous inserts
-	Cache   cache.Cache     // prediction cache; nil → caching off
-	Health  *health.Tracker // per-(task, model) circuit breaker; nil → no gating
-	Auth    AuthConfig
+	Runs     *db.RunWriter            // async observability writer; nil → synchronous inserts
+	Attempts *db.GatewayAttemptWriter // async gateway-trace writer; nil → synchronous inserts
+	Cache    cache.Cache              // prediction cache; nil → caching off
+	Health   *health.Tracker          // per-(task, model) circuit breaker; nil → no gating
+	Auth     AuthConfig
 
 	spend spendCache // budget gate's in-memory daily-spend view (no hot-path SUM)
 }

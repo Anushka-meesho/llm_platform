@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type ReactNode } from 'react';
 import { Typography, Button } from '@meesho/merlin-ui-tailwind';
-import type { TTask, TTaskStatsDetail, TPredictResult } from '../types';
+import type { TTask, TTaskStatsDetail, TPredictResult, TGatewayAttempt } from '../types';
 import { type PredictOutcome, api, ApiError, errorMessage } from '../api/client';
+import { usePersistentState } from '../hooks/usePersistentState';
 import { formatCost } from '../utils/tokens';
 
 // ── Local UI primitives ───────────────────────────────────────────────────────
@@ -56,7 +57,10 @@ const Spinner = () => (
 
 const ClientPortalPage = () => {
   const [tasks, setTasks] = useState<TTask[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = usePersistentState<string | null>(
+    'clientportal.selectedId',
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -251,8 +255,15 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
     }));
   }, [task.input_schema]);
 
-  const [values, setValues] = useState<Record<string, string>>({});
+  // The filled input values persist per task, so a test you set up is still there
+  // after a reload. Keyed by task id; TryItPanel remounts per task (parent keys
+  // on task.id), so the storage key is stable for the mount.
+  const [values, setValues] = usePersistentState<Record<string, string>>(
+    `clientportal.values.${task.id}`,
+    {},
+  );
   const [outcome, setOutcome] = useState<PredictOutcome | null>(null);
+  const [attempts, setAttempts] = useState<TGatewayAttempt[] | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -260,6 +271,7 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
     setRunning(true);
     setErr(null);
     setOutcome(null);
+    setAttempts(null);
     try {
       const inputs: Record<string, unknown> = {};
       for (const f of fields) {
@@ -267,7 +279,13 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
         if (raw === '') continue;
         inputs[f.name] = coerce(raw, f.schema);
       }
-      setOutcome(await api.predict(task.id, inputs));
+      const res = await api.predict(task.id, inputs);
+      setOutcome(res);
+      // Show exactly what happened behind the answer: the full gateway trace
+      // (every model tried, each fallback's reason, errors, retries, and the
+      // output each model returned). Best-effort — the run row + attempts are
+      // written asynchronously, so poll briefly; non-admins simply don't see it.
+      void fetchTrace(res.result.task_run_id).then(setAttempts);
     } catch (e) {
       if (e instanceof ApiError && e.status === 429) {
         const match = e.code?.match(/^retry_after:(\d+)$/);
@@ -292,36 +310,49 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
         </div>
       ) : (
         <div className="flex flex-col gap-2">
-          {fields.map((f) => (
-            <label key={f.name} className="block">
-              <div className="text-xs text-tertiary-text mb-0.5">
-                {f.name}
-                {f.required && <span className="text-red-600"> *</span>}
-                {f.schema.type && f.schema.type !== 'string' && (
-                  <span className="text-tertiary-text"> ({f.schema.type as string})</span>
-                )}
-                {f.schema.description && (
-                  <span className="text-tertiary-text"> — {f.schema.description as string}</span>
+          {fields.map((f) => {
+            const filled = (values[f.name] ?? '') !== '';
+            return (
+              <div key={f.name} className="block">
+                <div className="flex items-center justify-between gap-2 mb-0.5">
+                  <span className="text-xs text-tertiary-text">
+                    {f.name}
+                    {f.required && <span className="text-red-600"> *</span>}
+                    {typeof f.schema.type === 'string' && f.schema.type !== 'string' && (
+                      <span className="text-tertiary-text"> ({f.schema.type})</span>
+                    )}
+                    {typeof f.schema.description === 'string' && (
+                      <span className="text-tertiary-text"> — {f.schema.description}</span>
+                    )}
+                  </span>
+                  {filled && (
+                    <button
+                      type="button"
+                      onClick={() => setValues((prev) => ({ ...prev, [f.name]: '' }))}
+                      className="flex-shrink-0 text-[11px] text-secondary-text hover:text-primary-text bg-transparent border-none cursor-pointer p-0"
+                      title={`Clear ${f.name}`}
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {imageFieldMode(f) ? (
+                  <ImagePicker
+                    value={values[f.name] ?? ''}
+                    multi={imageFieldMode(f) === 'multi'}
+                    onChange={(next) => setValues((prev) => ({ ...prev, [f.name]: next }))}
+                  />
+                ) : (
+                  <textarea
+                    value={values[f.name] ?? ''}
+                    onChange={(e) => setValues((prev) => ({ ...prev, [f.name]: e.target.value }))}
+                    rows={1}
+                    className="w-full border border-solid border-primary-border rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-primary-bg text-primary-text"
+                  />
                 )}
               </div>
-              {imageFieldMode(f) ? (
-                <ImagePicker
-                  value={values[f.name] ?? ''}
-                  multi={imageFieldMode(f) === 'multi'}
-                  onChange={(next) => setValues((prev) => ({ ...prev, [f.name]: next }))}
-                />
-              ) : (
-                <textarea
-                  value={values[f.name] ?? ''}
-                  onChange={(e) =>
-                    setValues((prev) => ({ ...prev, [f.name]: e.target.value }))
-                  }
-                  rows={1}
-                  className="w-full border border-solid border-primary-border rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-primary-bg text-primary-text"
-                />
-              )}
-            </label>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -343,7 +374,98 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
       )}
 
       {outcome && <ResultCard outcome={outcome} />}
+      {outcome && attempts && attempts.length > 0 && <GatewayTrace attempts={attempts} />}
     </Section>
+  );
+};
+
+// fetchTrace pulls the gateway trace for a run by id. The run row and its
+// attempts are persisted asynchronously, so it polls briefly until they land;
+// it returns [] on access errors (e.g. a non-admin caller) so the panel just
+// omits the trace rather than failing the prediction view.
+async function fetchTrace(runId: string): Promise<TGatewayAttempt[]> {
+  for (let i = 0; i < 6; i++) {
+    try {
+      const detail = await api.adminRun(runId);
+      if (detail.attempts && detail.attempts.length > 0) return detail.attempts;
+    } catch {
+      // run not written yet (404), or no admin access — stop trying on access errors.
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  try {
+    return (await api.adminRun(runId)).attempts ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// GatewayTrace shows every model the gateway touched for one run, in order:
+// each fallback, why it advanced, the error and its classification, retries,
+// per-call latency/cost, and the output the model returned (kept even when it
+// failed validation) — the full "what actually happened" behind the answer.
+const GatewayTrace = ({ attempts }: { attempts: TGatewayAttempt[] }) => {
+  const outcomeTone: Record<string, 'ok' | 'warn' | 'error' | 'neutral'> = {
+    success: 'ok',
+    error: 'error',
+    schema_invalid: 'warn',
+    skipped_unhealthy: 'warn',
+    cache_hit: 'neutral',
+  };
+  return (
+    <div className="mt-3">
+      <div className="text-[10px] uppercase tracking-wider text-tertiary-text mb-1.5">
+        Gateway trace — {attempts.length} attempt{attempts.length === 1 ? '' : 's'}
+      </div>
+      <div className="flex flex-col gap-2">
+        {attempts.map((a) => {
+          const reason =
+            a.fallback_reason && a.fallback_reason !== a.error ? a.fallback_reason : '';
+          return (
+            <div
+              key={a.id || a.seq}
+              className="border border-solid border-primary-border rounded-md overflow-hidden"
+            >
+              <div className="flex items-center gap-2 bg-secondary-bg px-3 py-2 flex-wrap">
+                <span className="font-mono text-[10px] text-tertiary-text">#{a.seq}</span>
+                <span className="text-sm font-medium text-primary-text">{a.model}</span>
+                {a.provider && <span className="text-xs text-tertiary-text">({a.provider})</span>}
+                <Badge tone={outcomeTone[a.outcome] ?? 'neutral'}>
+                  {a.outcome.replace(/_/g, ' ')}
+                </Badge>
+                {a.fallback_used && <Badge tone="warn">fallback</Badge>}
+                {a.infra_failure && <Badge tone="error">infra</Badge>}
+                {a.retry_count > 1 && <Badge tone="neutral">{a.retry_count}× tries</Badge>}
+                {a.http_status > 0 && (
+                  <span className="text-xs text-tertiary-text">HTTP {a.http_status}</span>
+                )}
+                <span className="text-xs text-tertiary-text ml-auto">
+                  {a.total_tokens.toLocaleString()} tok · {formatCost(a.cost_usd)} · {a.latency_ms}ms
+                </span>
+              </div>
+              {(a.error || reason) && (
+                <pre className="m-0 px-3 py-2 text-xs whitespace-pre-wrap break-words bg-primary-bg text-primary-text">
+                  {[a.error ? `⚠️ ${a.error}` : '', reason ? `↪ advanced to next model: ${reason}` : '']
+                    .filter(Boolean)
+                    .join('\n')}
+                </pre>
+              )}
+              {a.outcome === 'schema_invalid' && a.response && (
+                <div className="border-t border-solid border-primary-border">
+                  <div className="px-3 pt-2 text-[10px] uppercase tracking-wider text-tertiary-text">
+                    Returned (failed validation · still cost {a.total_tokens.toLocaleString()} tok ·{' '}
+                    {formatCost(a.cost_usd)})
+                  </div>
+                  <pre className="m-0 px-3 py-2 text-xs whitespace-pre-wrap break-words bg-primary-bg text-primary-text">
+                    {a.response}
+                  </pre>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 };
 
@@ -446,7 +568,7 @@ const ImagePicker = ({
         accept="image/*"
         multiple={multi}
         onChange={onPick}
-        className="text-sm text-primary-text file:mr-3 file:rounded-md file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:cursor-pointer"
+        className="text-sm text-primary-text file:mr-3 file:rounded-md file:border file:border-solid file:border-primary-border file:bg-secondary-bg file:text-primary-text file:px-3 file:py-1.5 file:cursor-pointer file:font-medium hover:file:bg-tertiary-bg"
       />
       {urls.length > 0 && (
         <div className="flex flex-wrap gap-2">

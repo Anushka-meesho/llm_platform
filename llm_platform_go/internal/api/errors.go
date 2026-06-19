@@ -53,6 +53,7 @@ const (
 	CodeNotFound            = "not_found"
 	CodeBudgetExhausted     = "budget_exhausted"
 	CodeNoModelAvailable    = "no_model_available"
+	CodeNoValidOutput       = "no_valid_output"
 	CodeDBError             = "db_error"
 	CodeInternal            = "internal"
 )

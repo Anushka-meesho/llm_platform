@@ -29,6 +29,68 @@ func InsertRun(db *sql.DB, r *types.RunRow) error {
 	return err
 }
 
+// InsertGatewayAttempt persists one model attempt within a run's fallback walk.
+// created_at is supplied so a batch of attempts from one run shares a timestamp.
+func InsertGatewayAttempt(db *sql.DB, a *types.GatewayAttempt) error {
+	_, err := db.Exec(`
+		INSERT INTO gateway_attempts
+			(run_id, task_id, seq, model, provider, outcome, fallback_used,
+			 fallback_reason, response, error, http_status, infra_failure, retry_count,
+			 latency_ms, input_tokens, output_tokens, total_tokens, cost_usd,
+			 is_test, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.RunID, a.TaskID, a.Seq, a.Model, a.Provider, a.Outcome, boolToInt(a.FallbackUsed),
+		a.FallbackReason, a.Response, a.Error, a.HTTPStatus, boolToInt(a.InfraFailure), a.RetryCount,
+		a.LatencyMs, a.InputTokens, a.OutputTokens, a.TotalTokens, a.CostUSD,
+		boolToInt(a.IsTest),
+		a.CreatedAt.UTC().Format("2006-01-02 15:04:05"),
+	)
+	return err
+}
+
+// ListGatewayAttempts returns every attempt for one run_id, in walk order.
+func ListGatewayAttempts(db *sql.DB, runID string) ([]types.GatewayAttempt, error) {
+	rows, err := db.Query(`
+		SELECT id, run_id, task_id, seq, model, provider, outcome, fallback_used,
+		       fallback_reason, response, error, http_status, infra_failure, retry_count,
+		       latency_ms, input_tokens, output_tokens, total_tokens, cost_usd,
+		       is_test, created_at
+		FROM gateway_attempts
+		WHERE run_id = ?
+		ORDER BY seq ASC, id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanGatewayAttempts(rows)
+}
+
+func scanGatewayAttempts(rows *sql.Rows) ([]types.GatewayAttempt, error) {
+	attempts := []types.GatewayAttempt{}
+	for rows.Next() {
+		var a types.GatewayAttempt
+		var taskID, response sql.NullString
+		var fallbackInt, infraInt, testInt int
+		var createdAtStr string
+		if err := rows.Scan(
+			&a.ID, &a.RunID, &taskID, &a.Seq, &a.Model, &a.Provider, &a.Outcome, &fallbackInt,
+			&a.FallbackReason, &response, &a.Error, &a.HTTPStatus, &infraInt, &a.RetryCount,
+			&a.LatencyMs, &a.InputTokens, &a.OutputTokens, &a.TotalTokens, &a.CostUSD,
+			&testInt, &createdAtStr,
+		); err != nil {
+			return nil, err
+		}
+		a.TaskID = nullStrPtr(taskID)
+		a.Response = nullStrPtr(response)
+		a.FallbackUsed = fallbackInt == 1
+		a.InfraFailure = infraInt == 1
+		a.IsTest = testInt == 1
+		a.CreatedAt = parseTime(createdAtStr)
+		attempts = append(attempts, a)
+	}
+	return attempts, rows.Err()
+}
+
 // imagesToColumn serializes a run's multimodal inputs for the runs.image TEXT
 // column: NULL when there are none, otherwise a JSON array of the data URLs /
 // image URLs. Storing an array (rather than a bare string) lets a single column
@@ -394,7 +456,21 @@ func GetRunDetail(database *sql.DB, runID string) (*types.RunDetailResponse, err
 			FallbackUsed: fallbackInt == 1,
 		})
 	}
-	return detail, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if detail == nil {
+		return nil, nil // unknown run_id
+	}
+
+	// Attach the full gateway trace: every model the fallback walk touched for
+	// this run (predictions only; playground /run rows have none).
+	attempts, err := ListGatewayAttempts(database, runID)
+	if err != nil {
+		return nil, err
+	}
+	detail.Attempts = attempts
+	return detail, nil
 }
 
 // DistinctRunModels lists the distinct models that appear in the runs table,

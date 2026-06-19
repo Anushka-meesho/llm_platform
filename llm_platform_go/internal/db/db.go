@@ -119,6 +119,42 @@ func Migrate(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_health_task_model ON model_health_events(task_id, model);
 		CREATE INDEX IF NOT EXISTS idx_health_created_at ON model_health_events(created_at);
+
+		-- gateway_attempts: the full detailed trace of every model the gateway
+		-- touched for one prediction. A single run (run_id) yields one row PER
+		-- model the fallback walk reached, in walk order (seq) — live calls,
+		-- schema-invalid responses, skipped-unhealthy models, and cache hits.
+		-- runs holds the single answer served to the caller; this table holds
+		-- everything behind it: every fallback, why it happened, the error and its
+		-- classification, retries, and the per-call latency of each model/provider.
+		CREATE TABLE IF NOT EXISTS gateway_attempts (
+			id                INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id            TEXT NOT NULL,
+			task_id           TEXT,
+			seq               INTEGER NOT NULL DEFAULT 0,  -- 0-based walk order (0 = configured primary)
+			model             TEXT NOT NULL,
+			provider          TEXT NOT NULL DEFAULT '',
+			outcome           TEXT NOT NULL,               -- success|error|schema_invalid|skipped_unhealthy|cache_hit
+			fallback_used     INTEGER NOT NULL DEFAULT 0,  -- this attempt was a fallback model (seq > 0)
+			fallback_reason   TEXT NOT NULL DEFAULT '',    -- why the walk advanced past this model ('' = served the answer)
+			response          TEXT,                        -- content the model returned (set for success/cache_hit/schema_invalid)
+			error             TEXT NOT NULL DEFAULT '',    -- classified error message
+			http_status       INTEGER NOT NULL DEFAULT 0,  -- last upstream HTTP status (0 = no response reached)
+			infra_failure     INTEGER NOT NULL DEFAULT 0,  -- provider-infra trouble (5xx/429/network)
+			retry_count       INTEGER NOT NULL DEFAULT 0,  -- upstream HTTP attempts made (1 = no retry)
+			latency_ms        INTEGER NOT NULL DEFAULT 0,  -- this model call's duration
+			input_tokens      INTEGER NOT NULL DEFAULT 0,
+			output_tokens     INTEGER NOT NULL DEFAULT 0,
+			total_tokens      INTEGER NOT NULL DEFAULT 0,
+			cost_usd          REAL    NOT NULL DEFAULT 0.0,
+			is_test           INTEGER NOT NULL DEFAULT 0,  -- Studio test-panel call, not production traffic
+			created_at        DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_attempts_run_id     ON gateway_attempts(run_id);
+		CREATE INDEX IF NOT EXISTS idx_attempts_task_id    ON gateway_attempts(task_id);
+		CREATE INDEX IF NOT EXISTS idx_attempts_model      ON gateway_attempts(model);
+		CREATE INDEX IF NOT EXISTS idx_attempts_outcome    ON gateway_attempts(outcome);
+		CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON gateway_attempts(created_at);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -143,6 +179,11 @@ func Migrate(db *sql.DB) error {
 		// Multimodal predictions: the image input (base64 data URL / image URL)
 		// submitted with the run, persisted for audit/replay. NULL for text-only runs.
 		"ALTER TABLE runs ADD COLUMN image TEXT",
+		// gateway_attempts gained a response column after the table first shipped —
+		// the content a model returned for an attempt (kept for schema-invalid
+		// attempts, where the model answered but failed validation). Guarded ALTER
+		// so databases that created the table before this column upgrade in place.
+		"ALTER TABLE gateway_attempts ADD COLUMN response TEXT",
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate alter: %w", err)

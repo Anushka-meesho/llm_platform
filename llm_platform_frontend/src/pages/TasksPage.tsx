@@ -14,6 +14,8 @@ import OutputSchemaEditor from '../components/OutputSchemaEditor';
 import VersionHistory from '../components/VersionHistory';
 import ErrorState from '../components/ErrorState';
 import { stableStringify } from '../utils/schema';
+import { buildDefaultPrompts, canBuildDefaultPrompts } from '../utils/defaultPrompts';
+import { usePersistentState, clearPersisted } from '../hooks/usePersistentState';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 import { useToast } from '../toast/context';
 
@@ -24,8 +26,11 @@ const TasksPage = () => {
   const { user } = useAuth();
   const canWrite = can(user?.role, 'task:write');
   const [tasks, setTasks] = useState<TTask[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  // The open task and the create-form toggle persist, so Tasks reopens where you
+  // left it. A persisted id for a since-deleted task harmlessly falls back to the
+  // catalog (selected resolves to null below).
+  const [selectedId, setSelectedId] = usePersistentState<string | null>('tasks.selectedId', null);
+  const [creating, setCreating] = usePersistentState('tasks.creating', false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -154,9 +159,14 @@ const TaskDetail = ({
   const canDelete = can(user?.role, 'task:delete');
   const [versions, setVersions] = useState<TPromptVersion[]>([]);
   const [stats, setStats] = useState<TTaskStatsDetail | null>(null);
-  const [draft, setDraft] = useState(task.prompt_template);
-  const [draftSystem, setDraftSystem] = useState(task.system_prompt ?? '');
-  const [note, setNote] = useState('');
+  // In-progress prompt edits persist per task (TaskDetail mounts with key={id},
+  // so the keys are stable), so an unsaved draft survives a reload.
+  const [draft, setDraft] = usePersistentState(`tasks.draft.${task.id}`, task.prompt_template);
+  const [draftSystem, setDraftSystem] = usePersistentState(
+    `tasks.draftSystem.${task.id}`,
+    task.system_prompt ?? '',
+  );
+  const [note, setNote] = usePersistentState(`tasks.note.${task.id}`, '');
   const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
@@ -183,6 +193,29 @@ const TaskDetail = ({
     [draft, draftSystem, task.model],
   );
   const draftCost = estimateCost(task.model, draftTokens, task.max_tokens);
+
+  const canGenerate = canBuildDefaultPrompts(
+    task.description,
+    task.input_schema,
+    task.output_schema,
+  );
+  const writeDefaults = () => {
+    if (
+      (draft.trim() || draftSystem.trim()) &&
+      !window.confirm(
+        "Replace the current draft prompts with defaults generated from this task's config?",
+      )
+    )
+      return;
+    const { systemPrompt, promptTemplate } = buildDefaultPrompts({
+      taskName: task.name,
+      taskDescription: task.description,
+      inputSchema: task.input_schema,
+      outputSchema: task.output_schema,
+    });
+    setDraftSystem(systemPrompt);
+    setDraft(promptTemplate);
+  };
 
   const saveDraft = async () => {
     setBusy('save');
@@ -278,6 +311,9 @@ const TaskDetail = ({
         </div>
       )}
 
+      {/* Identity (name + description; id is immutable) */}
+      <IdentitySection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
+
       {/* Model routing */}
       <ModelSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
@@ -289,6 +325,26 @@ const TaskDetail = ({
 
       {/* Prompt editor */}
       <Section title="Prompt editor">
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <Typography variant="body" size="1" className="text-tertiary-text">
+            Generate a starting draft from this task's description and input/output schema, then edit.
+          </Typography>
+          <Button
+            variant="outline"
+            size="s"
+            disabled={!canGenerate || !canWrite}
+            onClick={writeDefaults}
+            title={
+              !canWrite
+                ? 'Your role cannot edit prompts'
+                : canGenerate
+                  ? 'Fill the system and user prompts from the input/output schema'
+                  : 'This task has no input or output schema to generate from'
+            }
+          >
+            ✨ Write default prompts from configs
+          </Button>
+        </div>
         <Typography variant="body" size="1" className="text-tertiary-text mb-1">
           System prompt
         </Typography>
@@ -370,23 +426,32 @@ const CreateTaskForm = ({
   onCreated: (id: string) => Promise<void>;
   onCancel: () => void;
 }) => {
-  const [id, setId] = useState('');
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [systemPrompt, setSystemPrompt] = useState('');
-  const [promptTemplate, setPromptTemplate] = useState('');
-  const [model, setModel] = useState('');
-  const [fallbacks, setFallbacks] = useState<string[]>([]);
-  const [temperature, setTemperature] = useState('0.2');
-  const [maxTokens, setMaxTokens] = useState('1000');
-  const [dailyBudget, setDailyBudget] = useState('');
-  const [cacheEnabled, setCacheEnabled] = useState(true);
-  const [cacheTtlHours, setCacheTtlHours] = useState('24');
+  // The whole new-task draft persists under the tasks.create.* namespace, so a
+  // partially filled form survives a reload; it's cleared once the task is
+  // created (clearPersisted in submit).
+  const [id, setId] = usePersistentState('tasks.create.id', '');
+  const [name, setName] = usePersistentState('tasks.create.name', '');
+  const [description, setDescription] = usePersistentState('tasks.create.description', '');
+  const [systemPrompt, setSystemPrompt] = usePersistentState('tasks.create.systemPrompt', '');
+  const [promptTemplate, setPromptTemplate] = usePersistentState('tasks.create.promptTemplate', '');
+  const [model, setModel] = usePersistentState('tasks.create.model', '');
+  const [fallbacks, setFallbacks] = usePersistentState<string[]>('tasks.create.fallbacks', []);
+  const [temperature, setTemperature] = usePersistentState('tasks.create.temperature', '0.2');
+  const [maxTokens, setMaxTokens] = usePersistentState('tasks.create.maxTokens', '1000');
+  const [dailyBudget, setDailyBudget] = usePersistentState('tasks.create.dailyBudget', '');
+  const [cacheEnabled, setCacheEnabled] = usePersistentState('tasks.create.cacheEnabled', true);
+  const [cacheTtlHours, setCacheTtlHours] = usePersistentState('tasks.create.cacheTtlHours', '24');
 
-  const [inputEnabled, setInputEnabled] = useState(false);
-  const [outputEnabled, setOutputEnabled] = useState(false);
-  const [input, setInput] = useState<SchemaEditorState>({ schema: EMPTY_OBJECT_SCHEMA, valid: true });
-  const [output, setOutput] = useState<SchemaEditorState>({ schema: EMPTY_OBJECT_SCHEMA, valid: true });
+  const [inputEnabled, setInputEnabled] = usePersistentState('tasks.create.inputEnabled', false);
+  const [outputEnabled, setOutputEnabled] = usePersistentState('tasks.create.outputEnabled', false);
+  const [input, setInput] = usePersistentState<SchemaEditorState>('tasks.create.input', {
+    schema: EMPTY_OBJECT_SCHEMA,
+    valid: true,
+  });
+  const [output, setOutput] = usePersistentState<SchemaEditorState>('tasks.create.output', {
+    schema: EMPTY_OBJECT_SCHEMA,
+    valid: true,
+  });
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -412,6 +477,28 @@ const CreateTaskForm = ({
   // an existing fallback.
   const usedModels = [model, ...fallbacks].filter(Boolean);
 
+  // Prefill the prompts from the schemas the author just defined, so they start
+  // from a working draft instead of a blank page. Only the enabled schemas feed
+  // it, and we confirm before clobbering anything already typed.
+  const liveInput = inputEnabled ? (input.schema as Record<string, unknown>) : null;
+  const liveOutput = outputEnabled ? (output.schema as Record<string, unknown>) : null;
+  const canGenerate = canBuildDefaultPrompts(description, liveInput, liveOutput);
+  const writeDefaults = () => {
+    if (
+      (systemPrompt.trim() || promptTemplate.trim()) &&
+      !window.confirm('Replace the current prompts with defaults generated from the task config?')
+    )
+      return;
+    const { systemPrompt: sp, promptTemplate: pt } = buildDefaultPrompts({
+      taskName: name.trim() || id.trim(),
+      taskDescription: description,
+      inputSchema: liveInput,
+      outputSchema: liveOutput,
+    });
+    setSystemPrompt(sp);
+    setPromptTemplate(pt);
+  };
+
   const submit = async () => {
     setBusy(true);
     setErr(null);
@@ -435,6 +522,9 @@ const CreateTaskForm = ({
         output_schema: outputEnabled ? (output.schema as Record<string, unknown>) : undefined,
       };
       await api.createTask(payload);
+      // The draft is committed — discard the persisted copy so it doesn't
+      // resurface the next time the create form is opened.
+      clearPersisted('tasks.create.');
       await onCreated(id);
     } catch (e) {
       setErr(errorMessage(e));
@@ -653,6 +743,24 @@ const CreateTaskForm = ({
       </Section>
 
       <Section title="Prompt">
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <Typography variant="body" size="1" className="text-tertiary-text">
+            Start from defaults generated from the description and input/output schema below, then edit.
+          </Typography>
+          <Button
+            variant="outline"
+            size="s"
+            disabled={!canGenerate}
+            onClick={writeDefaults}
+            title={
+              canGenerate
+                ? 'Fill the system and user prompts from the input/output schema'
+                : 'Define an input or output schema below first'
+            }
+          >
+            ✨ Write default prompts from configs
+          </Button>
+        </div>
         <Typography variant="body" size="1" className="text-tertiary-text mb-1">
           System prompt (optional)
         </Typography>
@@ -857,6 +965,93 @@ const SchemaPane = ({
 // on the model, so stale answers can't leak. At call time, models with an
 // open circuit are skipped instantly; the background prober re-engages a
 // higher-priority model once it's healthy again.
+// IdentitySection edits a task's human-facing name and description. The id is
+// the task's primary key — it pins runs, cache entries, and integration URLs, so
+// the backend refuses to change it (a rename is effectively a new task); it's
+// shown read-only. The description matters beyond docs: it drives the "write
+// default prompts" generator, so editing it here improves generated prompts.
+const IdentitySection = ({
+  task,
+  onSaved,
+  setFlash,
+  canWrite,
+}: {
+  task: TTask;
+  onSaved: () => Promise<void>;
+  setFlash: (msg: string) => void;
+  canWrite: boolean;
+}) => {
+  const [name, setName] = useState(task.name);
+  const [description, setDescription] = useState(task.description ?? '');
+  const [saving, setSaving] = useState(false);
+
+  const dirty = name !== task.name || description !== (task.description ?? '');
+  const nameValid = name.trim() !== '';
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateTask(task.id, { name: name.trim(), description: description.trim() });
+      setFlash('Task name and description updated.');
+      await onSaved();
+    } catch (e) {
+      setFlash(e instanceof Error ? e.message : 'Update failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Identity">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <label className="block">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Task id (immutable)
+          </Typography>
+          <input className={cn(INPUT_CLS, 'opacity-60 cursor-not-allowed')} value={task.id} readOnly disabled />
+          <Typography variant="body" size="1" className="text-tertiary-text mt-0.5">
+            The id keys runs, cache, and integration URLs — create a new task to change it.
+          </Typography>
+        </label>
+        <label className="block">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Name
+          </Typography>
+          <input
+            className={INPUT_CLS}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={!canWrite}
+            placeholder="Human-readable name"
+          />
+        </label>
+      </div>
+      <label className="block mt-3">
+        <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+          Description — describe what the task should do; it drives the default-prompt generator
+        </Typography>
+        <TextArea
+          value={description}
+          onChange={({ value }) => setDescription(value)}
+          rows={3}
+          disabled={!canWrite}
+        />
+      </label>
+      <div className="mt-3">
+        <Button
+          variant="primary"
+          size="s"
+          disabled={!dirty || saving || !nameValid || !canWrite}
+          onClick={save}
+          title={canWrite ? undefined : 'Your role cannot edit this task'}
+        >
+          {saving ? 'Saving…' : 'Save identity'}
+        </Button>
+      </div>
+    </Section>
+  );
+};
+
 const ModelSection = ({
   task,
   onSaved,

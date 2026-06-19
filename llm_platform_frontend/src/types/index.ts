@@ -215,6 +215,44 @@ export type TRunDetailResult = {
   fallback_used: boolean;
 };
 
+// A single model the gateway touched during one run's fallback walk. A run
+// produces one per model reached, in walk order (seq) — the detailed trace
+// behind the single answer served: every fallback, why it happened, the error
+// and its classification, retries, and per-call latency.
+export type TAttemptOutcome =
+  | 'success'
+  | 'error'
+  | 'schema_invalid'
+  | 'skipped_unhealthy'
+  | 'cache_hit';
+
+export type TGatewayAttempt = {
+  id: number;
+  run_id: string;
+  task_id: string | null;
+  seq: number;
+  model: string;
+  provider: string;
+  outcome: TAttemptOutcome;
+  fallback_used: boolean;
+  fallback_reason: string;
+  // What the model returned for this attempt, when any — present for a schema
+  // failure (the model answered but failed validation), so the wasted output
+  // and its cost are visible in the trace. null for errors/skips.
+  response: string | null;
+  error: string;
+  http_status: number;
+  infra_failure: boolean;
+  retry_count: number;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  is_test: boolean;
+  created_at: string;
+};
+
 export type TRunDetail = {
   run_id: string;
   task_id: string | null;
@@ -227,6 +265,9 @@ export type TRunDetail = {
   is_test: boolean;
   created_at: string;
   results: TRunDetailResult[];
+  // Gateway trace: every model the fallback walk touched for this run, in walk
+  // order. Present for predictions; empty for playground /run rows.
+  attempts: TGatewayAttempt[];
 };
 
 export type TRunFilters = {

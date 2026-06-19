@@ -81,6 +81,12 @@ func main() {
 	runWriter := db.NewRunWriter(database, 0)
 	defer runWriter.Close()
 
+	// Async gateway-trace writer — one row per model the fallback walk touches,
+	// off the hot path like runWriter. Captures every fallback, its reason, the
+	// error and its classification, retries, and per-call latency for each run.
+	attemptWriter := db.NewGatewayAttemptWriter(database, 0)
+	defer attemptWriter.Close()
+
 	// Per-(task, model) circuit breaker — skips a model in a task's fallback
 	// chain after repeated failures (provider errors OR schema-invalid output),
 	// with exponential backoff and admin reset. Transitions persist to
@@ -120,13 +126,14 @@ func main() {
 	}
 
 	router := api.NewRouter(api.RouterDeps{
-		DB:      database,
-		Clients: clients,
-		Users:   userStore,
-		Tasks:   taskStore,
-		Runs:    runWriter,
-		Cache:   predictionCache,
-		Health:  healthTracker,
+		DB:       database,
+		Clients:  clients,
+		Users:    userStore,
+		Tasks:    taskStore,
+		Runs:     runWriter,
+		Attempts: attemptWriter,
+		Cache:    predictionCache,
+		Health:   healthTracker,
 		Auth: api.AuthConfig{
 			Secret:      []byte(cfg.JWTSecret),
 			CookieName:  cfg.AuthCookieName,

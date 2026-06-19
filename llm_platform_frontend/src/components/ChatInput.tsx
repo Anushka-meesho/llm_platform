@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useMemo } from 'react';
 import { Button, TextArea, Spinner } from '@meesho/merlin-ui-tailwind';
 import type { TUIMessage } from '../types';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
+import { usePersistentState } from '../hooks/usePersistentState';
 
 type TChatInputProps = {
   onSubmit: (text: string, files: File[]) => Promise<void>;
@@ -22,7 +23,9 @@ const ChatInput = ({
   maxOutputTokens,
   setMaxOutputTokens,
 }: TChatInputProps) => {
-  const [text, setText] = useState('');
+  // The unsent message draft persists so a half-typed prompt survives a reload.
+  // Attached files are File objects (not serializable), so they stay in-memory.
+  const [text, setText] = usePersistentState('compare.draftMessage', '');
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [showBudget, setShowBudget] = useState(false);
@@ -53,7 +56,7 @@ const ChatInput = ({
     setFiles([]);
     setPreviews([]);
     await onSubmit(t, f);
-  }, [text, files, isLoading, onSubmit]);
+  }, [text, files, isLoading, onSubmit, setText]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

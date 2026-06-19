@@ -63,21 +63,49 @@ type predictOutcome struct {
 	GatewayLatencyMs int
 }
 
-// logUpstreamFailure records a 502 (the model chain produced no usable result)
-// with the request id, task, attributed model, and the provider error, and
-// echoes the request id in the response header — so an upstream failure is as
-// traceable as any other error even though the body is the predict response.
+// servedValid reports whether the prediction produced an answer that is safe to
+// hand back as the result: the model chain succeeded AND, when the task has an
+// output schema, the served output passed it. A schema-invalid output is still
+// fully stored (the run row keeps the raw response, the gateway trace keeps
+// every model's output), but it is NOT a valid answer — the API surfaces it as
+// an error rather than returning invalid data as if it were the result.
+func (o *predictOutcome) servedValid() bool {
+	return o.Result.Success && (o.OutputValid == nil || *o.OutputValid)
+}
+
+// failureReason returns the stable error code and client-facing message for an
+// outcome that produced no valid answer, or ("","") when the outcome is fine.
+// It distinguishes "no model produced a usable response at all" from "models
+// answered but none passed the task's output schema".
+func (o *predictOutcome) failureReason() (code, msg string) {
+	if o.servedValid() {
+		return "", ""
+	}
+	if !o.Result.Success {
+		detail := "no usable model for this task"
+		if o.Result.Error != nil {
+			detail = *o.Result.Error
+		}
+		return CodeNoModelAvailable, detail
+	}
+	return CodeNoValidOutput,
+		"no valid response: the model output did not match the task's output schema"
+}
+
+// logUpstreamFailure records a 502 (the model chain produced no usable result —
+// either no model responded, or none produced schema-valid output) with the
+// request id, task, attributed model, and the reason, and echoes the request id
+// in the response header — so an upstream failure is as traceable as any other
+// error even though the body is the predict response.
 func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, outcome *predictOutcome) {
 	reqID := chimw.GetReqID(r.Context())
 	if reqID != "" {
 		w.Header().Set("X-Request-ID", reqID)
 	}
-	detail := "unknown upstream error"
+	code, detail := CodeNoModelAvailable, "unknown upstream error"
 	model := ""
 	if outcome != nil {
-		if outcome.Result.Error != nil {
-			detail = *outcome.Result.Error
-		}
+		code, detail = outcome.failureReason()
 		model = outcome.Result.Model
 	}
 	slog.Error("upstream prediction failed",
@@ -85,7 +113,7 @@ func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, o
 		"path", r.URL.Path,
 		"task", taskID,
 		"model", model,
-		"code", CodeNoModelAvailable,
+		"code", code,
 		"status", http.StatusBadGateway,
 		"error", detail,
 	)
@@ -222,10 +250,16 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	result := llm.CallWithFallbackOpts(ctx, h.Clients, models, messages,
 		float32(task.Temperature), task.MaxTokens, fbOpts)
 
+	// One run id ties the answer (runs row) to its full gateway trace (one
+	// gateway_attempts row per model the walk touched). Generated before the
+	// cache branch so a cache-hit run and its trace share the same id.
+	runID := uuid.New().String()
+	h.recordAttempts(runID, &task.ID, result.Attempts, opts.isTest)
+
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		cached := h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
+		cached := h.serveCached(runID, task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
 		cached.GatewayLatencyMs = int(time.Since(gatewayStart).Milliseconds())
 		return cached, nil
 	}
@@ -267,7 +301,6 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
-	runID := uuid.New().String()
 	userID, userEmail := user.Subject, user.Email
 	var sysPrompt *string
 	if renderTask.SystemPrompt != "" {
@@ -317,7 +350,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 // still gets a run row (cache_hit=1) so attribution and hit-rate stay
 // observable, but with zero cost/tokens — nothing was consumed upstream, and
 // the budget gate must not count replayed answers as spend.
-func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, images []string,
+func (h *Handler) serveCached(runID string, task *tasks.Task, prompt, systemPrompt string, images []string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
@@ -333,7 +366,6 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, ima
 		Degraded:     fellBack,
 	}
 
-	runID := uuid.New().String()
 	userID, userEmail := user.Subject, user.Email
 	var sysPrompt *string
 	if systemPrompt != "" {
@@ -379,6 +411,46 @@ func (h *Handler) insertRun(row *types.RunRow) {
 	_ = db.InsertRun(h.DB, row)
 }
 
+// recordAttempts persists the gateway trace for one run: one gateway_attempts
+// row per model the fallback walk touched, in walk order. Like insertRun it
+// prefers the async writer and never fails the prediction on a trace error. A
+// run with no attempts (e.g. no models configured) writes nothing.
+func (h *Handler) recordAttempts(runID string, taskID *string, attempts []llm.Attempt, isTest bool) {
+	if len(attempts) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for _, a := range attempts {
+		row := &types.GatewayAttempt{
+			RunID:          runID,
+			TaskID:         taskID,
+			Seq:            a.Seq,
+			Model:          a.Model,
+			Provider:       a.Provider,
+			Outcome:        a.Outcome,
+			FallbackUsed:   a.FallbackUsed,
+			FallbackReason: a.FallbackReason,
+			Response:       a.Response,
+			Error:          a.Error,
+			HTTPStatus:     a.HTTPStatus,
+			InfraFailure:   a.InfraFailure,
+			RetryCount:     a.RetryCount,
+			LatencyMs:      a.LatencyMs,
+			InputTokens:    a.InputTokens,
+			OutputTokens:   a.OutputTokens,
+			TotalTokens:    a.TotalTokens,
+			CostUSD:        a.CostUSD,
+			IsTest:         isTest,
+			CreatedAt:      now,
+		}
+		if h.Attempts != nil {
+			h.Attempts.Write(row)
+		} else {
+			_ = db.InsertGatewayAttempt(h.DB, row)
+		}
+	}
+}
+
 // collectImages gathers the multimodal inputs from a request, in submission
 // order: a single "image" string (legacy single-image contract) first, then any
 // entries of an "images" array. Blank entries are dropped. Both keys are
@@ -400,13 +472,16 @@ func collectImages(inputMap map[string]any) []string {
 }
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.
+// Only a valid answer is returned as the result: if no model produced one
+// (every model failed, was unhealthy, or returned schema-invalid output) the
+// response carries a stable error_code and message and `output` stays null, so
+// callers never receive an invalid response dressed up as the answer. The raw
+// response is still echoed for debugging, and everything is persisted regardless.
 func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
-	// A failed result means the whole model chain proved unusable for this task
-	// (every model failed, was unhealthy, or returned schema-invalid output) —
-	// surface a stable code so callers can branch on "no model worked".
-	errorCode := ""
-	if !o.Result.Success {
-		errorCode = CodeNoModelAvailable
+	errorCode, errMsg := o.failureReason()
+	errPtr := o.Result.Error
+	if errPtr == nil && errMsg != "" {
+		errPtr = &errMsg
 	}
 	return predictResponse{
 		TaskRunID:     o.RunID,
@@ -417,7 +492,7 @@ func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
 		Output:        o.Output,
 		OutputValid:   o.OutputValid,
 		RawResponse:   o.Result.Response,
-		Error:         o.Result.Error,
+		Error:         errPtr,
 		ErrorCode:     errorCode,
 		FallbackUsed:  o.Result.FallbackUsed,
 		Cached:        o.CacheHit,
