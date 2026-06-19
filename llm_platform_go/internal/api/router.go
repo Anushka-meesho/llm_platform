@@ -9,6 +9,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/schema"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
@@ -24,23 +25,27 @@ type RouterDeps struct {
 	Clients        *llm.Clients
 	Users          users.Store
 	Tasks          *tasks.Store
-	Runs           *db.RunWriter   // optional async observability writer
-	Cache          cache.Cache     // optional prediction cache; nil → caching off
-	Health         *health.Tracker // optional per-(task, model) circuit breaker
+	Runs           *db.RunWriter            // optional async observability writer
+	Attempts       *db.GatewayAttemptWriter // optional async gateway-trace writer
+	Cache          cache.Cache              // optional prediction cache; nil → caching off
+	Health         *health.Tracker          // optional per-(task, model) circuit breaker
+	Limiter        *ratelimit.Limiter       // optional per-task request/token rate limiter
 	Auth           AuthConfig
 	AllowedOrigins []string // CORS — the frontend origin(s)
 }
 
 func NewRouter(deps RouterDeps) http.Handler {
 	h := &Handler{
-		DB:      deps.DB,
-		Clients: deps.Clients,
-		Users:   deps.Users,
-		Tasks:   deps.Tasks,
-		Runs:    deps.Runs,
-		Cache:   deps.Cache,
-		Health:  deps.Health,
-		Auth:    deps.Auth,
+		DB:       deps.DB,
+		Clients:  deps.Clients,
+		Users:    deps.Users,
+		Tasks:    deps.Tasks,
+		Runs:     deps.Runs,
+		Attempts: deps.Attempts,
+		Cache:    deps.Cache,
+		Health:   deps.Health,
+		Limiter:  deps.Limiter,
+		Auth:     deps.Auth,
 	}
 
 	// Request-body schemas (embedded YAML). v(name) is the per-route validation

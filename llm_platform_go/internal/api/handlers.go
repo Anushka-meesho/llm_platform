@@ -12,6 +12,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
 	"llm_platform_go/internal/users"
@@ -32,14 +33,16 @@ type AuthConfig struct {
 }
 
 type Handler struct {
-	DB      *sql.DB
-	Clients *llm.Clients
-	Users   users.Store
-	Tasks   *tasks.Store
-	Runs    *db.RunWriter   // async observability writer; nil → synchronous inserts
-	Cache   cache.Cache     // prediction cache; nil → caching off
-	Health  *health.Tracker // per-(task, model) circuit breaker; nil → no gating
-	Auth    AuthConfig
+	DB       *sql.DB
+	Clients  *llm.Clients
+	Users    users.Store
+	Tasks    *tasks.Store
+	Runs     *db.RunWriter            // async observability writer; nil → synchronous inserts
+	Attempts *db.GatewayAttemptWriter // async gateway-trace writer; nil → synchronous inserts
+	Cache    cache.Cache              // prediction cache; nil → caching off
+	Health   *health.Tracker          // per-(task, model) circuit breaker; nil → no gating
+	Limiter  *ratelimit.Limiter       // per-task request/token rate limiter; nil/disabled → no gating
+	Auth     AuthConfig
 
 	spend spendCache // budget gate's in-memory daily-spend view (no hot-path SUM)
 }

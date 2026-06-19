@@ -17,6 +17,9 @@ type AppError struct {
 	Code    string
 	Message string
 	cause   error
+	// RetryAfter, when > 0, is written as the Retry-After response header (in
+	// seconds) — used by the rate/budget limiters so a client knows when to retry.
+	RetryAfter int
 }
 
 func (e *AppError) Error() string {
@@ -32,6 +35,13 @@ func (e *AppError) Unwrap() error { return e.cause }
 // receiver so it chains: Internal(CodeDBError, "load task %q", id).WithCause(err).
 func (e *AppError) WithCause(err error) *AppError {
 	e.cause = err
+	return e
+}
+
+// WithRetryAfter sets the Retry-After hint (seconds). Returns the receiver so it
+// chains: TooMany(code, msg).WithRetryAfter(30).
+func (e *AppError) WithRetryAfter(seconds int) *AppError {
+	e.RetryAfter = seconds
 	return e
 }
 
@@ -53,6 +63,10 @@ const (
 	CodeNotFound            = "not_found"
 	CodeBudgetExhausted     = "budget_exhausted"
 	CodeNoModelAvailable    = "no_model_available"
+	CodeNoValidOutput       = "no_valid_output"
+	CodeInputTooLarge       = "input_too_large"
+	CodeRateLimited         = "request_rate_exceeded"
+	CodeTokenBudget         = "token_budget_exhausted"
 	CodeDBError             = "db_error"
 	CodeInternal            = "internal"
 )
@@ -84,6 +98,9 @@ func Unprocessable(code, format string, args ...any) *AppError {
 }
 func TooMany(code, format string, args ...any) *AppError {
 	return newAppError(http.StatusTooManyRequests, code, format, args...)
+}
+func PayloadTooLarge(code, format string, args ...any) *AppError {
+	return newAppError(http.StatusRequestEntityTooLarge, code, format, args...)
 }
 func BadGateway(code, format string, args ...any) *AppError {
 	return newAppError(http.StatusBadGateway, code, format, args...)

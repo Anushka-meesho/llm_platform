@@ -163,7 +163,9 @@ type RunDetailResult struct {
 
 // RunDetailResponse is the full record for one run_id, shared prompt/inputs on
 // top and per-model results below. Images carry the full data URLs (this is the
-// only endpoint that returns them).
+// only endpoint that returns them). Attempts is the gateway trace: every model
+// the fallback walk touched for this run, in order — present for prediction
+// runs, empty for playground /run rows.
 type RunDetailResponse struct {
 	RunID         string            `json:"run_id"`
 	TaskID        *string           `json:"task_id"`
@@ -176,6 +178,37 @@ type RunDetailResponse struct {
 	IsTest        bool              `json:"is_test"`
 	CreatedAt     time.Time         `json:"created_at"`
 	Results       []RunDetailResult `json:"results"`
+	Attempts      []GatewayAttempt  `json:"attempts"`
+}
+
+// GatewayAttempt is one model the gateway touched for a single prediction — one
+// row of the gateway_attempts table and the API shape served in a run's detail.
+// A run produces one per model the fallback walk reached, in walk order.
+type GatewayAttempt struct {
+	ID             int       `json:"id"`
+	RunID          string    `json:"run_id"`
+	TaskID         *string   `json:"task_id"`
+	Seq            int       `json:"seq"`
+	Model          string    `json:"model"`
+	Provider       string    `json:"provider"`
+	Outcome        string    `json:"outcome"` // success|error|schema_invalid|skipped_unhealthy|cache_hit
+	FallbackUsed   bool      `json:"fallback_used"`
+	FallbackReason string    `json:"fallback_reason"`
+	// Response is the content the model returned for this attempt, when any — set
+	// for success, cache_hit, and (crucially) schema_invalid, so the output that
+	// failed validation is preserved in the trace. nil for errors/skips.
+	Response       *string   `json:"response"`
+	Error          string    `json:"error"`
+	HTTPStatus     int       `json:"http_status"`
+	InfraFailure   bool      `json:"infra_failure"`
+	RetryCount     int       `json:"retry_count"`
+	LatencyMs      int       `json:"latency_ms"`
+	InputTokens    int       `json:"input_tokens"`
+	OutputTokens   int       `json:"output_tokens"`
+	TotalTokens    int       `json:"total_tokens"`
+	CostUSD        float64   `json:"cost_usd"`
+	IsTest         bool      `json:"is_test"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ── Model health (per-(task, model) circuit breaker) ──────────────────────────

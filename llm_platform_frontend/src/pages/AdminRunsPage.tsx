@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Typography, Spinner, Button, cn } from '@meesho/merlin-ui-tailwind';
 import type {
   TRunListItem,
@@ -6,8 +6,11 @@ import type {
   TRunDetail,
   TRunFilters,
   TTask,
+  TGatewayAttempt,
+  TAttemptOutcome,
 } from '../types';
 import { api, ApiError, errorMessage } from '../api/client';
+import { usePersistentState } from '../hooks/usePersistentState';
 import ErrorState from '../components/ErrorState';
 import { formatCost } from '../utils/tokens';
 
@@ -17,7 +20,12 @@ import { formatCost } from '../utils/tokens';
 // elegant no matter how large the underlying prompts or base64 images are; the
 // full prompt / responses / images load on demand in the detail drawer.
 const AdminRunsPage = () => {
-  const [filters, setFilters] = useState<TRunFilters>({ page: 1, pageSize: 25 });
+  // Filters and the auto-refresh toggle persist, so the history view returns with
+  // the same search/page/filters after a reload.
+  const [filters, setFilters] = usePersistentState<TRunFilters>('history.filters', {
+    page: 1,
+    pageSize: 25,
+  });
   const [data, setData] = useState<TRunListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -26,6 +34,12 @@ const AdminRunsPage = () => {
   const [tasks, setTasks] = useState<TTask[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [autoRefresh, setAutoRefresh] = usePersistentState('history.autoRefresh', true);
+
+  // Root ref lets the auto-refresh poll detect when this tab isn't actually on
+  // screen: tabs are kept mounted and hidden via display:none when inactive, so
+  // offsetParent is null then — no point polling the server in the background.
+  const rootRef = useRef<HTMLDivElement>(null);
 
   // Filter dropdown options — best-effort, the page works without them.
   useEffect(() => {
@@ -65,6 +79,19 @@ const AdminRunsPage = () => {
     return () => clearTimeout(t);
   }, [load]);
 
+  // Auto-refresh: poll the current page every 10s so new runs show up without a
+  // manual reload. Skipped while the tab is off screen (this in-app tab hidden,
+  // or the browser tab backgrounded) to avoid pointless background traffic.
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      if (rootRef.current && rootRef.current.offsetParent === null) return;
+      load();
+    }, 10000);
+    return () => clearInterval(id);
+  }, [autoRefresh, load]);
+
   // Merge a filter patch; any change other than page resets to page 1.
   const patch = (p: Partial<TRunFilters>) =>
     setFilters((prev) => ({ ...prev, ...p, page: p.page ?? 1 }));
@@ -83,7 +110,7 @@ const AdminRunsPage = () => {
   const page = filters.page ?? 1;
 
   return (
-    <div className="flex-1 overflow-y-auto bg-primary-bg p-6">
+    <div ref={rootRef} className="flex-1 overflow-y-auto bg-primary-bg p-6">
       <div className="mx-auto max-w-6xl flex flex-col gap-5">
         <div>
           <Typography variant="heading" size="6" className="text-primary-text">
@@ -166,11 +193,26 @@ const AdminRunsPage = () => {
 
         {/* Table */}
         <div className="border border-solid border-primary-border rounded-lg overflow-hidden">
-          <div className="bg-secondary-bg px-4 py-2.5 flex items-center justify-between">
-            <Typography variant="body" size="2" className="text-primary-text font-semi-bold">
-              {data ? `${data.total_runs.toLocaleString()} runs` : 'Runs'}
-            </Typography>
-            {loading && <Spinner />}
+          <div className="bg-secondary-bg px-4 py-2.5 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Typography variant="body" size="2" className="text-primary-text font-semi-bold">
+                {data ? `${data.total_runs.toLocaleString()} runs` : 'Runs'}
+              </Typography>
+              {loading && <Spinner />}
+            </div>
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-1.5 text-xs text-secondary-text cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                />
+                Auto-refresh
+              </label>
+              <Button variant="outline" size="s" onClick={load} disabled={loading}>
+                ↻ Refresh
+              </Button>
+            </div>
           </div>
 
           <div className="overflow-x-auto">
@@ -409,6 +451,24 @@ const RunDetailDrawer = ({ runId, onClose }: { runId: string; onClose: () => voi
                   ))}
                 </div>
               </DetailSection>
+
+              {/* Gateway trace — every model the fallback walk touched for this
+                  run, in order: each fallback, why it happened, the error and
+                  its classification, retries, and per-call latency. Empty for
+                  playground /run rows, so the section hides itself. */}
+              {detail.attempts.length > 0 && (
+                <DetailSection
+                  title={`Gateway trace (${detail.attempts.length} ${
+                    detail.attempts.length === 1 ? 'attempt' : 'attempts'
+                  })`}
+                >
+                  <div className="flex flex-col gap-3">
+                    {detail.attempts.map((a) => (
+                      <AttemptCard key={a.id || a.seq} attempt={a} />
+                    ))}
+                  </div>
+                </DetailSection>
+              )}
             </>
           )}
         </div>
@@ -473,6 +533,65 @@ const Pill = ({ tone, children }: { tone: Tone; children: ReactNode }) => (
     {children}
   </span>
 );
+
+// How each gateway-attempt outcome reads as a status pill: green = served the
+// answer, red = hard failure, amber = recoverable (validation/skip), neutral =
+// served from cache without a provider call.
+const OUTCOME_TONE: Record<TAttemptOutcome, Tone> = {
+  success: 'ok',
+  error: 'error',
+  schema_invalid: 'warn',
+  skipped_unhealthy: 'warn',
+  cache_hit: 'neutral',
+};
+
+// AttemptCard renders one model the gateway touched: a header strip of the
+// model/provider, outcome and modifier pills, and the per-call metrics, with
+// the error and/or fallback reason below when the walk advanced past it.
+const AttemptCard = ({ attempt: a }: { attempt: TGatewayAttempt }) => {
+  // The error message and the reason the walk advanced are often the same
+  // string (an infra error is its own fallback reason) — show the reason only
+  // when it adds something the error line didn't already say.
+  const lines: string[] = [];
+  if (a.error) lines.push(`⚠️ ${a.error}`);
+  if (a.fallback_reason && a.fallback_reason !== a.error)
+    lines.push(`↪ advanced to next model: ${a.fallback_reason}`);
+
+  // A schema-invalid attempt didn't serve the answer, but the model still
+  // answered (and we still paid for it). Surface that returned content — it's
+  // not shown anywhere else, unlike the served answer which appears in Results.
+  const showReturned = a.response != null && a.response !== '' && a.outcome === 'schema_invalid';
+
+  return (
+    <div className="border border-solid border-primary-border rounded-md overflow-hidden">
+      <div className="flex items-center gap-2 flex-wrap bg-secondary-bg px-3 py-2">
+        <span className="font-mono text-[10px] text-tertiary-text">#{a.seq}</span>
+        <span className="text-sm font-medium text-primary-text">{a.model}</span>
+        {a.provider && <span className="text-xs text-tertiary-text">({a.provider})</span>}
+        <Pill tone={OUTCOME_TONE[a.outcome]}>{a.outcome.replace(/_/g, ' ')}</Pill>
+        {a.fallback_used && <Pill tone="warn">fallback</Pill>}
+        {a.infra_failure && <Pill tone="error">infra</Pill>}
+        {a.retry_count > 1 && <Pill tone="neutral">{a.retry_count}× tries</Pill>}
+        {a.http_status > 0 && (
+          <span className="text-xs text-tertiary-text">HTTP {a.http_status}</span>
+        )}
+        <span className="ml-auto text-xs text-tertiary-text">
+          {a.total_tokens.toLocaleString()} tok · {formatCost(a.cost_usd)} · {a.latency_ms}ms
+        </span>
+      </div>
+      {lines.length > 0 && <Pre>{lines.join('\n')}</Pre>}
+      {showReturned && (
+        <div className="border-t border-solid border-primary-border">
+          <div className="flex items-center gap-2 px-3 pt-2 text-[10px] uppercase tracking-wider text-tertiary-text">
+            Returned content (failed validation · still cost{' '}
+            {a.total_tokens.toLocaleString()} tok · {formatCost(a.cost_usd)})
+          </div>
+          <Pre>{a.response}</Pre>
+        </div>
+      )}
+    </div>
+  );
+};
 
 const Th = ({ children, right }: { children: ReactNode; right?: boolean }) => (
   <th className={`px-4 py-2 ${right ? 'text-right' : 'text-left'}`}>

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
 
@@ -28,6 +29,9 @@ func writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	reqID := chimw.GetReqID(r.Context())
 	if reqID != "" {
 		w.Header().Set("X-Request-ID", reqID)
+	}
+	if ae.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(ae.RetryAfter))
 	}
 
 	attrs := []any{

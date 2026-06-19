@@ -14,6 +14,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/types"
 
@@ -44,6 +45,7 @@ type predictOptions struct {
 	overrideVersion *tasks.PromptVersion // test a specific prompt version instead of the active one
 	overrideModel   string               // test a specific model instead of the task's chain
 	useCache        bool                 // production predicts only — test/shadow always run fresh
+	enforceLimits   bool                 // apply the per-task request/token rate limiter (production predicts)
 }
 
 // predictOutcome is everything a prediction produced, shared by the Predict,
@@ -63,21 +65,78 @@ type predictOutcome struct {
 	GatewayLatencyMs int
 }
 
-// logUpstreamFailure records a 502 (the model chain produced no usable result)
-// with the request id, task, attributed model, and the provider error, and
-// echoes the request id in the response header — so an upstream failure is as
-// traceable as any other error even though the body is the predict response.
+// limiterError maps a rate-limiter rejection to the right HTTP error: an
+// oversized input is a deterministic 413 (retrying won't help — shrink it),
+// while a request-rate or token-budget breach is a transient 429 carrying a
+// Retry-After hint for when the task's window refills.
+func limiterError(d ratelimit.Decision) *AppError {
+	switch d.Code {
+	case ratelimit.InputTooLarge:
+		return PayloadTooLarge(CodeInputTooLarge, "%s", d.Message)
+	case ratelimit.RequestRate:
+		return TooMany(CodeRateLimited, "%s", d.Message).
+			WithRetryAfter(retryAfterSeconds(d.RetryAfter))
+	case ratelimit.TokenBudget:
+		return TooMany(CodeTokenBudget, "%s", d.Message).
+			WithRetryAfter(retryAfterSeconds(d.RetryAfter))
+	default:
+		return TooMany(CodeRateLimited, "%s", d.Message)
+	}
+}
+
+// retryAfterSeconds rounds a sub-second window remainder up to at least 1, so a
+// Retry-After is never 0 ("retry immediately") when the window hasn't refilled.
+func retryAfterSeconds(d time.Duration) int {
+	s := int(d / time.Second)
+	if d%time.Second > 0 || s == 0 {
+		s++
+	}
+	return s
+}
+
+// servedValid reports whether the prediction produced an answer that is safe to
+// hand back as the result: the model chain succeeded AND, when the task has an
+// output schema, the served output passed it. A schema-invalid output is still
+// fully stored (the run row keeps the raw response, the gateway trace keeps
+// every model's output), but it is NOT a valid answer — the API surfaces it as
+// an error rather than returning invalid data as if it were the result.
+func (o *predictOutcome) servedValid() bool {
+	return o.Result.Success && (o.OutputValid == nil || *o.OutputValid)
+}
+
+// failureReason returns the stable error code and client-facing message for an
+// outcome that produced no valid answer, or ("","") when the outcome is fine.
+// It distinguishes "no model produced a usable response at all" from "models
+// answered but none passed the task's output schema".
+func (o *predictOutcome) failureReason() (code, msg string) {
+	if o.servedValid() {
+		return "", ""
+	}
+	if !o.Result.Success {
+		detail := "no usable model for this task"
+		if o.Result.Error != nil {
+			detail = *o.Result.Error
+		}
+		return CodeNoModelAvailable, detail
+	}
+	return CodeNoValidOutput,
+		"no valid response: the model output did not match the task's output schema"
+}
+
+// logUpstreamFailure records a 502 (the model chain produced no usable result —
+// either no model responded, or none produced schema-valid output) with the
+// request id, task, attributed model, and the reason, and echoes the request id
+// in the response header — so an upstream failure is as traceable as any other
+// error even though the body is the predict response.
 func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, outcome *predictOutcome) {
 	reqID := chimw.GetReqID(r.Context())
 	if reqID != "" {
 		w.Header().Set("X-Request-ID", reqID)
 	}
-	detail := "unknown upstream error"
+	code, detail := CodeNoModelAvailable, "unknown upstream error"
 	model := ""
 	if outcome != nil {
-		if outcome.Result.Error != nil {
-			detail = *outcome.Result.Error
-		}
+		code, detail = outcome.failureReason()
 		model = outcome.Result.Model
 	}
 	slog.Error("upstream prediction failed",
@@ -85,7 +144,7 @@ func logUpstreamFailure(w http.ResponseWriter, r *http.Request, taskID string, o
 		"path", r.URL.Path,
 		"task", taskID,
 		"model", model,
-		"code", CodeNoModelAvailable,
+		"code", code,
 		"status", http.StatusBadGateway,
 		"error", detail,
 	)
@@ -219,13 +278,46 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
+	// Per-task rate limiter (production predicts only). Estimate the input cost
+	// from the rendered system+user prompt and any images, then reserve it: an
+	// oversized single input is rejected (413), and the task's per-window request
+	// and token budgets are enforced up front (429). The reservation is settled
+	// to the tokens actually consumed after the walk — see Reconcile below.
+	var reservation ratelimit.Reservation
+	if opts.enforceLimits && h.Limiter.Enabled() {
+		est := h.Limiter.Estimate(renderTask.SystemPrompt+"\n"+prompt, len(images))
+		res, dec := h.Limiter.Reserve(task.ID, est)
+		if !dec.Allowed {
+			return nil, limiterError(dec)
+		}
+		reservation = res
+	}
+
 	result := llm.CallWithFallbackOpts(ctx, h.Clients, models, messages,
 		float32(task.Temperature), task.MaxTokens, fbOpts)
+
+	// Settle the rate-limit reservation against the tokens actually consumed:
+	// the sum across every attempt (winner + failed/fallback + schema-invalid),
+	// which is the true input+output spend even when the request ultimately
+	// failed. A cache hit consumed nothing upstream, so its attempts total ~0.
+	if reservation.Active() {
+		actualTokens := 0
+		for _, a := range result.Attempts {
+			actualTokens += a.TotalTokens
+		}
+		h.Limiter.Reconcile(reservation, actualTokens)
+	}
+
+	// One run id ties the answer (runs row) to its full gateway trace (one
+	// gateway_attempts row per model the walk touched). Generated before the
+	// cache branch so a cache-hit run and its trace share the same id.
+	runID := uuid.New().String()
+	h.recordAttempts(runID, &task.ID, result.Attempts, opts.isTest)
 
 	// A per-model cache hit during the walk short-circuits the rest of the
 	// pipeline (validation/fill/spend) — serveCached replays the stored outcome.
 	if hitEntry != nil {
-		cached := h.serveCached(task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
+		cached := h.serveCached(runID, task, prompt, renderTask.SystemPrompt, images, promptVersion, user, hitEntry)
 		cached.GatewayLatencyMs = int(time.Since(gatewayStart).Milliseconds())
 		return cached, nil
 	}
@@ -267,7 +359,6 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 		}
 	}
 
-	runID := uuid.New().String()
 	userID, userEmail := user.Subject, user.Email
 	var sysPrompt *string
 	if renderTask.SystemPrompt != "" {
@@ -317,7 +408,7 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 // still gets a run row (cache_hit=1) so attribution and hit-rate stay
 // observable, but with zero cost/tokens — nothing was consumed upstream, and
 // the budget gate must not count replayed answers as spend.
-func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, images []string,
+func (h *Handler) serveCached(runID string, task *tasks.Task, prompt, systemPrompt string, images []string,
 	promptVersion int, user *auth.User, entry *cache.Entry) *predictOutcome {
 
 	response := entry.RawResponse
@@ -333,7 +424,6 @@ func (h *Handler) serveCached(task *tasks.Task, prompt, systemPrompt string, ima
 		Degraded:     fellBack,
 	}
 
-	runID := uuid.New().String()
 	userID, userEmail := user.Subject, user.Email
 	var sysPrompt *string
 	if systemPrompt != "" {
@@ -379,6 +469,46 @@ func (h *Handler) insertRun(row *types.RunRow) {
 	_ = db.InsertRun(h.DB, row)
 }
 
+// recordAttempts persists the gateway trace for one run: one gateway_attempts
+// row per model the fallback walk touched, in walk order. Like insertRun it
+// prefers the async writer and never fails the prediction on a trace error. A
+// run with no attempts (e.g. no models configured) writes nothing.
+func (h *Handler) recordAttempts(runID string, taskID *string, attempts []llm.Attempt, isTest bool) {
+	if len(attempts) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for _, a := range attempts {
+		row := &types.GatewayAttempt{
+			RunID:          runID,
+			TaskID:         taskID,
+			Seq:            a.Seq,
+			Model:          a.Model,
+			Provider:       a.Provider,
+			Outcome:        a.Outcome,
+			FallbackUsed:   a.FallbackUsed,
+			FallbackReason: a.FallbackReason,
+			Response:       a.Response,
+			Error:          a.Error,
+			HTTPStatus:     a.HTTPStatus,
+			InfraFailure:   a.InfraFailure,
+			RetryCount:     a.RetryCount,
+			LatencyMs:      a.LatencyMs,
+			InputTokens:    a.InputTokens,
+			OutputTokens:   a.OutputTokens,
+			TotalTokens:    a.TotalTokens,
+			CostUSD:        a.CostUSD,
+			IsTest:         isTest,
+			CreatedAt:      now,
+		}
+		if h.Attempts != nil {
+			h.Attempts.Write(row)
+		} else {
+			_ = db.InsertGatewayAttempt(h.DB, row)
+		}
+	}
+}
+
 // collectImages gathers the multimodal inputs from a request, in submission
 // order: a single "image" string (legacy single-image contract) first, then any
 // entries of an "images" array. Blank entries are dropped. Both keys are
@@ -400,13 +530,16 @@ func collectImages(inputMap map[string]any) []string {
 }
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.
+// Only a valid answer is returned as the result: if no model produced one
+// (every model failed, was unhealthy, or returned schema-invalid output) the
+// response carries a stable error_code and message and `output` stays null, so
+// callers never receive an invalid response dressed up as the answer. The raw
+// response is still echoed for debugging, and everything is persisted regardless.
 func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
-	// A failed result means the whole model chain proved unusable for this task
-	// (every model failed, was unhealthy, or returned schema-invalid output) —
-	// surface a stable code so callers can branch on "no model worked".
-	errorCode := ""
-	if !o.Result.Success {
-		errorCode = CodeNoModelAvailable
+	errorCode, errMsg := o.failureReason()
+	errPtr := o.Result.Error
+	if errPtr == nil && errMsg != "" {
+		errPtr = &errMsg
 	}
 	return predictResponse{
 		TaskRunID:     o.RunID,
@@ -417,7 +550,7 @@ func shapePredictResponse(task *tasks.Task, o *predictOutcome) predictResponse {
 		Output:        o.Output,
 		OutputValid:   o.OutputValid,
 		RawResponse:   o.Result.Response,
-		Error:         o.Result.Error,
+		Error:         errPtr,
 		ErrorCode:     errorCode,
 		FallbackUsed:  o.Result.FallbackUsed,
 		Cached:        o.CacheHit,

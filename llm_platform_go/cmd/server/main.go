@@ -13,6 +13,7 @@ import (
 	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/health"
 	"llm_platform_go/internal/llm"
+	"llm_platform_go/internal/ratelimit"
 	"llm_platform_go/internal/tasks"
 	"llm_platform_go/internal/users"
 
@@ -81,6 +82,12 @@ func main() {
 	runWriter := db.NewRunWriter(database, 0)
 	defer runWriter.Close()
 
+	// Async gateway-trace writer — one row per model the fallback walk touches,
+	// off the hot path like runWriter. Captures every fallback, its reason, the
+	// error and its classification, retries, and per-call latency for each run.
+	attemptWriter := db.NewGatewayAttemptWriter(database, 0)
+	defer attemptWriter.Close()
+
 	// Per-(task, model) circuit breaker — skips a model in a task's fallback
 	// chain after repeated failures (provider errors OR schema-invalid output),
 	// with exponential backoff and admin reset. Transitions persist to
@@ -99,6 +106,25 @@ func main() {
 			cfg.HealthThreshold, cfg.HealthBaseCooldown, cfg.HealthMaxCooldown)
 	} else {
 		log.Printf("model health breaker: off")
+	}
+
+	// Per-task request/token rate limiter — rejects oversized inputs (413) and
+	// throttles requests and token throughput per task per window (429), counting
+	// the tokens actually consumed (incl. failed/fallback attempts).
+	limiter := ratelimit.New(ratelimit.Config{
+		Enabled:        cfg.RateLimitEnabled,
+		Window:         cfg.RateWindow,
+		MaxRequests:    cfg.RateMaxRequests,
+		MaxTokens:      cfg.RateMaxTokens,
+		MaxInputTokens: cfg.RateMaxInputTokens,
+		CharsPerToken:  cfg.RateCharsPerToken,
+		TokensPerImage: cfg.RateTokensPerImage,
+	})
+	if cfg.RateLimitEnabled {
+		log.Printf("rate limiter: on (per task, window %s — max %d req, %d tok; max %d input tok/request)",
+			cfg.RateWindow, cfg.RateMaxRequests, cfg.RateMaxTokens, cfg.RateMaxInputTokens)
+	} else {
+		log.Printf("rate limiter: off")
 	}
 
 	// Prediction cache — Redis in production, in-process memory for dev boxes
@@ -120,13 +146,15 @@ func main() {
 	}
 
 	router := api.NewRouter(api.RouterDeps{
-		DB:      database,
-		Clients: clients,
-		Users:   userStore,
-		Tasks:   taskStore,
-		Runs:    runWriter,
-		Cache:   predictionCache,
-		Health:  healthTracker,
+		DB:       database,
+		Clients:  clients,
+		Users:    userStore,
+		Tasks:    taskStore,
+		Runs:     runWriter,
+		Attempts: attemptWriter,
+		Cache:    predictionCache,
+		Health:   healthTracker,
+		Limiter:  limiter,
 		Auth: api.AuthConfig{
 			Secret:      []byte(cfg.JWTSecret),
 			CookieName:  cfg.AuthCookieName,

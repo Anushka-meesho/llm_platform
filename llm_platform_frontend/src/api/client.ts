@@ -223,7 +223,20 @@ export const api = {
     }
     clearTimeout(timer);
     if (!res.ok) {
-      const data = (await res.json().catch(() => ({}))) as { detail?: string };
+      const data = (await res.json().catch(() => ({}))) as Partial<TPredictResult> & {
+        detail?: string;
+      };
+      // A 502 "no valid answer" still returns a full predict response (it carries
+      // task_run_id, error_code, and the raw response). Surface it as an outcome
+      // rather than throwing, so the caller can show exactly what happened —
+      // including the per-model gateway trace — for failed runs too. Other errors
+      // (429 budget, 4xx, network) have no predict body and still throw.
+      if (typeof data.task_run_id === 'string') {
+        return {
+          result: data as TPredictResult,
+          degraded: res.headers.get('X-Platform-Degraded') === 'true',
+        };
+      }
       const retryAfter = res.status === 429 ? res.headers.get('Retry-After') : null;
       throw new ApiError(
         res.status,

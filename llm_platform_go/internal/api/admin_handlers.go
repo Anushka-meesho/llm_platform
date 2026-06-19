@@ -68,8 +68,10 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AdminGetRun serves the full record for one run_id, including the complete
-// prompt, system prompt, per-model responses, and the image data URLs.
+// AdminGetRun serves the full record for one run_id: the complete prompt,
+// system prompt, per-model responses, image data URLs, and the gateway trace
+// (every model the fallback walk touched — each fallback, its reason, the error
+// and its classification, retries, and per-call latency).
 //
 // GET /v1/admin/runs/{run_id}
 func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {

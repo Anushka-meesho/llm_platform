@@ -71,10 +71,16 @@ func CallWithFallbackCached(ctx context.Context, clients *Clients, models []stri
 //     and recorded healthy. A provider error or a schema-invalid response is
 //     recorded against health and advances the chain. A 400/422 content error
 //     is returned immediately (bad input — not the model's fault).
-func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string, messages []ChatMessage, temperature float32, maxTokens int, opts FallbackOptions) ModelResult {
+func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string, messages []ChatMessage, temperature float32, maxTokens int, opts FallbackOptions) (result ModelResult) {
 	if len(models) == 0 {
 		return ModelResult{Success: false, Degraded: true, Error: strPtr("no models configured")}
 	}
+
+	// attempts records every model the walk touches, in order. It is attached to
+	// whichever result is ultimately returned so the caller can persist the full
+	// gateway trace (every fallback, its reason, errors, retries, latencies).
+	var attempts []Attempt
+	defer func() { result.Attempts = attempts }()
 
 	var last ModelResult
 	attempted := false
@@ -83,6 +89,8 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 		if opts.Gate != nil && !opts.Gate.Allow(model) {
 			last = skippedResult(model)
 			last.FallbackUsed = i > 0
+			attempts = append(attempts, attemptFrom(i, last, "skipped_unhealthy",
+				"model unhealthy (circuit open) for this task"))
 			continue
 		}
 		attempted = true
@@ -91,6 +99,7 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 			if cached, ok := opts.Lookup(model); ok {
 				cached.FallbackUsed = i > 0
 				cached.Degraded = i > 0
+				attempts = append(attempts, attemptFrom(i, cached, "cache_hit", ""))
 				return cached // cached answer for this model — definitive, stop here
 			}
 		}
@@ -107,6 +116,8 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 				}
 				last.fallbackEligible = true
 				last.Degraded = true
+				attempts = append(attempts, attemptFrom(i, last, "schema_invalid",
+					"output failed schema validation"))
 				if ctx.Err() != nil {
 					break
 				}
@@ -115,20 +126,26 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 			if opts.Gate != nil {
 				opts.Gate.RecordSuccess(model)
 			}
+			attempts = append(attempts, attemptFrom(i, last, "success", ""))
 			return last // usable answer — stop here
 		}
 
 		if !last.fallbackEligible {
-			return last // 400/422 content error — bad input, don't penalize health
+			// 400/422 content error — bad input, don't penalize health. Definitive,
+			// so no fallback reason (the walk stops here on purpose, not by falling
+			// through to another model).
+			attempts = append(attempts, attemptFrom(i, last, "error", ""))
+			return last
 		}
 		// Provider/infra/auth failure — count it and advance the chain.
+		reason := "model call failed"
+		if last.Error != nil {
+			reason = *last.Error
+		}
 		if opts.Gate != nil {
-			reason := "model call failed"
-			if last.Error != nil {
-				reason = *last.Error
-			}
 			opts.Gate.RecordFailure(model, reason)
 		}
+		attempts = append(attempts, attemptFrom(i, last, "error", reason))
 		if ctx.Err() != nil {
 			break // caller gone — don't burn the rest of the chain
 		}
@@ -143,18 +160,30 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 				len(models)))}
 	}
 
-	// Whole chain failed (infra errors and/or schema-invalid everywhere). Lead
-	// with the no-usable-model summary so the caller can tell the entire chain is
-	// down — not just one model — while keeping the last model's reason for
-	// diagnosis.
+	// The walk fell through every model. Two very different outcomes land here,
+	// and they must not be conflated:
+	//
+	//   - A genuine chain failure: no model produced a usable API response
+	//     (infra/provider errors everywhere). last.Success is false. Lead with the
+	//     no-usable-model summary so the caller sees the whole chain is down.
+	//
+	//   - Every model answered, but the output failed schema validation on all of
+	//     them. last.Success is true — this is the platform's "flagged, not
+	//     failed" contract: the caller still gets a 200 with the raw response and
+	//     output_valid=false. Pasting an "all models failed" error onto it would
+	//     be a lie (it's what made such a run render as "ok" with a failure error
+	//     attached). Leave it as a degraded success; each model's invalid output
+	//     is preserved per-model in the gateway trace.
 	last.Degraded = true
-	if last.Error != nil {
-		last.Error = strPtr(fmt.Sprintf(
-			"no usable model for this task — all %d configured model(s) failed; last error: %s",
-			len(models), *last.Error))
-	} else {
-		last.Error = strPtr(fmt.Sprintf(
-			"no usable model for this task — all %d configured model(s) failed", len(models)))
+	if !last.Success {
+		if last.Error != nil {
+			last.Error = strPtr(fmt.Sprintf(
+				"no usable model for this task — all %d configured model(s) failed; last error: %s",
+				len(models), *last.Error))
+		} else {
+			last.Error = strPtr(fmt.Sprintf(
+				"no usable model for this task — all %d configured model(s) failed", len(models)))
+		}
 	}
 	return last
 }
@@ -175,3 +204,32 @@ func skippedResult(model string) ModelResult {
 }
 
 func strPtr(s string) *string { return &s }
+
+// attemptFrom snapshots one model's outcome within the walk into an Attempt for
+// the gateway trace. outcome is the classified result ("success", "error",
+// "schema_invalid", "skipped_unhealthy", "cache_hit"); fallbackReason explains
+// why the walk advanced past this model (empty when it produced the answer).
+func attemptFrom(seq int, r ModelResult, outcome, fallbackReason string) Attempt {
+	errMsg := ""
+	if r.Error != nil {
+		errMsg = *r.Error
+	}
+	return Attempt{
+		Seq:            seq,
+		Model:          r.Model,
+		Provider:       r.Provider,
+		Outcome:        outcome,
+		FallbackUsed:   seq > 0,
+		FallbackReason: fallbackReason,
+		Response:       r.Response,
+		Error:          errMsg,
+		HTTPStatus:     r.httpStatus,
+		InfraFailure:   r.infraFailure,
+		RetryCount:     r.retryCount,
+		LatencyMs:      r.LatencyMs,
+		InputTokens:    r.InputTokens,
+		OutputTokens:   r.OutputTokens,
+		TotalTokens:    r.TotalTokens,
+		CostUSD:        r.CostUSD,
+	}
+}

@@ -53,6 +53,22 @@ type Config struct {
 	HealthThreshold      int
 	HealthBaseCooldown   time.Duration
 	HealthMaxCooldown    time.Duration
+
+	// Per-task input/token rate limiter. Each task gets its own rolling window
+	// of RateWindow. A request is rejected up front if its estimated input
+	// exceeds RateMaxInputTokens (413), if the task already hit RateMaxRequests
+	// in the window, or if reserving its estimate would exceed RateMaxTokens
+	// (both 429). Accepted requests reserve their estimate, then reconcile to the
+	// tokens actually consumed (input+output across every attempt, incl. failed
+	// ones). 0 for a Max disables that gate. Tokens are estimated as
+	// chars/RateCharsPerToken plus RateTokensPerImage per attached image.
+	RateLimitEnabled   bool
+	RateWindow         time.Duration
+	RateMaxRequests    int
+	RateMaxTokens      int
+	RateMaxInputTokens int
+	RateCharsPerToken  int
+	RateTokensPerImage int
 }
 
 func Load() (*Config, error) {
@@ -83,6 +99,14 @@ func Load() (*Config, error) {
 		HealthThreshold:      getEnvInt("HEALTH_FAILURE_THRESHOLD", 3),
 		HealthBaseCooldown:   getEnvDuration("HEALTH_BASE_COOLDOWN", 30*time.Second),
 		HealthMaxCooldown:    getEnvDuration("HEALTH_MAX_COOLDOWN", 30*time.Minute),
+
+		RateLimitEnabled:   getEnvBool("RATE_LIMIT_ENABLED", true),
+		RateWindow:         getEnvDuration("RATE_WINDOW", time.Minute),
+		RateMaxRequests:    getEnvInt("RATE_MAX_REQUESTS", 600),
+		RateMaxTokens:      getEnvInt("RATE_MAX_TOKENS", 200000),
+		RateMaxInputTokens: getEnvInt("RATE_MAX_INPUT_TOKENS", 16000),
+		RateCharsPerToken:  getEnvInt("RATE_CHARS_PER_TOKEN", 4),
+		RateTokensPerImage: getEnvInt("RATE_TOKENS_PER_IMAGE", 1000),
 	}
 	if cfg.CacheBackend == "" {
 		if cfg.RedisAddr != "" {

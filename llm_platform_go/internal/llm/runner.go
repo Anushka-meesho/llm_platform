@@ -154,16 +154,22 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 
 	var resp *chatResponse
 	var err error
+	tries := 0           // upstream HTTP attempts actually made (incl. retries)
+	lastStatus := 0      // last upstream HTTP status seen (0 = no response reached)
 	for attempt := 0; attempt < 3; attempt++ {
+		tries++
 		resp, err = provider.Call(ctx, &apiReq)
 		if err == nil {
 			break
 		}
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			lastStatus = apiErr.HTTPStatusCode
+		}
 		if ctx.Err() != nil {
 			break // context cancelled or timed out — do not retry
 		}
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && isRetryable(apiErr.HTTPStatusCode) {
+		if apiErr != nil && isRetryable(apiErr.HTTPStatusCode) {
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 			continue
 		}
@@ -176,15 +182,23 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		r := errResult(modelName, start, classifyError(err))
 		r.infraFailure = isInfraFailure(err)
 		r.fallbackEligible = shouldFallback(err)
+		r.httpStatus = lastStatus
+		r.retryCount = tries
 		return r
 	}
 	if len(resp.Choices) == 0 {
-		return errResult(modelName, start, "empty response from model")
+		r := errResult(modelName, start, "empty response from model")
+		r.httpStatus = 200
+		r.retryCount = tries
+		return r
 	}
 
 	text := resp.Choices[0].Message.Content
 	if text == "" {
-		return errResult(modelName, start, "model returned empty content")
+		r := errResult(modelName, start, "model returned empty content")
+		r.httpStatus = 200
+		r.retryCount = tries
+		return r
 	}
 	inTok := resp.Usage.PromptTokens
 	outTok := resp.Usage.CompletionTokens
@@ -200,6 +214,8 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		TotalTokens:  inTok + outTok,
 		CostUSD:      cost,
 		Success:      true,
+		httpStatus:   200,
+		retryCount:   tries,
 	}
 }
 

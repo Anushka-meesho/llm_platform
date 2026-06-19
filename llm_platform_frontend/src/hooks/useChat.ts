@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { usePersistentState } from './usePersistentState';
 import type {
   TUIMessage,
   TUserUIMessage,
@@ -44,23 +45,30 @@ const buildApiContent = (
 
 export const useChat = () => {
   const toast = useToast();
-  const [conversations, setConversations] = useState<Record<string, TUIMessage[]>>(
+  // The conversation, chosen models, system prompt, and sampling all persist, so
+  // the Compare workspace returns exactly as left after a reload. isLoading/error
+  // are transient and stay in-memory.
+  const [conversations, setConversations] = usePersistentState<Record<string, TUIMessage[]>>(
+    'compare.conversations',
     emptyConversations,
   );
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = usePersistentState<string | null>('compare.sessionId', null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedModels, setSelectedModels] = useState<string[]>([...DEFAULT_COMPARE_MODELS]);
-  const [temperature, setTemperature] = useState(0.7);
-  const [systemPrompt, setSystemPrompt] = useState('');
-  const [maxOutputTokens, setMaxOutputTokens] = useState(1000);
+  const [selectedModels, setSelectedModels] = usePersistentState<string[]>(
+    'compare.selectedModels',
+    [...DEFAULT_COMPARE_MODELS],
+  );
+  const [temperature, setTemperature] = usePersistentState('compare.temperature', 0.7);
+  const [systemPrompt, setSystemPrompt] = usePersistentState('compare.systemPrompt', '');
+  const [maxOutputTokens, setMaxOutputTokens] = usePersistentState('compare.maxOutputTokens', 1000);
 
   const newChat = useCallback(() => {
     setConversations(emptyConversations());
     setSessionId(null);
     setSystemPrompt('');
     setError(null);
-  }, []);
+  }, [setConversations, setSessionId, setSystemPrompt]);
 
   const loadSession = useCallback((detail: TSessionDetail) => {
     const newConvs = emptyConversations();
@@ -94,7 +102,7 @@ export const useChat = () => {
     setSessionId(detail.session_id);
     setSystemPrompt('');
     setError(null);
-  }, []);
+  }, [setSelectedModels, setConversations, setSessionId, setSystemPrompt]);
 
   const submitPrompt = useCallback(
     async (text: string, files: File[]) => {
@@ -202,7 +210,17 @@ export const useChat = () => {
         setIsLoading(false);
       }
     },
-    [sessionId, selectedModels, temperature, systemPrompt, maxOutputTokens, conversations, toast],
+    [
+      sessionId,
+      selectedModels,
+      temperature,
+      systemPrompt,
+      maxOutputTokens,
+      conversations,
+      toast,
+      setConversations,
+      setSessionId,
+    ],
   );
 
   return {

@@ -333,8 +333,8 @@ func TestPredictInvalidOutputNotCached(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		status, out := doPredict(t, srv, body)
-		if status != http.StatusOK {
-			t.Fatalf("predict %d status: got %d, want 200 (invalid output is flagged, not failed)", i, status)
+		if status != http.StatusBadGateway {
+			t.Fatalf("predict %d status: got %d, want 502 (invalid output is not a valid answer)", i, status)
 		}
 		if out.Cached {
 			t.Fatalf("predict %d: schema-invalid output must not be served from cache", i)

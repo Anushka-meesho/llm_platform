@@ -324,8 +324,10 @@ func TestPredictInputValidation(t *testing.T) {
 	}
 }
 
-func TestPredictInvalidOutputFlagged(t *testing.T) {
-	// Model returns JSON that violates the output schema.
+func TestPredictInvalidOutputErrors(t *testing.T) {
+	// Model returns JSON that violates the output schema. The API must NOT return
+	// an invalid response as the answer — it errors (502) with a stable code,
+	// while still echoing the raw response for debugging.
 	srv, _ := newPredictServer(t, `{"wrong_key":"oops"}`)
 
 	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost,
@@ -333,16 +335,24 @@ func TestPredictInvalidOutputFlagged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("predict: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status: got %d, want 200 (invalid output is flagged, not failed)", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502 (no valid response could be produced)", resp.StatusCode)
 	}
 
 	var out struct {
 		OutputValid *bool           `json:"output_valid"`
 		Output      json.RawMessage `json:"output"`
 		RawResponse *string         `json:"raw_response"`
+		Error       *string         `json:"error"`
+		ErrorCode   string          `json:"error_code"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if out.ErrorCode != "no_valid_output" {
+		t.Errorf("error_code: got %q, want no_valid_output", out.ErrorCode)
+	}
+	if out.Error == nil || *out.Error == "" {
+		t.Error("error message should explain why no valid response was produced")
+	}
 	if out.OutputValid == nil || *out.OutputValid {
 		t.Errorf("output_valid: got %v, want false", out.OutputValid)
 	}
@@ -350,7 +360,7 @@ func TestPredictInvalidOutputFlagged(t *testing.T) {
 		t.Errorf("output should be null for invalid responses, got %s", out.Output)
 	}
 	if out.RawResponse == nil {
-		t.Error("raw_response should be preserved for debugging")
+		t.Error("raw_response should still be preserved for debugging")
 	}
 }
 

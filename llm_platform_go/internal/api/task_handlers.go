@@ -223,7 +223,8 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user, predictOptions{useCache: true})
+	outcome, herr := h.executePrediction(r.Context(), task, req.Inputs, user,
+		predictOptions{useCache: true, enforceLimits: true})
 	if herr != nil {
 		writeErr(w, r, herr)
 		return
@@ -235,8 +236,10 @@ func (h *Handler) Predict(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusOK
-	if !outcome.Result.Success {
-		// Upstream model failure — the predict response carries the Error detail;
+	if !outcome.servedValid() {
+		// No valid answer to return — either no model produced a usable response,
+		// or every model's output failed the task's schema. The predict response
+		// carries the error_code + detail (and the raw response for debugging);
 		// add the request id + a log line so it's traceable like any other error.
 		status = http.StatusBadGateway
 		logUpstreamFailure(w, r, task.ID, outcome)
