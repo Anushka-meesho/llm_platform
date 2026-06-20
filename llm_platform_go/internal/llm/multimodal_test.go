@@ -57,3 +57,34 @@ func TestChatMessage_WithImageMarshalsAsMultimodalArray(t *testing.T) {
 		t.Errorf("data URL missing from wire body: %s", b)
 	}
 }
+
+// Gemini thinking models return content as a multi-part array.
+// UnmarshalJSON must concatenate text parts and discard non-text types (thought tokens).
+func TestChatMessage_ArrayContentUnmarshal(t *testing.T) {
+	raw := `{"role":"assistant","content":[{"type":"text","text":"Hello"},{"type":"text","text":" world"}]}`
+	var m ChatMessage
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Content != "Hello world" {
+		t.Errorf("want 'Hello world', got %q", m.Content)
+	}
+	if m.Role != "assistant" {
+		t.Errorf("want role 'assistant', got %q", m.Role)
+	}
+}
+
+// Plain-string content must still unmarshal correctly after adding UnmarshalJSON.
+func TestChatMessage_StringContentUnmarshal(t *testing.T) {
+	raw := `{"role":"assistant","content":"The product is red."}`
+	var m ChatMessage
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Content != "The product is red." {
+		t.Errorf("want 'The product is red.', got %q", m.Content)
+	}
+	if m.Role != "assistant" {
+		t.Errorf("want role 'assistant', got %q", m.Role)
+	}
+}

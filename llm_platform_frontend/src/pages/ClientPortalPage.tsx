@@ -347,6 +347,7 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
                     value={values[f.name] ?? ''}
                     onChange={(e) => setValues((prev) => ({ ...prev, [f.name]: e.target.value }))}
                     rows={1}
+                    placeholder={f.schema.type === 'array' ? arrayPlaceholder(f.schema) : undefined}
                     className="w-full border border-solid border-primary-border rounded-md px-2 py-1.5 text-sm font-mono resize-y bg-primary-bg text-primary-text"
                   />
                 )}
@@ -469,6 +470,25 @@ const GatewayTrace = ({ attempts }: { attempts: TGatewayAttempt[] }) => {
   );
 };
 
+function arrayPlaceholder(schema: Record<string, unknown>): string {
+  const items = schema.items as Record<string, unknown> | undefined;
+  if (items?.type === 'object') {
+    const props = (items.properties ?? {}) as Record<string, Record<string, unknown>>;
+    const example: Record<string, unknown> = {};
+    for (const [key, propSchema] of Object.entries(props)) {
+      switch (propSchema.type) {
+        case 'array':   example[key] = ['value1']; break;
+        case 'number':
+        case 'integer': example[key] = 0; break;
+        case 'boolean': example[key] = true; break;
+        default:        example[key] = '...'; break;
+      }
+    }
+    return JSON.stringify([example]);
+  }
+  return '["item1", "item2"] or item1, item2';
+}
+
 function coerce(raw: string, schema: Record<string, unknown>): unknown {
   switch (schema.type) {
     case 'number':
@@ -483,6 +503,16 @@ function coerce(raw: string, schema: Record<string, unknown>): unknown {
       try {
         return JSON.parse(raw);
       } catch {
+        if (schema.type === 'array') {
+          const itemType = (schema.items as Record<string, unknown> | undefined)?.type;
+          if (!itemType || itemType === 'string') {
+            const items = raw
+              .split(',')
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+            if (items.length > 0) return items;
+          }
+        }
         return raw;
       }
     default:

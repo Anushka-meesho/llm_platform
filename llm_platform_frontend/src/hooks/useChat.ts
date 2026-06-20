@@ -26,8 +26,10 @@ const readFileAsDataUrl = (file: File): Promise<string> =>
 const buildApiContent = (
   msg: TUIMessage,
   modelName: string,
+  includeImages = true,
 ): string | TContentPart[] => {
   if (
+    includeImages &&
     msg.role === 'user' &&
     msg.images.length > 0 &&
     !modelName.startsWith('llama-groq')
@@ -61,7 +63,7 @@ export const useChat = () => {
   );
   const [temperature, setTemperature] = usePersistentState('compare.temperature', 0.7);
   const [systemPrompt, setSystemPrompt] = usePersistentState('compare.systemPrompt', '');
-  const [maxOutputTokens, setMaxOutputTokens] = usePersistentState('compare.maxOutputTokens', 1000);
+  const [maxOutputTokens, setMaxOutputTokens] = usePersistentState('compare.maxOutputTokens', 4096);
 
   const newChat = useCallback(() => {
     setConversations(emptyConversations());
@@ -140,9 +142,13 @@ export const useChat = () => {
       try {
         const modelConvs: Record<string, TApiMessage[]> = {};
         for (const model of selectedModels) {
-          modelConvs[model] = (snapshotWithNewMsg[model] ?? []).map((msg) => ({
+          const msgs = snapshotWithNewMsg[model] ?? [];
+          modelConvs[model] = msgs.map((msg, idx) => ({
             role: msg.role,
-            content: buildApiContent(msg, model),
+            // Only attach images on the most recent user message — re-sending images
+            // from every historical turn causes the image token count to balloon and
+            // confuses vision models into returning empty responses.
+            content: buildApiContent(msg, model, idx === msgs.length - 1),
           }));
         }
 

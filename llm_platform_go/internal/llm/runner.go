@@ -20,6 +20,11 @@ type providerConfig struct {
 	// chat-completions wire rejects max_tokens and non-default temperature —
 	// CallModel sends max_completion_tokens and omits temperature instead.
 	reasoning bool
+	// minOutputTokens is a floor applied to max_tokens for thinking models (e.g.
+	// Gemini 2.5 family). Thinking tokens count against the same output budget, so
+	// a low user-supplied max_tokens leaves almost no room for actual response text.
+	// When set, CallModel silently raises max_tokens to this value if it is lower.
+	minOutputTokens int
 }
 
 var (
@@ -48,8 +53,8 @@ var registry = map[string]providerConfig{
 
 	// ── Gemini via Meesho bifrost ────────────────────────────────────────────
 	// "gemini-3-pro":          {modelID: "vertex/gemini-3-pro-preview", provider: "gemini", clientFn: meeshoC},
-	"gemini-2.5-pro":   {modelID: "vertex/gemini-2.5-pro", provider: "gemini", clientFn: meeshoC},
-	"gemini-2.5-flash": {modelID: "vertex/gemini-2.5-flash", provider: "gemini", clientFn: meeshoC},
+	"gemini-2.5-pro":   {modelID: "vertex/gemini-2.5-pro", provider: "gemini", clientFn: meeshoC, minOutputTokens: 8192},
+	"gemini-2.5-flash": {modelID: "vertex/gemini-2.5-flash", provider: "gemini", clientFn: meeshoC, minOutputTokens: 4096},
 	// "gemini-2.5-flash-lite": {modelID: "vertex/gemini-2.5-flash-lite", provider: "gemini", clientFn: meeshoC},
 	// "gemini-flash":          {modelID: "vertex/gemini-2.0-flash", provider: "gemini", clientFn: meeshoC},
 
@@ -139,6 +144,9 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		return r
 	}
 
+	if cfg.minOutputTokens > 0 && maxTokens < cfg.minOutputTokens {
+		maxTokens = cfg.minOutputTokens
+	}
 	apiReq := chatRequest{
 		Model:       cfg.modelID,
 		Messages:    messages,

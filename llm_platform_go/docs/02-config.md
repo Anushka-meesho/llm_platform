@@ -117,6 +117,36 @@ Set `HEALTH_BREAKER_ENABLED=false` if you want every model called regardless of 
 
 ---
 
+### Per-task rate limiter
+
+Each task gets its own independent rolling window. Three gates are enforced per task per window:
+
+| Env var | Config field | What it does | Default |
+|---------|-------------|--------------|---------|
+| `RATE_LIMIT_ENABLED` | `RateLimitEnabled` | Master on/off switch | `true` |
+| `RATE_WINDOW` | `RateWindow` | Rolling window length per task | `1m` |
+| `RATE_MAX_REQUESTS` | `RateMaxRequests` | Max requests per task per window (0 = unlimited) | `600` |
+| `RATE_MAX_TOKENS` | `RateMaxTokens` | Max tokens consumed per task per window (0 = unlimited) | `200000` |
+| `RATE_MAX_INPUT_TOKENS` | `RateMaxInputTokens` | Max estimated input tokens for a single request (0 = unlimited) | `16000` |
+| `RATE_CHARS_PER_TOKEN` | `RateCharsPerToken` | Characters-per-token for input estimation | `4` |
+| `RATE_TOKENS_PER_IMAGE` | `RateTokensPerImage` | Flat token cost added per attached image for estimation | `1000` |
+
+**How the three gates work:**
+
+1. **Per-request input cap (`RATE_MAX_INPUT_TOKENS`)** — evaluated first, before reserving any window capacity. A request whose estimated input tokens exceed this limit is rejected immediately with `413 Payload Too Large`. Retrying the same oversized request won't help — the caller must shrink their input.
+
+2. **Request-rate cap (`RATE_MAX_REQUESTS`)** — limits how many requests a task accepts per window. Breaching it returns `429 Too Many Requests` with a `Retry-After` header indicating when the window refills.
+
+3. **Token budget (`RATE_MAX_TOKENS`)** — limits total token consumption per window. Tokens are *reserved upfront* based on the estimated input cost; after the walk completes, the reservation is *reconciled* to the tokens actually consumed (input + output across every attempt, including failed and fallback ones). Breaching it returns `429` with a `Retry-After`.
+
+**Token estimation:** input tokens are estimated as `ceil(len(text) / CharsPerToken)` plus `TokensPerImage` for each attached image. This is a cheap over-estimate — the limiter would rather gate slightly early than under-count, because the actual count isn't known until the provider responds.
+
+**Tasks are independent:** each task's window has its own lock. High traffic on one task never slows rate-limit decisions for another.
+
+Set `RATE_LIMIT_ENABLED=false` to disable all gating (useful for local dev or load testing).
+
+---
+
 ## How defaults work in Go
 
 ```go
@@ -152,4 +182,11 @@ CACHE_BACKEND=memory
 # HEALTH_BREAKER_ENABLED=true
 # HEALTH_FAILURE_THRESHOLD=3
 # HEALTH_BASE_COOLDOWN=30s
+
+# Optional: rate limiter tuning (per task, rolling window)
+# RATE_LIMIT_ENABLED=true
+# RATE_WINDOW=1m
+# RATE_MAX_REQUESTS=600
+# RATE_MAX_TOKENS=200000
+# RATE_MAX_INPUT_TOKENS=16000
 ```

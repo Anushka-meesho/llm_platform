@@ -9,25 +9,27 @@ Every Go program starts at a function called `main()`. Think of it as the "on" b
 
 ---
 
-## The 12-step boot sequence
+## The boot sequence
 
 The server initializes components **in a specific order**, because each step depends on the previous one. Here's the complete sequence:
 
 ```mermaid
 flowchart TD
-    A[1. Load .env file] --> B[2. Load & validate config]
-    B --> C[3. Load pricing.json]
-    C --> D[4. Open SQLite database]
-    D --> E[5. Run database migrations]
-    E --> F[6. Build LLM clients]
-    F --> G[7. Start recovery prober]
-    G --> H[8. Create task store]
-    H --> I[9. Seed built-in tasks]
-    I --> J[10. Load tasks from tasks.d/]
-    J --> K[11. Initialize async writers]
-    K --> L[12. Create health tracker + cache]
-    L --> M[13. Build HTTP router]
-    M --> N[14. Start listening on port 8000]
+    A[1. Load .env file] --> B[2. Set up structured logging]
+    B --> C[3. Load & validate config]
+    C --> D[4. Load pricing.json]
+    D --> E[5. Open SQLite database]
+    E --> F[6. Run database migrations]
+    F --> G[7. Build LLM clients]
+    G --> H[8. Create task store + seed built-in tasks]
+    H --> I[9. Create user store]
+    I --> J[10. Start async run writer]
+    J --> K[11. Start async gateway attempt writer]
+    K --> L[12. Initialize health writer + tracker]
+    L --> M[13. Initialize rate limiter]
+    M --> N[14. Set up prediction cache]
+    N --> O[15. Build HTTP router]
+    O --> P[16. Start listening on port 8000]
 ```
 
 ---
@@ -49,26 +51,46 @@ The `.env` file is just a text file with `KEY=VALUE` lines. It's gitignored (nev
 
 ---
 
-### Step 2 — Load and validate config
+### Step 2 — Set up structured logging
+
+```go
+logLevel := slog.LevelInfo
+if strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug") {
+    logLevel = slog.LevelDebug
+}
+slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+```
+
+The server uses Go's built-in `slog` package for structured, JSON-formatted logging. Every log line is a JSON object — easy for log aggregators (Grafana Loki, Datadog, etc.) to parse and index.
+
+Set `LOG_LEVEL=debug` in your `.env` to see verbose output during development.
+
+**Why JSON logs?** In production, log lines are ingested by log aggregation systems. A structured format like JSON lets you filter on fields (`"task": "classify-ticket"`, `"code": "rate_limited"`) instead of grepping text.
+
+---
+
+### Step 3 — Load and validate config
 
 ```go
 cfg, err := config.Load()
 if err != nil {
     log.Fatalf("config error: %v", err)
 }
+if missing := cfg.MissingProviderKeys(); len(missing) > 0 {
+    log.Printf("warning: provider keys not set %v — those models will fail at call time", missing)
+}
 ```
 
 > **🔤 Go concept: `:=` and multiple return values**
-> `:=` is Go's shorthand for "declare a new variable and assign to it". You don't need to write a type — Go figures it out.
-> Many Go functions return two values: the result *and* an error. It's a convention: if `err != nil` (not nil = there was an error), something went wrong. `log.Fatalf` prints the error and **exits the program immediately** — if config is broken, there's no point starting.
+> `:=` is Go's shorthand for "declare a new variable and assign to it". Many Go functions return two values: the result *and* an error. It's a convention: if `err != nil` (not nil = there was an error), something went wrong. `log.Fatalf` prints the error and **exits the program immediately** — if config is broken, there's no point starting.
 
-`config.Load()` reads all env vars, applies defaults, and validates that at least one LLM provider key is set. If you forgot to set `MEESHO_GATEWAY_VK` *and* `GROQ_API_KEY`, the server refuses to start with a clear error rather than starting and failing mysteriously on the first real call.
+`config.Load()` reads all env vars, applies defaults, and validates that at least one LLM provider key is set. If *neither* key is configured, the server refuses to start. If only one is missing, it logs a warning and continues — models that use the missing provider will fail at call time (not at boot).
 
 **Why crash on bad config instead of using defaults?** Failing fast at startup is better than running for hours before anyone notices a misconfiguration. This is called "fail-fast" design.
 
 ---
 
-### Step 3 — Load pricing
+### Step 4 — Load pricing
 
 ```go
 if err := llm.LoadPricing(cfg.PricingPath); err != nil {
@@ -78,11 +100,11 @@ if err := llm.LoadPricing(cfg.PricingPath); err != nil {
 
 `pricing.json` contains the dollar cost per 1 million tokens for each model. It's loaded into memory once and referenced on every call to calculate `cost_usd`.
 
-**Why must pricing load before LLM clients?** The LLM clients don't need pricing, but this step comes before call handling. If pricing fails, every call would silently report `$0.00` — misleading data is worse than no data. Fail fast.
+**Why must pricing load before LLM clients?** If pricing fails, every call would silently report `$0.00` — misleading data is worse than no data. Fail fast.
 
 ---
 
-### Step 4 — Open the database
+### Step 5 — Open the database
 
 ```go
 database, err := db.Open(cfg.DBPath)
@@ -96,7 +118,7 @@ defer database.Close()
 
 ---
 
-### Step 5 — Run migrations
+### Step 6 — Run migrations
 
 ```go
 if err := db.Migrate(database); err != nil {
@@ -106,73 +128,129 @@ if err := db.Migrate(database); err != nil {
 
 `db.Migrate` runs all `CREATE TABLE IF NOT EXISTS` statements. On first launch, it creates every table. On subsequent launches, the `IF NOT EXISTS` clause means it skips tables that already exist — safe to run every time.
 
-**Why migrations on every startup?** No separate migration script to remember to run. The database schema is always up-to-date.
+The migration also runs guarded `ALTER TABLE` statements to add new columns to existing tables, so older databases upgrade automatically. See [08-database.md](08-database.md) for the full schema.
 
 ---
 
-### Step 6 — Build LLM clients
+### Step 7 — Build LLM clients
 
 ```go
 clients := llm.BuildClients(cfg)
 ```
 
-Creates one HTTP client per provider (currently Groq and Meesho gateway). Each client knows its base URL and API key. See [03-models-and-routing.md](03-models-and-routing.md) for details.
+Creates one HTTP client per provider (Groq and Meesho gateway). Each client knows its base URL and API key. See [03-models-and-routing.md](03-models-and-routing.md) for details.
 
 ---
 
-### Step 7 — Start the recovery prober
-
-```go
-proberCtx, stopProber := context.WithCancel(context.Background())
-defer stopProber()
-llm.StartRecoveryProber(proberCtx, clients, 15*time.Second)
-```
-
-> **🔤 Go concept: goroutines and `context`**
-> `StartRecoveryProber` starts a **goroutine** — a lightweight background thread that runs concurrently with the main server. It pings unhealthy providers every 15 seconds to check if they've recovered.
->
-> `context.WithCancel` creates a "cancellation token". When the server shuts down and `stopProber()` is called (via `defer`), the prober goroutine receives the cancellation signal and stops cleanly. Without this, the goroutine would run forever even after the server exits — a "goroutine leak".
-
-**Why start the prober before accepting HTTP traffic?** If a provider was unhealthy during the last server run (and state was lost at restart), the prober will discover it's healthy again before the first user request arrives.
-
----
-
-### Steps 8–10 — Load tasks
+### Step 8 — Load tasks + seed built-ins
 
 ```go
 taskStore := tasks.NewStore(database)
-tasks.SeedPlayground(taskStore)
-tasks.LoadYAMLDir(taskStore, "./tasks.d")
+if err := tasks.SeedPlayground(taskStore); err != nil {
+    log.Fatalf("seed playground task: %v", err)
+}
+if err := tasks.SeedAttributeExtraction(taskStore); err != nil {
+    log.Fatalf("seed attribute-extraction task: %v", err)
+}
 ```
 
-The task store is a combination of the database (for persistence) and an in-memory cache (for speed). At startup:
-1. The built-in "playground" task is seeded if it doesn't exist.
-2. YAML files from `tasks.d/` are loaded — this is how you add product tasks without touching code.
+The task store combines the database (for persistence) with an in-memory cache (for speed). At startup, two built-in tasks are seeded if they don't already exist:
+
+- **`playground`** — the free-form task backing the Studio's `/run` endpoint.
+- **`attribute-extraction`** — a demo product task for extracting structured attributes from text.
+
+All other tasks are authored at runtime through the API (`POST /v1/tasks`) and persist in the database.
 
 ---
 
-### Step 11 — Async writers
+### Step 9 — Create the user store
+
+```go
+userStore := users.NewDemoStore()
+```
+
+The demo store is a swap seam — a single hardcoded admin user for development. Replace `NewDemoStore` with a real Store implementation (LDAP, OAuth2, internal SSO) and nothing else in the platform changes. See [09-auth-and-rbac.md](09-auth-and-rbac.md).
+
+---
+
+### Step 10 — Async run writer
 
 ```go
 runWriter := db.NewRunWriter(database, 0)
 defer runWriter.Close()
-healthWriter := db.NewHealthEventWriter(database, 0)
-defer healthWriter.Close()
 ```
 
-Two background goroutines that write to the database **off the hot path**. When a prediction completes, instead of waiting for the DB INSERT to finish before returning the response, the handler drops the record into a channel and returns immediately. The writer goroutine drains the channel in the background.
+A background goroutine that writes prediction run rows to the database **off the hot path**. When a prediction completes, the handler drops the record into a channel and returns immediately. The writer drains the channel in the background.
 
-**Why async?** A SQLite write can take 1–5ms. For a prediction that took 500ms to get an LLM response, adding 5ms of DB latency sounds small — but under high concurrency, the single-writer lock on SQLite creates a bottleneck. Async writing removes this bottleneck entirely.
+**Why async?** A SQLite write can take 1–5ms. Under high concurrency, the single-writer lock creates a bottleneck. Async writing removes this bottleneck entirely.
 
 See [08-database.md](08-database.md) for details on the async writer design.
 
 ---
 
-### Step 12 — Health tracker and prediction cache
+### Step 11 — Async gateway attempt writer
 
 ```go
-healthTracker := health.NewTracker(health.Config{...}, healthWriter.Write)
+attemptWriter := db.NewGatewayAttemptWriter(database, 0)
+defer attemptWriter.Close()
+```
 
+A second async writer, specifically for the gateway trace — one row per model the fallback walk touched in a prediction. While the run writer captures the final answer, the attempt writer captures **everything that happened getting there**: every fallback, why it happened, the error and its classification, retry counts, and per-call latency.
+
+The attempt writer uses a larger default buffer (4096 vs. 2048 for the run writer) because a single run can produce several attempt rows (one per model in the chain).
+
+**Why a separate writer?** Attempt rows are higher volume (one per model call, not per prediction) and not needed for the response. Keeping them on a separate async path prevents noisy trace writes from interfering with run writes.
+
+---
+
+### Step 12 — Health writer and tracker
+
+```go
+healthWriter := db.NewHealthEventWriter(database, 0)
+defer healthWriter.Close()
+healthTracker := health.NewTracker(health.Config{
+    Enabled:      cfg.HealthBreakerEnabled,
+    Threshold:    cfg.HealthThreshold,
+    BaseCooldown: cfg.HealthBaseCooldown,
+    MaxCooldown:  cfg.HealthMaxCooldown,
+    Factor:       2,
+}, healthWriter.Write)
+```
+
+The health tracker is the per-(task, model) circuit breaker. Every state transition (failure, tripped, recovered, manual reset) is written to `model_health_events` via the health writer. See [06-circuit-breaker.md](06-circuit-breaker.md) for the full explanation.
+
+---
+
+### Step 13 — Rate limiter
+
+```go
+limiter := ratelimit.New(ratelimit.Config{
+    Enabled:        cfg.RateLimitEnabled,
+    Window:         cfg.RateWindow,
+    MaxRequests:    cfg.RateMaxRequests,
+    MaxTokens:      cfg.RateMaxTokens,
+    MaxInputTokens: cfg.RateMaxInputTokens,
+    CharsPerToken:  cfg.RateCharsPerToken,
+    TokensPerImage: cfg.RateTokensPerImage,
+})
+```
+
+A per-task rolling-window rate limiter with three gates:
+
+1. **Per-request input cap** — rejects a single request whose estimated input tokens are too large (returns 413).
+2. **Request-rate cap** — at most N requests per task per window (returns 429).
+3. **Token budget** — at most N tokens consumed per task per window, enforced "reserve upfront" (returns 429).
+
+Each task has its own independent window — different tasks never serialize against each other. Defaults: enabled, 1-minute window, 600 requests, 200,000 tokens, 16,000 tokens per request.
+
+See [02-config.md](02-config.md) for all the tuning knobs.
+
+---
+
+### Step 14 — Prediction cache
+
+```go
+var predictionCache cache.Cache
 switch cfg.CacheBackend {
 case "redis": predictionCache = cache.NewRedis(...)
 case "memory": predictionCache = cache.NewMemory()
@@ -180,35 +258,36 @@ default: // off
 }
 ```
 
-The health tracker is the per-(task, model) circuit breaker. The prediction cache is either Redis (production) or in-memory (dev). Both are explained in their dedicated docs.
+The prediction cache stores responses so identical requests return the stored answer instantly. Redis in production, in-memory for local dev, off by default. See [10-caching-and-cost.md](10-caching-and-cost.md).
 
 ---
 
-### Step 13 — Build the router
+### Step 15 — Build the router
 
 ```go
 router := api.NewRouter(api.RouterDeps{
     DB: database, Clients: clients, Users: userStore,
-    Tasks: taskStore, Runs: runWriter, Cache: predictionCache,
-    Health: healthTracker, Auth: ..., AllowedOrigins: ...,
+    Tasks: taskStore, Runs: runWriter, Attempts: attemptWriter,
+    Cache: predictionCache, Health: healthTracker, Limiter: limiter,
+    Auth: ..., AllowedOrigins: ...,
 })
 ```
 
 > **🔤 Go concept: structs as function parameters**
-> Instead of passing 10 separate arguments to `NewRouter(db, clients, users, tasks, ...)`, Go code groups them into a struct (`RouterDeps`). This is a common pattern — it's easier to read and adding a new dependency doesn't break existing call sites.
+> Instead of passing 10+ separate arguments to `NewRouter(db, clients, users, tasks, ...)`, Go code groups them into a struct (`RouterDeps`). This is a common pattern — it's easier to read and adding a new dependency doesn't break existing call sites.
 
-`NewRouter` registers every HTTP route and binds each handler to all its dependencies. See [04-prediction-flow.md](04-prediction-flow.md) and [09-auth-and-rbac.md](09-auth-and-rbac.md) for the routing details.
+`NewRouter` registers every HTTP route and binds each handler to all its dependencies. The router now receives both the `Attempts` writer (for gateway traces) and the `Limiter` (for rate limiting) alongside the other deps.
 
 ---
 
-### Step 14 — Listen for connections
+### Step 16 — Listen for connections
 
 ```go
 addr := ":" + cfg.Port  // e.g. ":8000"
 http.ListenAndServe(addr, router)
 ```
 
-The server is now ready. It will run until the process is killed (Ctrl+C or SIGTERM), at which point all the `defer` calls run in reverse order (close writers, close DB, stop prober).
+The server is now ready. It will run until the process is killed (Ctrl+C or SIGTERM), at which point all the `defer` calls run in reverse order (close cache, close limiter, close writers, close DB).
 
 ---
 
@@ -221,8 +300,8 @@ The server is now ready. It will run until the process is killed (Ctrl+C or SIGT
 | DB open | `log.Fatalf` — server exits | Can't run without persistence |
 | Migrations | `log.Fatalf` — server exits | Schema could be inconsistent |
 | LLM clients | No error — clients are built even if keys are empty | A missing key just fails at call time (per-model) |
-| Recovery prober | Goroutine launch can't fail | Background loop, not critical path |
-| Task loading | `log.Fatalf` — server exits if YAML is malformed | Bad task config would silently cause 500s |
+| Task seeding | `log.Fatalf` — server exits if seeding fails | Missing built-in tasks would cause 404s |
+| Async writers | No error possible — goroutine launches always succeed | Background loops, not critical path |
 | Cache | `log.Fatalf` only for Redis config errors; "off" if unconfigured | Cache is an optimization, not a hard requirement |
 | Router | No error possible | Pure in-memory setup |
 | Listen | `log.Fatalf` if port is already in use | Can't start without a port |

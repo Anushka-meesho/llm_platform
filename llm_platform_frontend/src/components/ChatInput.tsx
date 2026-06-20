@@ -4,6 +4,13 @@ import type { TUIMessage } from '../types';
 import { countTokens, estimateCost, formatCost } from '../utils/tokens';
 import { usePersistentState } from '../hooks/usePersistentState';
 
+function imageTokensPerImage(model: string): number {
+  if (model.startsWith('claude')) return 1590;
+  if (model.startsWith('gpt') || model.startsWith('o1') || model.startsWith('o3')) return 765;
+  if (model.startsWith('gemini')) return 258;
+  return 1024;
+}
+
 type TChatInputProps = {
   onSubmit: (text: string, files: File[]) => Promise<void>;
   isLoading: boolean;
@@ -34,12 +41,18 @@ const ChatInput = ({
   const handleFiles = useCallback((selected: FileList | null) => {
     if (!selected) return;
     const arr = Array.from(selected);
-    setFiles((prev) => [...prev, ...arr]);
-    arr.forEach((f) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        setPreviews((prev) => [...prev, reader.result as string]);
-      reader.readAsDataURL(f);
+    const reads = arr.map(
+      (f) =>
+        new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        }),
+    );
+    Promise.all(reads).then((urls) => {
+      setFiles((prev) => [...prev, ...arr]);
+      setPreviews((prev) => [...prev, ...urls]);
     });
   }, []);
 
@@ -84,11 +97,12 @@ const ChatInput = ({
         (acc, msg) => acc + countTokens(msg.content, model),
         0,
       );
-      const inputTokens = systemTok + historyTok + msgTok;
+      const imageTok = previews.length * imageTokensPerImage(model);
+      const inputTokens = systemTok + historyTok + msgTok + imageTok;
       const cost = estimateCost(model, inputTokens, maxOutputTokens);
       return { model, inputTokens, cost };
     });
-  }, [selectedModels, systemPrompt, conversations, text, maxOutputTokens]);
+  }, [selectedModels, systemPrompt, conversations, text, previews, maxOutputTokens]);
 
   const totalCost = useMemo(
     () => estimates.reduce((s, e) => s + e.cost, 0),
@@ -146,7 +160,10 @@ const ChatInput = ({
           multiple
           accept="image/*"
           className="hidden"
-          onChange={(e) => handleFiles(e.target.files)}
+          onChange={(e) => {
+            handleFiles(e.target.files);
+            e.target.value = '';
+          }}
         />
 
         <div className="flex-1">
@@ -204,7 +221,7 @@ const ChatInput = ({
                 </div>
               </div>
               <p className="text-xs text-tertiary-text mt-2 leading-relaxed">
-                Approximate — input tokens via cl100k_base · output cost estimated from max tokens setting.
+                Approximate — text via cl100k_base · images estimated at ~765–1590 tok/image · output cost from max tokens setting.
               </p>
             </div>
           )}

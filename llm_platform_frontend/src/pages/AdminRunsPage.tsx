@@ -25,6 +25,7 @@ const AdminRunsPage = () => {
   const [filters, setFilters] = usePersistentState<TRunFilters>('history.filters', {
     page: 1,
     pageSize: 25,
+    hasTask: true,
   });
   const [data, setData] = useState<TRunListResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -189,6 +190,14 @@ const AdminRunsPage = () => {
               <option value="test">Test</option>
             </select>
           </FilterField>
+          <label className="flex items-center gap-1.5 text-xs text-secondary-text cursor-pointer select-none pb-1">
+            <input
+              type="checkbox"
+              checked={!filters.hasTask}
+              onChange={(e) => patch({ hasTask: e.target.checked ? undefined : true })}
+            />
+            Include compare tasks
+          </label>
         </div>
 
         {/* Table */}

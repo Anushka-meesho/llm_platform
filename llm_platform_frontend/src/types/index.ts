@@ -279,6 +279,7 @@ export type TRunFilters = {
   q?: string;
   status?: '' | 'success' | 'error';
   type?: '' | 'production' | 'test';
+  hasTask?: boolean;
 };
 
 // ── Admin: model health (per-(task, model) circuit breaker) ───────────────────

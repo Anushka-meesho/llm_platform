@@ -262,6 +262,7 @@ export const api = {
     if (f.q) p.set('q', f.q);
     if (f.status) p.set('status', f.status);
     if (f.type) p.set('type', f.type);
+    if (f.hasTask) p.set('has_task', 'true');
     return fetchJSON<TRunListResponse>(`${BASE}/v1/admin/runs?${p.toString()}`);
   },
 

@@ -121,8 +121,9 @@ Every `ModelResult` carries two public flags:
 ```go
 type ModelResult struct {
     // ...
-    FallbackUsed bool   // true if this was served by model[1], [2], etc. (not [0])
-    Degraded     bool   // true if FallbackUsed=true, OR if the whole chain failed
+    FallbackUsed bool      // true if this was served by model[1], [2], etc. (not [0])
+    Degraded     bool      // true if FallbackUsed=true, OR if the whole chain failed
+    Attempts     []Attempt // full gateway trace — one entry per model the walk touched
 }
 ```
 
@@ -140,6 +141,55 @@ These are surfaced in the API response so callers can observe degradation:
 This tells the caller: "you got an answer, but from a fallback model — the primary is currently unhealthy."
 
 There's also an `X-Platform-Degraded: true` response header for callers who check headers rather than JSON.
+
+---
+
+## The gateway trace: `Attempt`
+
+Every model the walk touches — whether it succeeded, failed, was skipped, or was a cache hit — is recorded as an `Attempt`:
+
+```go
+type Attempt struct {
+    Seq            int     // 0-based walk order (0 = configured primary)
+    Model          string
+    Provider       string
+    Outcome        string  // "success" | "error" | "schema_invalid" | "skipped_unhealthy" | "cache_hit"
+    FallbackUsed   bool    // seq > 0
+    FallbackReason string  // why the walk advanced past this model (empty on success/cache_hit)
+    Response       *string // the model's output, when any (set even for schema_invalid)
+    Error          string  // classified error message
+    HTTPStatus     int     // last upstream HTTP status (0 if no response reached)
+    InfraFailure   bool    // provider-infra trouble: 5xx, 429, network, timeout
+    RetryCount     int     // upstream HTTP attempts made (1 = no retry)
+    LatencyMs      int
+    InputTokens    int
+    OutputTokens   int
+    TotalTokens    int
+    CostUSD        float64
+}
+```
+
+The `Attempts` slice is attached to the `ModelResult` by a `defer` at the top of `CallWithFallbackOpts`:
+
+```go
+var attempts []Attempt
+defer func() { result.Attempts = attempts }()
+```
+
+> **🔤 Go concept: `defer` with closure**
+> The `defer` here runs when the function returns — at that point `attempts` has been fully populated by the walk loop. The closure captures the slice *by reference*, so whatever is in `attempts` at return time is what gets attached to `result`. This is a clean way to ensure the trace is always attached, even when the function returns early (cache hit, content error).
+
+The caller (`executePrediction`) persists the full `Attempts` slice to the `gateway_attempts` table via the async `GatewayAttemptWriter`. The `runs` table records what the caller received; `gateway_attempts` records everything that happened behind it.
+
+### Outcome values
+
+| Outcome | When it happens |
+|---------|----------------|
+| `success` | Model returned content and passed schema validation (or no schema) |
+| `error` | Provider returned an error or timed out |
+| `schema_invalid` | Model returned 200 OK but output failed schema validation — treated as a failure |
+| `skipped_unhealthy` | Circuit breaker blocked this model — no call was made |
+| `cache_hit` | A cached answer was found for this model — no provider call |
 
 ---
 

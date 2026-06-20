@@ -291,6 +291,7 @@ type RunFilter struct {
 	Query     string // case-insensitive substring of the prompt text
 	Success   *bool  // nil = either; else filter on success
 	IsTest    *bool  // nil = both production and test; else filter on is_test
+	HasTask   *bool  // when true: only runs with a task_id (excludes compare/playground runs)
 }
 
 // where builds the SQL WHERE clause + args shared by ListAllRuns and its count.
@@ -320,6 +321,9 @@ func (f RunFilter) where() (string, []any) {
 	if f.IsTest != nil {
 		clauses = append(clauses, "is_test = ?")
 		args = append(args, boolToInt(*f.IsTest))
+	}
+	if f.HasTask != nil && *f.HasTask {
+		clauses = append(clauses, "task_id IS NOT NULL AND task_id != 'playground'") // 'playground' == tasks.PlaygroundTaskID
 	}
 	if len(clauses) == 0 {
 		return "", nil

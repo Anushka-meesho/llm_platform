@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -285,7 +286,8 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// to the tokens actually consumed after the walk — see Reconcile below.
 	var reservation ratelimit.Reservation
 	if opts.enforceLimits && h.Limiter.Enabled() {
-		est := h.Limiter.Estimate(renderTask.SystemPrompt+"\n"+prompt, len(images))
+		textForEst := stripBase64DataURLs(renderTask.SystemPrompt + "\n" + prompt)
+		est := h.Limiter.Estimate(textForEst, len(images))
 		res, dec := h.Limiter.Reserve(task.ID, est)
 		if !dec.Allowed {
 			return nil, limiterError(dec)
@@ -507,6 +509,17 @@ func (h *Handler) recordAttempts(runID string, taskID *string, attempts []llm.At
 			_ = db.InsertGatewayAttempt(h.DB, row)
 		}
 	}
+}
+
+// base64DataURLRe matches a base64-encoded data URL (e.g. "data:image/jpeg;base64,…").
+// Used to exclude image bytes from the text-token estimate; images are already
+// accounted for by the flat TokensPerImage cost in the rate limiter.
+var base64DataURLRe = regexp.MustCompile(`data:[^;]{1,50};base64,[A-Za-z0-9+/]+=*`)
+
+// stripBase64DataURLs replaces every base64 data URL in s with a short
+// placeholder so the rate-limit estimator doesn't count image bytes as text.
+func stripBase64DataURLs(s string) string {
+	return base64DataURLRe.ReplaceAllString(s, "[image]")
 }
 
 // collectImages gathers the multimodal inputs from a request, in submission
