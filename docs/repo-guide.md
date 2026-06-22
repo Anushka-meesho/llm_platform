@@ -1,6 +1,6 @@
 # LLM Platform — Complete Repository Guide
 
-**Last updated:** 2026-06-19
+**Last updated:** 2026-06-22
 **Scope:** `llm_platform_go` (backend) + `llm_platform_frontend` (operator Studio UI) +
 `llm_platform_client` (consumer-facing client portal). The Python `llm_platform_v0` is
 superseded and excluded.
@@ -259,6 +259,10 @@ and calls `issueSession`. Nothing else in the codebase knows where users come fr
 `PromptVersion`, `Model`, `FallbackModels` (executed by `CallWithFallback`), `Temperature`
 (default 0.2), `MaxTokens` (default 1000), `DailyBudgetUSD` (enforced by the budget gate),
 `CacheEnabled` / `CacheTTLSeconds` (per-task prediction-cache opt-in, default TTL 24h),
+`MaxPromptChars` (max characters of the rendered system+user prompt sent to the model),
+`MaxImageKB` (max size per uploaded image, in KB), `MaxImages` (max number of images per
+prediction) — these three are per-task input-size guardrails where `0` = no limit and
+`Validate()` rejects negative values —
 `Active`. `Validate()` checks slug shape, required fields, **known model routing keys**,
 schema compilability, and template parsability — a bad config is rejected at write time,
 not call time.
@@ -283,7 +287,12 @@ validates, returns the cleaned JSON.
 **Rendering** (`render.go`): Go `text/template` with `missingkey=error`. Fields declared
 in the input schema but absent from the request are pre-filled with `""` — so
 `{{if .description}}…{{end}}` optional-field guards work, while a template referencing an
-**undeclared** key fails loudly. Parsed templates cached by content hash.
+**undeclared** key fails loudly. Parsed templates cached by content hash. **Image fields are
+exposed to the template as their image *count*, not the raw value** (`imageInputFields` /
+`imageValueCount`): a base64 data URL is never inlined into the prompt text (which would bloat
+the prompt and the rate-limiter input estimate) — `{{if .image}}` still gates on presence and
+`{{.image}}` renders a small number instead of the bytes; the images themselves travel to the
+model as `image_url` attachments (§3.6).
 
 **Seeding** (`seed.go`): just `SeedPlayground`, which registers the built-in `playground`
 task once and never overwrites it. **There is no file/YAML seeding** — the DB is the single
@@ -296,9 +305,12 @@ input `{title*, description, category*, brand, images[]}` → output
 `{attributes: {string: string}, confidence: 0..1}`, model `gemini-2.5-flash` (vision),
 fallback `[gpt-4o-mini]` (vision), budget $50/day, `max_tokens: 2048` (Gemini 2.5 Flash
 spends hidden "thinking" tokens from the same budget; a tight cap truncates the JSON →
-schema-invalid), cache enabled at 24h TTL. The `images` (array of strings) field takes base64
-data URLs or image URLs and is attached to the vision model as multimodal content blocks
-(the backend still accepts a legacy single `image` string too) — see §3.6 (Multimodal input).
+schema-invalid), cache enabled at 24h TTL. The `images` field takes base64
+data URLs or image URLs and is attached to the vision model as multimodal content blocks.
+It is now **typed** via a JSON-Schema marker — `format:"image"` on the array's items (the
+field is recognised as an image input by that marker, not by its property name) — so an image
+field can carry any name. The backend still honours the implicit `image`/`images` names as a
+legacy fallback. See §3.6 (Multimodal input).
 
 ### 3.6 Model layer — `internal/llm`
 
@@ -328,6 +340,15 @@ gateway wire, enabling one is a one-line uncomment, no new provider code):
 The bracketed name is the `provider` attribution string recorded on each run. The
 `reasoning` flag (for OpenAI reasoning-family models that reject `max_tokens` /
 temperature) still exists in `providerConfig`, but no currently-active model sets it.
+
+**Gemini-2.5 thinking support** (`runner.go` + `client.go`): the Gemini 2.5 models spend hidden
+"thinking" tokens from the *same* output budget as the answer, so a low user-supplied
+`max_tokens` can leave no room for the actual response. `providerConfig.minOutputTokens` sets a
+per-model floor (`gemini-2.5-pro`: 8192, `gemini-2.5-flash`: 4096); `CallModel` silently raises
+`max_tokens` to that floor when it is lower. And `ChatMessage.UnmarshalJSON` now accepts the
+**array-shaped** content (`[{type:text,…}, …]`) that thinking models can return — it concatenates
+the `text` parts and **discards thought (non-text) parts** — in addition to the plain-string
+content form (so non-thinking models are unaffected).
 
 Helpers: `ProviderName(model)`, `KnownModel(model)`, `AllModels()` (sorted keys —
 backs `/health` `models_available`; `DefaultModels` stays the small /run
@@ -366,9 +387,13 @@ as thin wrappers (no gate, no validator) for callers that don't need health gati
 (base64 data URLs or image URLs). Its custom `MarshalJSON` emits the plain-string content
 form when there are no images (byte-identical to the legacy wire form) and the OpenAI
 multimodal array (`[{type:text}, {type:image_url}…]`) when there are — so one or many images
-ride the same OpenAI-compatible endpoint. The predict pipeline collects images from both an
-`image` (single string) and an `images` (array) input field, in submission order
-(`collectImages`), folds them into the cache key, and persists them on the run row.
+ride the same OpenAI-compatible endpoint. The predict pipeline collects images
+(`collectImages` + `imageSchemaFieldNames` in `predict_core.go`) by the **schema marker**: any
+input-schema property typed as an image — a string with `format:"image"`, or an array whose
+items carry `format:"image"` — under **any** property name. The implicit `image`/`images`
+names are still honoured as a **legacy fallback** (so untyped callers and pre-typing tasks keep
+working). A property may hold a single string or an array; blank/non-string entries are dropped.
+Collected images are folded into the cache key and persisted on the run row.
 
 **Per-(task, model) health breaker** (`internal/health`): distinct from the provider breaker
 above — keyed on a specific task's use of a specific model, so a model that misbehaves for one
@@ -502,7 +527,11 @@ daily time series; `TaskSpendToday` (budget gate), `TaskDailyStats` (per-task st
 endpoint). Pre-Phase-0 rows surface as task `untagged` via COALESCE. **Admin
 (cross-tenant, not user-scoped):** `ListAllRuns(filter, page, pageSize)` (lightweight
 rows — truncated prompt preview + image count, never the bytes — with filters on
-task/model/user/status/prod-vs-test and prompt-text search), `GetRunDetail(runID)`
+task/model/user/status/prod-vs-test and prompt-text search; `RunFilter` also carries `MaxID`
+(a point-in-time snapshot **anchor** — only rows with `id <= MaxID` are returned, so rows
+inserted while a user pages never shift the slices; 0 resolves to the current `MAX(id)` and the
+anchor actually used is returned for pinning the next page) and `HasTask` (when true, excludes
+playground/compare runs)), `GetRunDetail(runID)`
 (full prompt + per-model results + image data URLs), `DistinctRunModels` (filter
 dropdown), `InsertHealthEvent`, `ListHealthEvents(taskID, model, page, pageSize)`.
 Image columns serialize via `imagesToColumn` / `ParseImagesColumn` (JSON array,
@@ -558,7 +587,7 @@ capability, because these are privacy-sensitive cross-tenant views; non-admins g
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/admin/runs?page&page_size&task_id&model&user_email&q&status&type` | Prompt history across **all** users, newest first. Lightweight rows (truncated `prompt_preview` + `image_count`, never bytes). `status` = `success`\|`error`; `type` = `production`\|`test` |
+| `GET /v1/admin/runs?page&page_size&task_id&model&user_email&q&status&type&anchor_id&has_task` | Prompt history across **all** users, newest first. Lightweight rows (truncated `prompt_preview` + `image_count`, never bytes). `status` = `success`\|`error`; `type` = `production`\|`test`. `anchor_id` pins a point-in-time snapshot (only runs with `id ≤ anchor_id`, so a growing runs table never shifts rows across pages; absent → newest run now, and the resolved anchor is returned). `has_task=true` excludes playground/compare runs |
 | `GET /v1/admin/runs/models` | Distinct models seen in `runs` (filter dropdown) |
 | `GET /v1/admin/runs/{run_id}` | Full run detail: prompt, system prompt, image data URLs, per-model results |
 | `GET /v1/admin/model-health` | Live per-(task, model) circuit states `{enabled, statuses:[{task_id, model, provider, state, consecutive_failures, total_failures, total_successes, trips, cooldown_ms, open_for_seconds, last_reason, last_change}]}` |
@@ -575,7 +604,11 @@ cache, no DB read) → **budget gate** (429 + `Retry-After` to UTC midnight when
 spend ≥ cap; warn-log at 80%; cap 0 = exempt; spend comes from an in-memory view —
 `budget_cache.go`: DB SUM refresh ≤ every 5s + per-prediction local increments — so
 no per-request aggregate query and async-writer lag can't under-count) → `executePrediction`: `ValidateInput` (422) → `RenderPrompt` (+ `collectImages`
-attaches `image`/`images` as vision blocks) → `llm.CallWithFallbackOpts` over
+attaches the schema-typed image fields as vision blocks) → **per-task input-size limits**
+(`enforceInputLimits`: `MaxPromptChars` / `MaxImageKB` / `MaxImages`, 0 = no limit) →
+oversized input returns **413** (a SECOND, deterministic 413 source distinct from the §3.9
+rate-limiter's per-request input cap — retrying won't help, the input has to shrink) →
+`llm.CallWithFallbackOpts` over
 `[model, fallbacks...]` with the per-model **cache lookup** (hit → `cached:true`, zero
 usage, `cache_hit` run row), the **health gate** (skips models unhealthy for this task),
 and the **output validator** (production predicts only) → a provider error **or a
@@ -645,8 +678,10 @@ predict testing.
 - **Tasks / Studio** (`TasksPage`) — master/detail over the registry. A **+ New** button
   (admin) opens a `CreateTaskForm` that authors a task from scratch — id (live slug +
   duplicate check), name, description, primary model + fallback chain, temperature, max
-  tokens, daily budget, cache on/off + TTL, system prompt, prompt template, and optional
-  input/output schemas (reusing `SchemaEditor`) — and POSTs it to `/v1/tasks`. The detail
+  tokens, daily budget, cache on/off + TTL, an **Input limits** section (max text length /
+  max image size KB / max number of images — blank or 0 = no limit, mapping to
+  `max_prompt_chars` / `max_image_kb` / `max_images`), system prompt, prompt template, and
+  optional input/output schemas (reusing `SchemaEditor`) — and POSTs it to `/v1/tasks`. The detail
   header carries an **admin-only Delete task** button (confirm → `DELETE /v1/tasks/{id}`,
   refuses `playground`). Per task: config
   summary + 30-day usage strip, **model-routing chain editor** (ordered list,
@@ -654,7 +689,9 @@ predict testing.
   remove; saves `{model, fallback_models}` via PUT merge), **schema editor**
   (`components/SchemaEditor` + `utils/schema.ts`) — per-schema enable toggle
   plus a visual **Fields** mode (name / type / required / description, enum for
-  strings, element type for arrays) and a **JSON** mode that round-trips with it
+  strings, element type for arrays, and an **`image`** field type for input schemas —
+  which serializes to a JSON-Schema array with `items.format:"image"`, the marker the
+  backend recognises images by) and a **JSON** mode that round-trips with it
   and is the escape hatch for anything the field view can't represent (the
   converter returns null and forces JSON mode rather than dropping data); both
   schemas save in one PUT, prompt editor with token/cost estimate, **save draft →

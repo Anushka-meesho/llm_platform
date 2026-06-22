@@ -6,7 +6,7 @@ The platform is a **task-keyed LLM prediction service** plus a **Studio** for au
 
 There are **three deployables**: the Go backend (single binary), the **Studio** frontend (`llm_platform_frontend`, :5173) for teams that *operate* the platform, and the **client portal** (`llm_platform_client`, :5174) for teams that *call* it (catalog + live Try-it predict against `/v1/tasks/*`, authenticated as a service token — see §11). The superseded Python prototype `llm_platform_v0` is out of scope.
 
-> **Deployment readiness (2026-06-19).** The backend now supports a **pluggable database** (SQLite *or* Postgres via `DB_DRIVER`), an `APP_ENV=prod` boot gate (`config.Validate()` rejects insecure defaults), an `AUTH_MODE` switch (demo login vs an SSO scaffold), `cmd/migrate` + `cmd/bootstrap`, graceful shutdown + HTTP timeouts, and a `/ready` probe. RBAC is **two roles** — `admin` and `client` (§4). The split-repo / cross-origin / first-run runbook is `llm_platform_go/docs/DEPLOY.md`.
+> **Deployment readiness (2026-06-22).** The backend now supports a **pluggable database** (SQLite *or* Postgres via `DB_DRIVER`), an `APP_ENV=prod` boot gate (`config.Validate()` rejects insecure defaults), an `AUTH_MODE` switch (demo login vs an SSO scaffold), `cmd/migrate` + `cmd/bootstrap`, graceful shutdown + HTTP timeouts, and a `/ready` probe. RBAC is **two roles** — `admin` and `client` (§4). The split-repo / cross-origin / first-run runbook is `llm_platform_go/docs/DEPLOY.md`.
 
 ---
 
@@ -138,7 +138,8 @@ flowchart TD
 **Key facts**
 - **Budget gate** uses in-memory spend (refreshed from DB ≤ every 5s), not a per-request `SUM`. `daily_budget_usd: 0` = exempt. At ≥80% it logs a warning; at 100% it returns `429` with `Retry-After` set to seconds until UTC midnight.
 - **Routing chain** is `[task.Model, ...task.FallbackModels]`, read fresh from the config store on every request — a routing edit changes which model runs, immediately.
-- **Multimodal input**: an `image` (single string) and/or `images` (array) input field — base64 data URLs or image URLs — are collected in order and attached to the user message as OpenAI `image_url` content blocks for vision models. They also key the cache (a different photo is a different prediction) and are persisted on the run row.
+- **Multimodal input**: image inputs are recognised by a **JSON-Schema marker** — a property typed as a string with `format:"image"`, or an array whose `items` carry `format:"image"` — under *any* property name; the implicit `image`/`images` names are kept only as a legacy fallback for untyped callers and pre-typing tasks. Recognised image values (base64 data URLs or image URLs) are collected in order and attached to the user message as OpenAI `image_url` content blocks for vision models. They also key the cache (a different photo is a different prediction) and are persisted on the run row.
+- **Per-task input-size caps**: each task may set hard ceilings on text characters (rendered system + user prompt), per-image KB, and image count (0 = no limit). A predict that exceeds any of them is rejected with **413** (`input_too_large`). Unlike the production-only global rate limiter (§6), these caps are enforced on **both** production predicts **and** Studio test runs.
 - **Per-(task, model) health gate** (production predicts only): before calling a model the walk asks the breaker if it's healthy *for this task*; an unhealthy model is **skipped — no call made**. A provider failure **or a schema-invalid output** is recorded against health and **advances the chain to the next model in the same request**. After the threshold of consecutive failures the model trips unhealthy for a cooldown (exponential backoff); see §6.
 - **Per-model cache** is consulted *during* the walk, as the router reaches each model — never as a pre-call shortcut. So a recovered primary is always tried live rather than shadowed by a stale lower-priority cache entry.
 - **Output handling**: when a task has an output schema, the raw response is de-fenced (```` ```json ```` wrappers stripped) and validated; `output_valid` is `true`/`false`. If *every* model returns schema-invalid output, the last one is returned with `output_valid:false` (200, not an error). With no schema, `output` is null and `output_valid` is null (raw text only).
@@ -225,15 +226,16 @@ All errors are `{"detail": "<message>"}` with the HTTP status carrying the meani
 
 ### 5.3 Task product API (RBAC-gated)
 
-The full **Task object** (returned by create/get/update/list):
+The full **Task object** (returned by create/get/update/list). The three input-size-limit fields `max_prompt_chars`, `max_image_kb`, `max_images` are integers where **0 = no limit** — respectively the max characters of the rendered (system + user) prompt, max KB per image, and max image count; a predict that exceeds any of them returns **413**:
 ```
 { id, name, description,
   input_schema|null, output_schema|null,
   prompt_template, system_prompt, prompt_version,
   model, fallback_models[],
   temperature, max_tokens, daily_budget_usd,
-  cache_enabled, cache_ttl_seconds, active,
-  created_at, updated_at }
+  cache_enabled, cache_ttl_seconds,
+  max_prompt_chars, max_image_kb, max_images,  // per-task input-size limits
+  active, created_at, updated_at }
 ```
 
 | Method · Path | Perm | Accepts | Returns / notes |
@@ -269,7 +271,7 @@ The full **Task object** (returned by create/get/update/list):
 ```
 Header `X-Platform-Degraded: true` is set when a fallback served it or the chain failed.
 
-**Multimodal inputs**: `inputs` may include an `image` (single string) and/or `images` (array of strings) field — base64 data URLs (`data:image/jpeg;base64,…`) or image URLs — when the task declares them. They are attached to the user message as `image_url` blocks for vision models (not rendered into the prompt text), key the cache, and are persisted on the run row. The backend accepts **both** keys for backward compatibility, but the live `attribute-extraction` task now declares only `images` (one-or-many); the client portal renders a single image picker for it (see §8).
+**Multimodal inputs**: image inputs are recognised by a **JSON-Schema marker**, not a fixed name — a property typed as a string with `format:"image"`, or an array whose `items` carry `format:"image"`, under whatever name the author chose. The implicit `image`/`images` names are kept only as a **legacy fallback** (untyped callers and pre-typing tasks). Recognised values — base64 data URLs (`data:image/jpeg;base64,…`) or image URLs — are attached to the user message as `image_url` blocks for vision models (not rendered into the prompt text), key the cache, and are persisted on the run row. The live `attribute-extraction` task declares a single image field (one-or-many); the client portal renders a single image picker for it (see §8).
 
 ### 5.4 Shadow comparison harness
 
@@ -285,7 +287,7 @@ Gated by the `RequireAdmin` middleware — the **`admin` role**, not a task capa
 
 | Method · Path | Accepts | Returns |
 |---|---|---|
-| `GET /v1/admin/runs` | query: `page, page_size (≤100), task_id, model, user_email, q (prompt substring), status (success\|error), type (production\|test)` | Prompt history across **all** users, newest first: `{page, page_size, total_runs, total_pages, runs:[{id, run_id, task_id, user_email, model, provider, prompt_preview, has_image, image_count, success, cache_hit, fallback_used, is_test, latency_ms, total_tokens, cost_usd, created_at}]}`. Rows are lightweight — truncated preview + image **count**, never the bytes |
+| `GET /v1/admin/runs` | query: `page, page_size (≤100), task_id, model, user_email, q (prompt substring), status (success\|error), type (production\|test), has_task (true → exclude playground/compare runs), anchor_id (point-in-time snapshot pin — only runs at or below it, so a growing runs table doesn't shift rows across pages; the resolved anchor is echoed back)` | Prompt history across **all** users, newest first: `{page, page_size, total_runs, total_pages, runs:[{id, run_id, task_id, user_email, model, provider, prompt_preview, has_image, image_count, success, cache_hit, fallback_used, is_test, latency_ms, total_tokens, cost_usd, created_at}]}`. Rows are lightweight — truncated preview + image **count**, never the bytes |
 | `GET /v1/admin/runs/models` | — | `{models:[…]}` — distinct models seen in `runs` (filter dropdown) |
 | `GET /v1/admin/runs/{run_id}` | — | Full detail: `{run_id, task_id, user_id, user_email, prompt_version, prompt, system_prompt, images:[…], is_test, created_at, results:[{model, provider, response, success, error, latency_ms, input/output/total_tokens, cost_usd, cache_hit, fallback_used}]}` · `404` |
 | `GET /v1/admin/model-health` | — | `{enabled, statuses:[{task_id, model, provider, state (healthy\|unhealthy\|probing), consecutive_failures, total_failures, total_successes, trips, cooldown_ms, open_for_seconds, last_reason, last_error, last_change}]}` |
@@ -311,6 +313,7 @@ All non-Groq models route through the Meesho gateway (`clientFn: meeshoC`); only
 The registry also carries more vendor variants commented out; since they all share the gateway's OpenAI-compatible wire, enabling one is a one-line uncomment with no new provider code.
 
 - **`reasoning` flag** (OpenAI reasoning family): the chat-completions wire rejects `max_tokens`/`temperature`, so `CallModel` sends `max_completion_tokens` and omits temperature. The flag exists in `providerConfig` but no currently-active model sets it.
+- **Gemini-2.5 thinking support**: thinking tokens share the same output budget as the response, so a low `max_tokens` can leave no room for the actual answer. Each thinking model carries a `minOutputTokens` floor (`gemini-2.5-pro`: 8192, `gemini-2.5-flash`: 4096); `CallModel` silently raises `max_tokens` to that floor when it is lower. Thinking models can also return **array-shaped** `content` (`[{type:"text",…}, {type:"thought",…}]`); `ChatMessage.UnmarshalJSON` accepts both the plain-string and array forms — it concatenates the text parts and discards thought parts.
 
 ### Providers
 - **`Provider` interface**: `Call(ctx, *chatRequest) (*chatResponse, error)`.
@@ -377,7 +380,7 @@ It uses **reserve-then-reconcile**: `executePrediction` reserves the request's e
 ## 8. Tasks, prompts, schemas
 
 ### Task config & validation
-Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, `fallback_models nil→[]`. Validation: slug id, known model(s), `name`/`prompt_template`/`model` required, `temperature∈[0,2]`, `max_tokens>0`, `cache_ttl_seconds≥0`, schemas must compile, template must parse.
+Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, `fallback_models nil→[]`. Validation: slug id, known model(s), `name`/`prompt_template`/`model` required, `temperature∈[0,2]`, `max_tokens>0`, `cache_ttl_seconds≥0`, the three input-size-limit fields (`max_prompt_chars`, `max_image_kb`, `max_images`) must each be **non-negative** (`Validate` rejects negatives), schemas must compile, template must parse.
 
 ### Task lifecycle & source of truth
 - **The DB is the single source of truth for tasks.** There is no file/YAML seeding layer — tasks are created, edited, and deleted at runtime through the Studio (`POST/PUT/DELETE /v1/tasks`) and persist in the `tasks` table.
@@ -389,7 +392,7 @@ Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, 
 - **Render**: Go `text/template` (`{{.field}}`, `{{if .field}}…{{end}}`), compiled templates cached by content hash, `missingkey=error` (referencing an undeclared key fails loudly). Declared input fields are pre-seeded so optional fields work with `{{if}}`.
 - **Input validation**: against `input_schema` (JSON Schema) when present; otherwise any input is accepted.
 - **Output validation**: strips a wrapping markdown code fence, then validates against `output_schema`; returns the cleaned JSON. No schema → raw text, no validation.
-- **Image inputs**: an `image` (string) and/or `images` (array of strings) input field carries base64 data URLs or image URLs. These are **not** rendered into the prompt text (the template only gates on them, e.g. `{{if .images}}…{{end}}`); they're attached to the user message as `image_url` vision blocks. The backend still accepts both keys, but the live `attribute-extraction` task declares only `images` (one-or-many; model `gemini-2.5-flash`, vision; `max_tokens: 2048` so Gemini's hidden "thinking" tokens don't truncate the JSON). The client portal renders one image picker for it — thumbnails with a corner ✕ and a click-to-zoom lightbox that also offers removal.
+- **Image inputs**: image fields are recognised by a JSON-Schema marker — a string with `format:"image"`, or an array whose `items` carry `format:"image"` — under any property name; the implicit `image`/`images` names are kept only as a legacy fallback. Their values carry base64 data URLs or image URLs and are **not** rendered into the prompt text: `RenderPrompt` exposes an image field to the template as its image **count** (so `{{if .images}}…{{end}}` still gates on presence and `{{.images}}` renders a small number), so the base64 bytes are never inlined into the prompt — they're attached to the user message as `image_url` vision blocks instead. The live `attribute-extraction` task declares one image field (one-or-many; model `gemini-2.5-flash`, vision; `max_tokens: 2048` so Gemini's hidden "thinking" tokens don't truncate the JSON). The client portal renders one image picker for it — thumbnails with a corner ✕ and a click-to-zoom lightbox that also offers removal.
 
 ### Prompt version lifecycle
 
@@ -416,7 +419,7 @@ The schema is identical across backends (selected by `DB_DRIVER`); `created_at` 
 
 | Table | Purpose | Notable columns |
 |---|---|---|
-| `tasks` | task registry / config | id (PK), name, description, input_schema, output_schema, prompt_template, system_prompt, prompt_version, model, fallback_models (JSON), temperature, max_tokens, daily_budget_usd, active, cache_enabled, cache_ttl_seconds, created_at, updated_at |
+| `tasks` | task registry / config | id (PK), name, description, input_schema, output_schema, prompt_template, system_prompt, prompt_version, model, fallback_models (JSON), temperature, max_tokens, daily_budget_usd, max_prompt_chars, max_image_kb, max_images (all INTEGER NOT NULL DEFAULT 0), active, cache_enabled, cache_ttl_seconds, created_at, updated_at |
 | `prompt_versions` | prompt history & drafts | id, task_id, version, prompt_template, system_prompt, note, created_by, created_at · unique (task_id, version) |
 | `runs` | the served answer — one row per model call (predict, /run, test, cache hits) | run_id, session_id, prompt, system_prompt, **image** (JSON array of data URLs/URLs, NULL for text-only), model, response, latency_ms, input/output/total_tokens, cost_usd, success, error, user_id, user_email, task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at |
 | `gateway_attempts` | the full fallback-walk trace — **one row per model the walk touched** | id, run_id, task_id, seq (0=primary), model, provider, outcome (success\|error\|schema_invalid\|skipped_unhealthy\|cache_hit), fallback_used, fallback_reason, response, error, http_status, infra_failure, retry_count, latency_ms, input/output/total_tokens, cost_usd, is_test, created_at · indexed run_id, task_id, model, outcome, created_at |
@@ -473,7 +476,7 @@ Single-page app gated by `/auth/me` (spinner → login → app). Navigation live
 | Page | What a user does |
 |---|---|
 | **Compare** (playground) | Pick 2–N models, enter prompt/system prompt (+ images), tune temperature/max tokens, see side-by-side responses (one scrolling `ModelColumn` per model) with latency/tokens/cost, rate 1–5★, browse/load/delete sessions, open the **🏆 Leaderboard** modal (avg ★ per model for the session, via `GET /sessions/{id}/leaderboard`; disabled until a session exists) |
-| **Tasks (Studio)** | **Create a task** (admin — a *New task* form covering id/name/description, model + fallback chain, sampling, budget, cache, prompt, and input/output schemas); browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model; view/compare/deploy version history (the embedded `VersionHistory` component); **delete a task** (admin) |
+| **Tasks (Studio)** | **Create a task** (admin — a *New task* form covering id/name/description, model + fallback chain, sampling, budget, cache, an **Input limits** section — max text length / max KB per image / max image count, blank or 0 = no limit — prompt, and input/output schemas); browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor — including an **"image" field type** that emits JSON-Schema `format:"image"`, with a per-field max-images control — or raw JSON); configure model routing; **test** against any version/model; view/compare/deploy version history (the embedded `VersionHistory` component); **delete a task** (admin) |
 | **Dashboard** | Totals (runs/tokens/spend), per-task and per-model breakdowns, daily spend trend, ratings, success rates |
 | **History** *(admin)* | Cross-tenant prompt history: filter/search every user's runs (task, model, user, status, prod-vs-test, prompt text), paginated; click a row for a detail drawer with the full prompt, image grid, per-model responses, and the **gateway-attempt trace** (every model the fallback walk touched). Lightweight list (server-truncated previews) so it stays fast on huge prompts/images |
 | **Health** *(admin)* | Per-(task, model) circuit-breaker console: live status table (auto-polls every 4s — state, cooldown remaining, failures, trips, last reason) with a **Mark healthy** override, plus a filterable event log (failure/tripped/recovered/manual_reset) |

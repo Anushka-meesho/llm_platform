@@ -1,0 +1,546 @@
+# Repo Work Doc — `llm_platform_go` (Go backend)
+
+**Last updated: 2026-06-22**
+
+> A reference manual for the standalone Go backend that powers the LLM platform. This is the **single binary** repo (`llm_platform_go` is the repo root): the HTTP API, the task-keyed prediction core, the LLM routing/fallback/health machinery, the prediction cache, prompt versioning, auth/RBAC, the data model, configuration, and how to run it. All paths in this document are rooted at the backend repo (`internal/...`, `cmd/...`).
+
+The backend is a **task-keyed LLM prediction service** plus the API behind a **Studio** (authoring/versioning prompts) and a **playground** (comparing models). A *task* bundles a prompt template, input/output JSON Schemas, a model routing chain (primary + fallbacks), sampling params, a daily budget, per-task input-size caps, and cache settings. Callers invoke a task by id; the platform renders the prompt, attaches any image inputs for vision models, routes to a model (with fallback **and** a per-`(task, model)` health breaker that routes around a model after repeated failures), validates output, caches, meters cost, and records every run. Admins get a cross-tenant **prompt-history** viewer and a **model-health** console.
+
+> **Deployment readiness (2026-06-22).** The backend supports a **pluggable database** (SQLite *or* Postgres via `DB_DRIVER`), an `APP_ENV=prod` boot gate (`config.Validate()` rejects insecure defaults), an `AUTH_MODE` switch (demo login vs an SSO scaffold), `cmd/migrate` + `cmd/bootstrap`, graceful shutdown + HTTP timeouts, and a `/ready` probe. RBAC is **two roles** — `admin` and `client` (§4). The split-repo / cross-origin / first-run runbook is `docs/DEPLOY.md`.
+
+---
+
+## Table of contents
+
+1. [System architecture](#1-system-architecture)
+2. [Tech stack](#2-tech-stack)
+3. [The prediction pipeline](#3-the-prediction-pipeline)
+4. [Authentication & RBAC](#4-authentication--rbac)
+5. [API reference](#5-api-reference)
+6. [LLM execution layer](#6-llm-execution-layer)
+7. [Prediction cache](#7-prediction-cache)
+8. [Tasks, prompts, schemas](#8-tasks-prompts-schemas)
+9. [Data model](#9-data-model)
+10. [Configuration](#10-configuration-environment-variables)
+11. [Running locally](#11-running-locally)
+
+> **Companion frontends & cross-origin contract.** This repo is **backend-only**. Two React/Vite single-page apps consume it over HTTP from separate repos: the **Studio** (operators — Compare/Tasks/Dashboard plus admin History/Health/Test) and the **client portal** (consumers — catalog + live Try-it predict against `/v1/tasks/*` with a service token). They are cookie-auth (Studio) or `Authorization: Bearer` service-token (portal) clients. CORS (`ALLOWED_ORIGINS`, `AllowCredentials: true`), the cookie scope (`COOKIE_DOMAIN`/`COOKIE_SECURE`), and the split-repo `VITE_BACKEND_URL` wiring are the cross-origin contract — the full runbook is in `docs/DEPLOY.md`.
+
+---
+
+## 1. System architecture
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 70, 'rankSpacing': 110, 'curve': 'basis', 'useMaxWidth': true}}}%%
+flowchart LR
+  subgraph Clients["HTTP clients (separate repos)"]
+    UI["Studio (operators)<br/>cookie-auth"]
+    CP["Client portal / machine callers<br/>Bearer svc-token (/v1 only)"]
+  end
+
+  subgraph API["Go API — internal/api (chi router)"]
+    MW["Auth + RBAC middleware<br/>(middleware.go, auth/rbac.go)"]
+    H["Handlers"]
+    EP["executePrediction pipeline<br/>(predict_core.go)"]
+  end
+
+  subgraph LLMCORE["LLM execution layer — internal/llm"]
+    FB["CallWithFallbackOpts (chain walk:<br/>health gate + cache + output validator)"]
+    REG["Model registry (runner.go)"]
+    HB["Health breaker (per task+model)<br/>internal/health"]
+  end
+
+  subgraph Backends["Provider backends — 1 OpenAI-compatible client, 2 wirings"]
+    GRQ["Groq API (direct, Bearer)<br/>llama-groq"]
+    subgraph MSH["Meesho gateway (x-bf-vk)"]
+      OAI["OpenAI: gpt-4o · gpt-4o-mini"]
+      GEM["Gemini: 2.5-pro · 2.5-flash"]
+      ANT["Anthropic: claude-sonnet-4-6"]
+    end
+  end
+
+  subgraph State["State"]
+    DB[("Database — internal/db<br/>SQLite (WAL) | Postgres")]
+    CACHE[("Prediction cache — internal/cache<br/>Redis | memory | off")]
+    STORE["Task config store<br/>internal/tasks (in-proc cache + editMu)"]
+    HEALTH["Health tracker<br/>(in-proc, per task+model)"]
+  end
+
+  UI -->|"cookie-auth JSON"| MW --> H
+  CP -->|"Bearer svc-token JSON (/v1 only)"| MW
+  H --> EP
+  H <--> STORE
+  H <-->|"admin: snapshot / reset"| HEALTH
+  STORE <--> DB
+  EP --> FB --> REG
+  REG -->|"llama-groq"| GRQ
+  REG -->|"all other models"| MSH
+  FB <-->|"allow / record"| HB
+  HB <--> HEALTH
+  HEALTH -->|"async events"| DB
+  EP <--> CACHE
+  EP -->|"async run rows + gateway trace"| DB
+```
+
+**Process boundaries**
+
+| Boundary | Where it lives | Notes |
+|---|---|---|
+| API process | `cmd/server` + `internal/api` | One Go server process. chi router, graceful shutdown, HTTP read/write/idle timeouts. |
+| Task config | `tasks` table → `internal/tasks.Store` | DB is the source of truth, fronted by an in-process config cache (5s TTL) coordinated by a read/write lock (`editMu`). |
+| Prediction cache | `internal/cache` | Separate store: Redis in prod, in-process memory for dev, or off. Cache errors are misses — never fail a prediction. |
+| Observability writers | `internal/db` (`RunWriter`, `GatewayAttemptWriter`, `HealthEventWriter`) | Async, buffered-channel writers. Run rows **and** the per-attempt gateway trace (`gateway_attempts`, §9) never block the request hot path. |
+| Rate limiter + budget gate | `internal/ratelimit`, `internal/api/budget_cache.go` | A per-task rolling-window limiter and the per-task daily budget gate both sit in front of production predicts (§3, §6). |
+| Health breaker | `internal/health` (in-process) | Per-`(task, model)` state, mutex-guarded; resets on restart; transitions persisted to `model_health_events`. |
+
+---
+
+## 2. Tech stack
+
+The backend has **no native vendor LLM SDKs** — every provider is reached over an OpenAI-compatible chat-completions wire. Direct (non-indirect) dependencies from `go.mod` (Go 1.25):
+
+| Dependency | Purpose |
+|---|---|
+| `github.com/go-chi/chi/v5` | HTTP router and middleware (request-id, logger, recoverer). |
+| `github.com/go-chi/cors` | CORS middleware (`ALLOWED_ORIGINS`, credentialed). |
+| `modernc.org/sqlite` | Pure-Go SQLite driver (no cgo). WAL, single writer. Used when `DB_DRIVER=sqlite`. |
+| `github.com/jackc/pgx/v5` | Postgres driver + real connection pool. Used when `DB_DRIVER=postgres`. |
+| `github.com/golang-jwt/jwt/v5` | HS256 session/service tokens. |
+| `github.com/google/uuid` | Run / session / report ids. |
+| `github.com/redis/go-redis/v9` | Redis prediction-cache backend. |
+| `github.com/santhosh-tekuri/jsonschema/v6` | JSON Schema compilation + input/output validation. |
+| `github.com/joho/godotenv` | `.env` loading at startup. |
+| `gopkg.in/yaml.v3` | Embedded request-body schemas (`internal/schema`) and `dev.yaml`-style config. |
+| `github.com/alicebob/miniredis/v2` | In-memory Redis for cache tests. |
+
+Plus the standard library: `text/template` for prompt rendering, `crypto/sha256` for cache keys, `database/sql` for the SQLite/Postgres seam, `net/http` for both server and provider clients.
+
+The dialect seam (`internal/db/dialect.go`) rewrites portable `?` placeholders to `$n` for Postgres so one set of queries serves both backends.
+
+---
+
+## 3. The prediction pipeline
+
+Endpoint: `POST /v1/tasks/{task_id}/predict`. The same core (`executePrediction` in `internal/api/predict_core.go`) backs `/predict`, `/test`, and shadow comparison — differing only by options (test/shadow bypass the cache and don't feed production health in the same way).
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 55, 'rankSpacing': 70, 'curve': 'basis', 'useMaxWidth': true}}}%%
+flowchart TD
+  A["POST /predict {inputs}"] --> B{"Task exists & active?"}
+  B -- "no" --> B1["404 / 409"]
+  B -- "yes" --> SZ{"Within per-task size caps?<br/>(max_prompt_chars / max_image_kb / max_images)"}
+  SZ -- "no" --> SZ1["413 input_too_large"]
+  SZ -- "yes" --> C{"Daily budget left?"}
+  C -- "no" --> C1["429 + Retry-After (UTC midnight)"]
+  C -- "yes" --> RL{"Rate limiter (prod only):<br/>input cap / req-rate / token budget?"}
+  RL -- "over input cap" --> RL1["413 input_too_large"]
+  RL -- "over rate/token" --> RL2["429 + Retry-After (window refill)"]
+  RL -- "ok (reserve estimate)" --> D["Validate inputs vs input_schema"]
+  D -- "invalid" --> D1["422"]
+  D -- "valid" --> E["Render prompt (Go template + inputs)"]
+  E --> F["Build messages (system + user + image_url blocks)"]
+  F --> G["Chain = [primary, ...fallbacks] (read fresh from config store)"]
+  G --> H["CallWithFallbackOpts walks the chain<br/>(health gate + cache + output validator)"]
+
+  subgraph WALK["For each model in chain order (production)"]
+    H --> HG{"Healthy for this task?<br/>(per task+model breaker)"}
+    HG -- "no" --> K["Skip — no call · advance chain"]
+    HG -- "yes" --> I{"Per-model cache hit?<br/>(only if cacheable)"}
+    I -- "yes" --> I1["Serve cached answer · stop · zero cost"]
+    I -- "no" --> L["Call provider (≤3 tries, backoff on 429/5xx)"]
+    L --> M{"Outcome"}
+    M -- "success + schema-valid" --> N["record healthy · stop"]
+    M -- "success but schema-invalid" --> KR["record failure · advance"]
+    M -- "content error (400/422)" --> N2["return as-is · not counted"]
+    M -- "infra/config error (429/5xx/401/403/404/net)" --> KR
+    KR --> K
+    K --> HG
+  end
+
+  N --> O{"Output schema?"}
+  N2 --> O
+  O -- "yes" --> P["Strip code fences · validate · set output_valid"]
+  O -- "no" --> Q["raw text, output_valid = null"]
+  P --> R["Cache fill (per-model, clean success only)"]
+  Q --> R
+  R --> RC["Reconcile rate-limiter reservation to actual tokens"]
+  RC --> S["Async run row (+ images) + gateway trace · update spend"]
+  S --> T{"usable?"}
+  T -- "yes" --> T1["200 (+ X-Platform-Degraded if fallback/degraded)"]
+  T -- "no (chain failed / all unhealthy)" --> T2["502 (+ X-Platform-Degraded)"]
+```
+
+**Key facts**
+
+- **Budget gate** uses in-memory spend (refreshed from DB ≤ every 5s — `budget_cache.go`), not a per-request `SUM`. `daily_budget_usd: 0` = exempt. At ≥80% it logs a warning; at 100% it returns `429` with `Retry-After` set to seconds until UTC midnight.
+- **Routing chain** is `[task.Model, ...task.FallbackModels]`, read fresh from the config store on every request — a routing edit changes which model runs, immediately.
+- **Multimodal input** via the `format:"image"` marker: image inputs are recognised by a **JSON-Schema marker** — a property typed as a string with `format:"image"`, or an array whose `items` carry `format:"image"` — under *any* property name; the implicit `image`/`images` names are kept only as a **legacy fallback** for untyped callers and pre-typing tasks. Recognised values (base64 data URLs or image URLs) are collected in order and attached to the user message as OpenAI `image_url` content blocks for vision models. They also key the cache (a different photo is a different prediction) and are persisted on the run row.
+- **Per-task SIZE caps → 413, on predict AND test**: each task may set hard ceilings on text characters (rendered system + user prompt), per-image KB, and image count (`0` = no limit). A request that exceeds any of them is rejected with **413** (`input_too_large`). Unlike the production-only global rate limiter (§6), these caps are enforced on **both** production predicts **and** Studio test runs.
+- **Per-`(task, model)` health gate** (production predicts only): before calling a model the walk asks the breaker if it's healthy *for this task*; an unhealthy model is **skipped — no call made**. A provider failure **or a schema-invalid output** is recorded against health and **advances the chain to the next model in the same request**. After the threshold of consecutive failures the model trips unhealthy for a cooldown (exponential backoff); see §6.
+- **Rate limiter** (production predicts only): three gates — per-request input cap (→ 413), request-rate cap (→ 429), and per-window token budget (→ 429 with `Retry-After`). Reserve-then-reconcile (§6). Test/shadow runs are not rate-limited.
+- **Per-model cache** is consulted *during* the walk, as the router reaches each model — never as a pre-call shortcut. So a recovered primary is always tried live rather than shadowed by a stale lower-priority cache entry.
+- **Valid-only output handling**: when a task has an output schema, the raw response is de-fenced (` ```json ` wrappers stripped) and validated; `output_valid` is `true`/`false`. If *every* model returns schema-invalid output, the last one is returned with `output_valid:false` (200, not an error). With no schema, `output` is null and `output_valid` is null (raw text only).
+- **Cache fill**: only on a *clean* success (schema valid, or no schema). Failures and schema-invalid outputs are never cached. One entry, keyed on the serving model, at the task's TTL (default 24h).
+- **Observability / gateway trace**: every call (including cache hits, marked `cache_hit=1` with zero cost) writes a `runs` row asynchronously, and the full fallback walk writes one `gateway_attempts` row per model it touched (§9). The run row also stores the image inputs.
+- **Test/shadow** runs (no `useCache`, or a single-model override) bypass health gating and the in-request schema fallback — they call the model exactly as asked and don't feed production health.
+
+---
+
+## 4. Authentication & RBAC
+
+### Auth modes
+
+`AUTH_MODE` selects how humans authenticate (`internal/api/router.go` registers the routes per mode):
+
+- **`demo`** (default, dev) — the passwordless pick-a-user login below (`/auth/demo-users`, `/auth/login`).
+- **`sso`** — the demo routes are **not registered**; `/auth/sso/login` + `/auth/sso/callback` take their place (an OIDC scaffold in `internal/api/auth_sso_handlers.go` that shares the cookie-minting tail with demo login; the IdP handshake is a documented `TODO` returning `501` until the `OIDC_*` env is wired). `config.Validate()` forbids `demo` in prod.
+
+### Login flow (demo mode)
+
+1. `POST /auth/login {user_id}` → looks up a user in the identity store (`internal/users`; the demo store is an in-memory SSO stand-in).
+2. Issues an HS256 JWT (`internal/auth`) with claims `sub, email, name, role, iss, iat, exp`.
+3. Sets an httpOnly cookie (`llm_platform_token` by default), `SameSite=Lax`, `Secure` configurable, `MaxAge = TOKEN_EXPIRY` (default 12h). For the subdomain deploy topology set `COOKIE_DOMAIN=.example.com` + `COOKIE_SECURE=true`.
+4. `RequireAuth` middleware accepts the token via `Authorization: Bearer …` or the cookie, validates signature + expiry, and puts the `auth.User` on the request context. Role is embedded in the token, so the predict hot path needs no identity lookup.
+
+The demo store seeds a **single** user:
+
+| id | email | role |
+|---|---|---|
+| `u-admin` | admin@demo.local | admin |
+
+A token with no role claim defaults to **admin** (`DefaultRole`, kept for backward compatibility; `cmd/issue-token` always stamps an explicit role).
+
+### Roles × permissions
+
+Two roles are wired today: the human **operator** (`admin`) and the service **client**. The capability set (`internal/auth/rbac.go`) is finer-grained (it anticipates future creator/approver splits), so `write`/`deploy`/`delete` are effectively admin-only.
+
+| Role | task:read | task:predict | task:write | task:deploy | task:delete | task:view_prompt |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **admin** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **client** | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
+
+- `RequirePermission(perm)` runs after `RequireAuth` and returns `403` (`role 'X' is not permitted to task:Y`) when the role lacks the capability. The cross-tenant admin views use `RequireAdmin` (the `admin` *role*, not a capability).
+- **Prompt redaction**: a `client` (no `task:view_prompt`) gets `prompt_template` and `system_prompt` blanked in task/version responses — it sees the contract (schemas, metadata), not the prompt internals.
+- `cmd/issue-token -role` mints service tokens (default `client`); `KnownRole` validates the flag.
+
+---
+
+## 5. API reference
+
+All errors are `{"detail": "<message>"}` with the HTTP status carrying the meaning. All non-public routes require a valid session (`RequireAuth`).
+
+### 5.1 Auth & meta (public unless noted)
+
+| Method · Path | Accepts | Returns |
+|---|---|---|
+| `GET /health` | — | liveness: `{status:"ok", models_available:[…]}` |
+| `GET /ready` | — | readiness: pings the DB → `{status:"ready"}` (200) or `{status:"not_ready",reason}` (503) |
+| `GET /auth/demo-users` *(demo mode only)* | — | `{users:[{id,email,name,role}]}` |
+| `POST /auth/login` *(demo mode only)* | `{user_id}` | `{user:{…}}` + sets cookie · 401 unknown · 422 missing |
+| `GET /auth/sso/login` · `GET /auth/sso/callback` *(sso mode only)* | — | IdP redirect / callback (OIDC scaffold; `501` until wired — §4) |
+| `POST /auth/logout` | — (auth) | `{status:"logged out"}` (clears cookie) |
+| `GET /auth/me` | — (auth) | `{user:{…}}` · 401 if not authed |
+| `GET /pricing` | — (auth) | `{pricing:{model:{input_cost_per_1k,output_cost_per_1k}}}` |
+
+### 5.2 Playground / analytics (any authenticated principal)
+
+**`POST /run`** — fan out one prompt across N models in parallel (the Compare playground).
+- Accepts: `{prompt (req), models?[], model_conversations?{model:[{role,content}]}, temperature?, max_tokens?, session_id?, system_prompt?}`
+- Returns: `{run_id, prompt, system_prompt, results:[{model,response,latency_ms,input_tokens,output_tokens,total_tokens,cost_usd,success,error}], total_wall_clock_ms, models_succeeded, models_failed}`
+
+**`GET /sessions?page&page_size`** — paginated session list (default page_size 8, max 100).
+- Returns: `{page,page_size,total_sessions,total_pages,sessions:[{session_id,first_prompt,turn_count,created_at}]}`
+
+**`GET /sessions/{session_id}`** — full conversation: `{session_id, turns:[{run_id,prompt,system_prompt,created_at,results:[…]}]}` · 404 if missing.
+
+**`GET /sessions/{session_id}/leaderboard`** — per-session model leaderboard from manual ratings.
+- Returns: `{session_id, entries:[{model, avg_score, rating_count}]}`, ordered by `avg_score` desc.
+- Averages the 1–5★ `feedback` rows for the session, scoped to the calling user. Because a fan-out writes one `runs` row per model under a single `run_id`, the query selects the session's `run_id`s in a subquery and groups `feedback` by model — counting each rating exactly once (a naive `run_id` join would multiply each rating by the number of models in the run).
+
+**`DELETE /sessions`** — `{session_ids:[…]}` → `{deleted_count, session_ids}`.
+
+**`POST /feedback`** — `{run_id, model, rating (1–5)}` → echoes back · 422 out of range.
+
+**`GET /dashboard`** — aggregate analytics:
+`{total_runs, total_tokens, total_cost_usd, by_task:[{task_id,runs,total_tokens,cost_usd,avg_latency_ms,success_rate}], by_model:[{model,runs,total_tokens,cost_usd,avg_latency_ms,avg_rating,rating_count}], daily:[{date,cost_usd,total_tokens,runs}]}`.
+
+### 5.3 Task product API (RBAC-gated)
+
+The full **Task object** (returned by create/get/update/list). The three input-size-limit fields `max_prompt_chars`, `max_image_kb`, `max_images` are integers where **0 = no limit** — respectively the max characters of the rendered (system + user) prompt, max KB per image, and max image count; a predict that exceeds any of them returns **413**:
+
+```
+{ id, name, description,
+  input_schema|null, output_schema|null,
+  prompt_template, system_prompt, prompt_version,
+  model, fallback_models[],
+  temperature, max_tokens, daily_budget_usd,
+  cache_enabled, cache_ttl_seconds,
+  max_prompt_chars, max_image_kb, max_images,  // per-task input-size limits
+  active, created_at, updated_at }
+```
+
+| Method · Path | Perm | Accepts | Returns / notes |
+|---|---|---|---|
+| `POST /v1/tasks` | write | full Task body (`id` slug `[a-z0-9-]{2,64}`, `name`, `prompt_template`, `model` required) | `201` Task · `422` validation (bad slug, unknown model, bad schema/template, temp∉[0,2]). **Tasks are authored here** — there is no file/YAML seeding (see §8) |
+| `GET /v1/tasks` | read | — | `{tasks:[…]}` (prompts blanked without `view_prompt`) |
+| `GET /v1/tasks/{task_id}` | read | — | Task · `404` |
+| `PUT /v1/tasks/{task_id}` | write | **partial** patch (only present fields change; `input_schema:null` removes it) | updated Task · routing changes here. Prompt change bumps `prompt_version` |
+| `DELETE /v1/tasks/{task_id}` | delete | — | `{task_id,status:"deleted"}` · **admin-only** (`task:delete`). Removes the task + its prompt-version history (run rows kept for audit). `404` unknown · `409` for the built-in `playground` task |
+| `POST /v1/tasks/{task_id}/predict` | predict | `{inputs:{…}}` | predict response (below) · `409` inactive · `413` size cap · `429` budget/rate · `502` chain failed |
+| `GET /v1/tasks/runs/{run_id}` | read | — | `{run_id,task_id,prompt_version,provider,created_at,results:[…]}` |
+| `GET /v1/tasks/{task_id}/versions` | read | — | `{task_id,active_version,versions:[{version,prompt_template,system_prompt,note,created_by,created_at,active}]}` |
+| `POST /v1/tasks/{task_id}/versions` | write | `{prompt_template (req), system_prompt?, note?}` | `201 {task_id,version,active:false}` (saves a draft; doesn't activate) |
+| `DELETE /v1/tasks/{task_id}/versions/{version}` | delete | — | `{task_id,version,status:"deleted"}` · `409` if it's the active version |
+| `POST /v1/tasks/{task_id}/deploy` | deploy | `{version (req)}` | `{task_id,active_version,status:"deployed"}` (makes a version live) |
+| `POST /v1/tasks/{task_id}/test` | write | `{inputs (req), version?, model?}` | predict response, marked `is_test`; **bypasses cache**, supports version/model overrides. Size caps still enforced (413) |
+| `GET /v1/tasks/{task_id}/stats?days=30` | read | — | `{task_id,days,totals:{total_cost_usd,total_tokens,success_count,failure_count,avg_latency_ms}, daily:[{date,cost_usd,tokens,runs}]}` |
+
+**Predict response shape** (valid-only — `/predict` and `/test`):
+
+```
+{ task_run_id, task_id, prompt_version, model, provider,
+  output|null,            // parsed JSON ONLY when output_schema validates
+  output_valid|null,      // true/false with a schema; null when task has no output schema
+  raw_response|null, error|null,
+  fallback_used,          // served by a non-primary model
+  cached,                 // served from the prediction cache (zero cost)
+  usage:{input_tokens,output_tokens,total_tokens,cost_usd},
+  latency_ms,             // the winning model's call time only
+  gateway_latency_ms }    // end-to-end platform wall-clock: validation +
+                          // the whole fallback walk (incl. failed attempts) +
+                          // output validation + cache work. Always ≥ latency_ms;
+                          // the gap is the gateway's own overhead + losing models
+```
+
+Header `X-Platform-Degraded: true` is set when a fallback served it or the chain failed.
+
+**Multimodal inputs**: image inputs are recognised by a **JSON-Schema marker**, not a fixed name — a property typed as a string with `format:"image"`, or an array whose `items` carry `format:"image"`, under whatever name the author chose. The implicit `image`/`images` names are kept only as a **legacy fallback** (untyped callers and pre-typing tasks). Recognised values — base64 data URLs (`data:image/jpeg;base64,…`) or image URLs — are attached to the user message as `image_url` blocks for vision models (not rendered into the prompt text), key the cache, and are persisted on the run row. The live `attribute-extraction` task declares a single image field (one-or-many).
+
+### 5.4 Shadow comparison harness
+
+**`POST /v1/shadow/compare`** (write) — run a labeled dataset through a task and score field-level accuracy.
+- Accepts: `{task_id (req), items:[{inputs, expected_output}] (req, ≤200)}`
+- Returns: `{id, task_id, items, match_rate (0..1), items_fully_matched, avg_latency_ms, p50_latency_ms, p95_latency_ms, total_cost_usd, mismatches:[{item,field,expected,got}] (≤20), created_at}`
+
+**`GET /v1/shadow/reports?task_id=`** (read) — last 50 reports (newest first), each with summary metrics + a `details` blob (`items_fully_matched`, `p50_latency_ms`, `mismatches`).
+
+### 5.5 Admin observability (admin role only)
+
+Gated by the `RequireAdmin` middleware — the **`admin` role**, not a task capability, because these are privacy-sensitive cross-tenant views. Non-admins get `403`. (Static routes like `/v1/admin/runs/models` are registered before `/v1/admin/runs/{run_id}` so they aren't captured as a run id.)
+
+| Method · Path | Accepts | Returns |
+|---|---|---|
+| `GET /v1/admin/runs` | query: `page, page_size (≤100), task_id, model, user_email, q (prompt substring), status (success\|error), type (production\|test), has_task (true → exclude playground/compare runs), anchor_id (point-in-time snapshot pin — only runs at or below it, so a growing runs table doesn't shift rows across pages; the resolved anchor is echoed back)` | Prompt history across **all** users, newest first: `{page, page_size, total_runs, total_pages, runs:[{id, run_id, task_id, user_email, model, provider, prompt_preview, has_image, image_count, success, cache_hit, fallback_used, is_test, latency_ms, total_tokens, cost_usd, created_at}]}`. Rows are lightweight — truncated preview + image **count**, never the bytes |
+| `GET /v1/admin/runs/models` | — | `{models:[…]}` — distinct models seen in `runs` (filter dropdown) |
+| `GET /v1/admin/runs/{run_id}` | — | Full detail: `{run_id, task_id, user_id, user_email, prompt_version, prompt, system_prompt, images:[…], is_test, created_at, results:[{model, provider, response, success, error, latency_ms, input/output/total_tokens, cost_usd, cache_hit, fallback_used}], attempts:[…gateway trace…]}` · `404` |
+| `GET /v1/admin/model-health` | — | `{enabled, statuses:[{task_id, model, provider, state (healthy\|unhealthy\|probing), consecutive_failures, total_failures, total_successes, trips, cooldown_ms, open_for_seconds, last_reason, last_error, last_change}]}` |
+| `GET /v1/admin/model-health/events` | query: `task_id, model, page, page_size (≤200)` | `{page, page_size, total_count, total_pages, events:[{id, task_id, model, provider, event (failure\|tripped\|recovered\|manual_reset), reason, consecutive_failures, cooldown_ms, state, created_at}]}` |
+| `POST /v1/admin/model-health/reset` | `{task_id, model}` | `{status:"ok", task_id, model, state:"healthy"}` · `404` if the pair was never tracked. Records a `manual_reset` event |
+
+---
+
+## 6. LLM execution layer
+
+### Model registry
+
+A single `registry` map in `internal/llm/runner.go` is the source of truth for routing. Every model key maps to a `providerConfig` of `{modelID, provider, clientFn, reasoning, minOutputTokens}`. All non-Groq models route through the Meesho gateway (`clientFn: meeshoC`); only `llama-groq` calls a vendor API directly. The active model keys today:
+
+| Provider attribution | Served via | Model keys (friendly) | Underlying `modelID` |
+|---|---|---|---|
+| `openai` | Meesho gateway | `gpt-4o`, `gpt-4o-mini` | `openai/gpt-4o`, `openai/gpt-4o-mini` |
+| `gemini` | Meesho gateway | `gemini-2.5-pro`, `gemini-2.5-flash` | `vertex/gemini-2.5-pro`, `vertex/gemini-2.5-flash` |
+| `anthropic` | Meesho gateway | `claude-sonnet-4-6` | `anthropic/claude-sonnet-4-6` |
+| `groq` | Groq API (direct) | `llama-groq` | `llama-3.3-70b-versatile` |
+
+`DefaultModels` (the `/run` fan-out default) is `["gpt-4o-mini", "gemini-2.5-flash", "llama-groq"]`. The registry also carries more vendor variants commented out; since they all share the gateway's OpenAI-compatible wire, enabling one is a one-line uncomment with no new provider code.
+
+- **`reasoning` flag** (OpenAI reasoning family): the chat-completions wire rejects `max_tokens`/`temperature`, so `CallModel` sends `max_completion_tokens` and omits temperature. The flag exists in `providerConfig` but no currently-active model sets it.
+- **Gemini-2.5 thinking support**:
+  - *`minOutputTokens` floor* — thinking tokens share the same output budget as the response, so a low `max_tokens` can leave no room for the actual answer. Each thinking model carries a floor (`gemini-2.5-pro`: **8192**, `gemini-2.5-flash`: **4096**); `CallModel` silently raises `max_tokens` to that floor when it is lower.
+  - *Array-content unmarshal* — thinking models can return **array-shaped** `content` (`[{type:"text",…}, {type:"thought",…}]`); `ChatMessage.UnmarshalJSON` accepts both the plain-string and array forms — it concatenates the text parts and discards thought parts.
+
+### Providers
+
+- **`Provider` interface**: `Call(ctx, *chatRequest) (*chatResponse, error)`.
+- **OpenAI-compatible provider** is the *only* implementation — it serves both Groq (direct) and the Meesho gateway (POST `{baseURL}/chat/completions`). Auth is `Authorization: Bearer <key>` for Groq and the `x-bf-vk` virtual-key header for the Meesho gateway.
+- There is **no native Anthropic/Gemini provider** — OpenAI, Gemini, and Claude models are all reached over the Meesho gateway's OpenAI-compatible wire.
+- `BuildClients` wires two backends: `Groq` and `Meesho`. Either is left `nil` when its key is absent (so a missing key is a normal "not configured" call error, not a tripped breaker).
+
+### Fallback semantics
+
+`CallWithFallbackOpts` (`internal/llm/fallback.go`) walks `[primary, …fallbacks]` in order, with three optional hooks — a per-model cache `Lookup`, a `HealthGate` (the per-`(task, model)` breaker), and an `OutputValidator`. For each model it:
+
+- **Skips** the model (no call) if the health gate reports it unhealthy *for this task*.
+- Serves a cached answer if the lookup hits.
+- Otherwise calls it live and decides:
+  - **Stops** on a usable success — a provider success that passes the output validator (or no validator).
+  - **Advances** on provider-specific trouble — infra (`429/5xx`, network, timeout) and provider-config errors (`401/403/404`, provider not configured) — **and on a schema-invalid output** (a "schematic" failure), recording the failure against health each time.
+  - **Returns immediately** on a `400/422` content error (bad input — retrying elsewhere just burns money; not counted against health).
+- Sets `FallbackUsed` (served by a non-primary) and `Degraded` (fallback used, or the whole chain failed) for the `X-Platform-Degraded` contract.
+- Records one `Attempt` per model touched (`success` / `error` / `schema_invalid` / `skipped_unhealthy` / `cache_hit`) — the source for the `gateway_attempts` trace.
+
+`CallWithFallback`/`CallWithFallbackCached` remain thin wrappers (no gate, no validator) for callers that don't need health gating. The health gate + output validator are wired only for **production** predicts (`useCache`, no model override).
+
+### Per-`(task, model)` circuit breaker (`internal/health`)
+
+The single breaker in the platform: keyed on a **specific task's use of a specific model**, so a model that misbehaves for one task is routed around only for that task. The `Tracker` is process-wide and mutex-guarded; the fallback walk feeds it through a task-bound `HealthGate` adapter built in `predict_core.go`. Failures are discovered in-band — there is no separate per-provider circuit breaker or background prober; a model's recovery trial is the next production request after its cooldown elapses.
+
+```mermaid
+stateDiagram-v2
+  [*] --> healthy
+  healthy --> unhealthy: threshold failures
+  unhealthy --> probing: cooldown elapsed
+  probing --> healthy: trial succeeds / admin reset
+  probing --> unhealthy: trial fails (cooldown ×2)
+  unhealthy --> healthy: admin reset
+```
+
+- **Trip**: after `HEALTH_FAILURE_THRESHOLD` (default **3**) consecutive failures the model goes **unhealthy** and is **skipped — no call** — for `HEALTH_BASE_COOLDOWN` (default **30s**).
+- **Backoff**: each re-trip (a failed probe) **doubles** the cooldown, capped at `HEALTH_MAX_COOLDOWN` (default **30m**).
+- **Recover**: a successful probe (or an admin reset) returns it to healthy and resets the counters.
+- **What counts**: any provider error that advances the chain (network / `401/403` / `429` / `5xx` / timeout) and any **schema-invalid** output. A `400/422` content error does not (bad input, not the model's fault).
+- **Scope**: production predicts only. Live state is **in-process** and resets on restart; every transition (`failure` / `tripped` / `recovered` / `manual_reset`) is persisted to `model_health_events` via an async writer. Admins view state and force a reset via `/v1/admin/model-health*` (§5.5).
+- **Config**: `HEALTH_BREAKER_ENABLED` (default `true`) turns the whole thing off — every model is then tried every time.
+
+### Per-task rate limiter (`internal/ratelimit`)
+
+A per-task **rolling-window** limiter in front of production predicts, independent of the daily budget gate. Each task gets its own window (default 1m) with its own lock — tasks never serialize against each other. Three gates:
+
+- **Per-request input cap** (`RATE_MAX_INPUT_TOKENS`): estimate = chars/`RATE_CHARS_PER_TOKEN` + `RATE_TOKENS_PER_IMAGE` per image; over the cap → **413** (`input_too_large`), no `Retry-After`.
+- **Request-rate cap** (`RATE_MAX_REQUESTS`/window) → **429** with `Retry-After` = time to window refill.
+- **Token budget** (`RATE_MAX_TOKENS`/window) → **429** with `Retry-After`.
+
+It uses **reserve-then-reconcile**: `executePrediction` reserves the request's estimate up front, then reconciles to tokens actually consumed (input+output across every attempt, incl. failed/fallback ones). A request that ran always counts toward the request gate. A `0` for any `Max…` disables that gate; `RATE_LIMIT_ENABLED=false` disables the limiter. Test/shadow runs are not rate-limited.
+
+### Retry & cost
+
+- **Retry**: up to 3 attempts per model, backing off 2s/4s/6s, only for retryable statuses (`429/500/503`). Context cancellation/timeout stops retries.
+- **Cost**: `CalculateCost(model, in, out)` uses `pricing.json` (`{model:{input_per_1m, output_per_1m}}`), rounded to 6 decimals; unknown models cost `0`. Loaded once at startup from `PRICING_PATH`.
+
+---
+
+## 7. Prediction cache
+
+| Aspect | Detail |
+|---|---|
+| **Interface** (`internal/cache/cache.go`) | `Get(ctx,key)→([]byte,bool)`, `Set(ctx,key,val,ttl)`. Errors are treated as misses — caching never fails a prediction. |
+| **Backends** | Redis (`NewRedis`, pings at boot), in-process memory (`memory.go`, lazy TTL expiry), or off. Selected by `CACHE_BACKEND` (§10). |
+| **Key composition** | `"predict:" + SHA-256(JSON{task_id, prompt_version, model, system_prompt, rendered_prompt, temperature, max_tokens, output_schema, images[]})`. **Per model** — the routing chain is *not* part of the key. A deploy (version bump), param change, prompt change, model change, or a different image all produce new keys, so invalidation is implicit; stale entries age out by TTL. |
+| **TTL** | per-task `cache_ttl_seconds`, else 24h default. |
+| **When consulted** | *during* the fallback walk, only when the router actually reaches a model. Studio test/shadow runs bypass the cache entirely. |
+
+---
+
+## 8. Tasks, prompts, schemas
+
+### Task config & validation
+
+Defaults (`internal/tasks`): `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, `fallback_models nil→[]`. Validation (`validate.go`): slug id, known model(s), `name`/`prompt_template`/`model` required, `temperature∈[0,2]`, `max_tokens>0`, `cache_ttl_seconds≥0`, and the **three input-size-limit fields** (`max_prompt_chars`, `max_image_kb`, `max_images`) must each be **non-negative** (`Validate` rejects negatives), schemas must compile, template must parse.
+
+### Task lifecycle & source of truth
+
+- **The DB is the single source of truth for tasks.** There is no file/YAML seeding layer — tasks are created, edited, and deleted at runtime through the Studio API (`POST/PUT/DELETE /v1/tasks`) and persist in the `tasks` table.
+- **Authoring** (`POST /v1/tasks`, `task:write` → admin): supplies every field that used to live in a config file (id, name, description, schemas, prompt, model + fallbacks, sampling, budget, cache, the three size limits). The backend validates the slug, schemas, template, and model, activates the task, and seeds prompt version 1.
+- **Deletion** (`DELETE /v1/tasks/{id}`, `task:delete` → admin only): removes the task and its prompt-version history; run rows are kept for audit. The built-in `playground` task is protected (`409`).
+- **Startup seeding** is limited to `SeedPlayground` (`internal/tasks/seed.go`), which idempotently creates the built-in free-form playground task the Compare UI's `/run` attributes to. A fresh database therefore starts with only that task.
+
+### Prompt rendering & validation
+
+- **Render** (`internal/tasks/render.go`): Go `text/template` (`{{.field}}`, `{{if .field}}…{{end}}`), compiled templates cached by content hash, `missingkey=error` (referencing an undeclared key fails loudly). Declared input fields are pre-seeded so optional fields work with `{{if}}`.
+- **Input validation**: against `input_schema` (JSON Schema) when present; otherwise any input is accepted.
+- **Output validation** (valid-only): strips a wrapping markdown code fence, then validates against `output_schema`; returns the cleaned JSON. No schema → raw text, no validation.
+- **Image inputs — exposed by COUNT, never inlined**: image fields are recognised by a JSON-Schema marker — a string with `format:"image"`, or an array whose `items` carry `format:"image"` — under any property name; the implicit `image`/`images` names are kept only as a legacy fallback. Their values carry base64 data URLs or image URLs and are **not** rendered into the prompt text: `RenderPrompt` exposes an image field to the template as its image **count** (so `{{if .images}}…{{end}}` still gates on presence and `{{.images}}` renders a small number), so the base64 bytes are never inlined into the prompt — they're attached to the user message as `image_url` vision blocks instead. The live `attribute-extraction` task declares one image field (one-or-many; model `gemini-2.5-flash`, vision; `max_tokens: 2048` so Gemini's hidden "thinking" tokens don't truncate the JSON).
+
+### Prompt version lifecycle
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 60, 'rankSpacing': 90, 'curve': 'basis', 'useMaxWidth': true}}}%%
+flowchart LR
+  E["Edit prompt in Studio"] -->|"write"| D["Save draft (POST /versions)<br/>version = max+1, active:false"]
+  D --> T["Test draft (POST /test, version override)"]
+  T --> P{"Good?"}
+  P -- "no" --> E
+  P -- "yes" --> DP["Deploy (POST /deploy)<br/>→ active_version, cache invalidates"]
+  DP --> L["Live: /predict uses the deployed version"]
+  D -. "admin" .-> X["Delete a non-active version"]
+```
+
+- Editing a task's prompt via `PUT` also bumps the version (records history). Drafts never auto-activate; `deploy` is the explicit publish gate (`task:deploy`). The active version can't be deleted (`409`).
+- Edits to task config are serialized by the store's `editMu` write lock; predictions reading config take a shared lock, so a reader during an edit waits and then sees the new config (single-process coordination).
+
+---
+
+## 9. Data model
+
+The schema is identical across backends (selected by `DB_DRIVER`); `created_at` is stored as TEXT (`YYYY-MM-DD HH:MM:SS`) in both so scans/ordering match. SQLite migrates via guarded `ALTER`s; Postgres via `internal/db/schema_postgres.go` (`… IF NOT EXISTS`).
+
+| Table | Purpose | Notable columns |
+|---|---|---|
+| `tasks` | task registry / config | id (PK), name, description, input_schema, output_schema, prompt_template, system_prompt, prompt_version, model, fallback_models (JSON), temperature, max_tokens, daily_budget_usd, **max_prompt_chars, max_image_kb, max_images** (all INTEGER NOT NULL DEFAULT 0), active, cache_enabled, cache_ttl_seconds, created_at, updated_at |
+| `prompt_versions` | prompt history & drafts | id, task_id, version, prompt_template, system_prompt, note, created_by, created_at · unique (task_id, version) |
+| `runs` | the served answer — one row per model call (predict, /run, test, cache hits) | run_id, session_id, prompt, system_prompt, **image** (JSON array of data URLs/URLs, NULL for text-only), model, response, latency_ms, input/output/total_tokens, cost_usd, success, error, user_id, user_email, task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at |
+| `gateway_attempts` | the full fallback-walk trace — **one row per model the walk touched** | id, run_id, task_id, seq (0=primary), model, provider, outcome (success\|error\|schema_invalid\|skipped_unhealthy\|cache_hit), fallback_used, fallback_reason, response, error, http_status, infra_failure, retry_count, latency_ms, input/output/total_tokens, cost_usd, is_test, created_at · indexed run_id, task_id, model, outcome, created_at |
+| `feedback` | star ratings | run_id, model, user_id, rating · unique (run_id, model, user_id) |
+| `shadow_reports` | accuracy comparisons | id, task_id, created_by, items, match_rate, avg_latency_ms, p95_latency_ms, total_cost_usd, details (JSON), created_at |
+| `model_health_events` | per-(task, model) breaker history | id, task_id, model, provider, event (failure\|tripped\|recovered\|manual_reset), reason, consecutive_failures, cooldown_ms, state, created_at · indexed (task_id, model) + created_at |
+
+**Writer / pool notes**
+
+- **SQLite**: single writer (`SetMaxOpenConns(1)`) + `busy_timeout=5000` avoid "database is locked". **Postgres**: a real pool (`MaxOpenConns=20`); implemented but **pending validation against a live instance** — confirm numeric→float dashboard scans and `shadow_reports.id` (uses `LastInsertId`, unsupported by pgx → switch to `RETURNING id` if needed). See `docs/DEPLOY.md`.
+- **`RunWriter`** (`runs`), **`GatewayAttemptWriter`** (`gateway_attempts`, larger 4096 buffer since one run emits several attempts), and **`HealthEventWriter`** (`model_health_events`) are all the same pattern: a buffered channel drained by one goroutine; handlers submit without blocking; a full buffer drops + counts the row (a prediction is never blocked by observability). All `Close()` are idempotent and flushed by graceful shutdown.
+- The full per-run trace is read by `ListGatewayAttempts(run_id)` and attached to the admin run-detail response (§5.5, `RunDetailResponse.Attempts`).
+- The `image` column is written/read via `imagesToColumn`/`ParseImagesColumn` (JSON array; legacy single-string rows still parse), so one or many images share one column.
+
+**Dialect seam** (`internal/db/dialect.go`): portable `?` placeholders are rewritten to `$n` for Postgres, so one set of queries in `internal/db/queries.go` serves both backends.
+
+---
+
+## 10. Configuration (environment variables)
+
+Loaded by `internal/config` (`.env` via godotenv). In `APP_ENV=prod`, `config.Validate()` rejects insecure defaults at boot.
+
+| Var | Default | Controls |
+|---|---|---|
+| `APP_ENV` | `dev` | `prod` turns on `config.Validate()` (rejects insecure defaults) + disables inline migrations |
+| `AUTH_MODE` | `demo` | `demo` (passwordless login) or `sso` (IdP redirect/callback; demo login unregistered) |
+| `PORT` | `8000` | HTTP port |
+| `DB_DRIVER` | `sqlite` | `sqlite` (location = `DB_PATH`) or `postgres` (location = `DB_DSN`) |
+| `DB_PATH` | `./llm_platform.db` | SQLite file (used when `DB_DRIVER=sqlite`; absolute in prod) |
+| `DB_DSN` | — | Postgres connection string (used when `DB_DRIVER=postgres`) |
+| `PRICING_PATH` | `./pricing.json` | cost table (absolute in prod) |
+| `GROQ_API_KEY` / `GROQ_BASE_URL` | — / `api.groq.com/openai/v1` | Groq (direct API) |
+| `MEESHO_GATEWAY_VK` / `MEESHO_GATEWAY_BASE_URL` | — / internal gateway URL | Meesho gateway (`x-bf-vk`) — serves every non-Groq model (GPT-4o, Gemini, Claude). At least one of this or `GROQ_API_KEY` is required at boot. |
+| `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | — / — / `0` | Redis cache |
+| `CACHE_BACKEND` | `redis` if `REDIS_ADDR` set, else `off` | `redis` \| `memory` \| `off` |
+| `HEALTH_BREAKER_ENABLED` | `true` | per-(task, model) health breaker on/off |
+| `HEALTH_FAILURE_THRESHOLD` | `3` | consecutive failures (provider error or schema-invalid) before tripping a model for a task |
+| `HEALTH_BASE_COOLDOWN` | `30s` | first unhealthy window (doubles per re-trip) |
+| `HEALTH_MAX_COOLDOWN` | `30m` | cap for the backed-off cooldown |
+| `JWT_SECRET` | `dev-insecure-secret-change-me` | session signing key |
+| `AUTH_COOKIE_NAME` | `llm_platform_token` | cookie name |
+| `AUTH_ISSUER` | `llm-platform-demo` | JWT `iss` |
+| `COOKIE_DOMAIN` / `COOKIE_SECURE` | — / `false` | cookie scope/security (`.example.com` + `true` for subdomain prod; Secure required in prod) |
+| `TOKEN_EXPIRY` | `12h` | session lifetime |
+| `ALLOWED_ORIGINS` | `http://localhost:5173` (dev fallback) | CORS origins, comma-separated; **required in prod** |
+| `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` / `OIDC_POST_LOGIN_URL` | — | SSO config (read when `AUTH_MODE=sso`) |
+| `RATE_LIMIT_ENABLED` | `true` | per-task rate limiter on/off (§6) |
+| `RATE_WINDOW` | `1m` | rolling window per task |
+| `RATE_MAX_REQUESTS` / `RATE_MAX_TOKENS` / `RATE_MAX_INPUT_TOKENS` | `600` / `200000` / `16000` | per-window request cap, per-window token cap, per-request input cap (0 = off) |
+| `RATE_CHARS_PER_TOKEN` / `RATE_TOKENS_PER_IMAGE` | `4` / `1000` | input-token estimation |
+
+At least one provider key is required at boot (a warning logs the missing ones; the server still starts — those models fail at call time). The annotated template lives in `.env.example`.
+
+---
+
+## 11. Running locally
+
+- **Backend**: `go run ./cmd/server` (listens on `:8000`; needs ≥1 provider key in `.env`).
+- **Service token** (for the portal or a machine caller): `go run ./cmd/issue-token -sub svc:my-team -email my-team@svc.local -role client -ttl 8760h` (default role is `client`).
+- **Migrate / first-run**: `go run ./cmd/migrate` applies the schema for the configured `DB_DRIVER`; `go run ./cmd/bootstrap -issue-admin` generates a `JWT_SECRET`, validates prod config, migrates, locks down a SQLite file, and mints a break-glass admin token. See `docs/DEPLOY.md`.
+- **Tests**: `go test ./...` (add `-race` for the concurrency paths — fallback walk, health tracker, rate limiter, writers).
+
+The companion frontends and the split-repo / cross-origin runbook (CORS, cookie domain, `VITE_BACKEND_URL`) live in `docs/DEPLOY.md`.
+
+---
+
+*Generated from the codebase as of this revision. When endpoints, the model registry, or RBAC change, update the relevant table here.*
