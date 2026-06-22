@@ -26,3 +26,7 @@ llm_platform_go/llm_platform_go
 
 # Word design docs — kept locally, not tracked/published
 *.docx
+
+.claude/
+.vscode/
+
