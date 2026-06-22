@@ -13,11 +13,12 @@ import (
 // AdminListRuns serves the admin prompt-history list: every user's runs,
 // newest first, paginated and filterable. Admin-only (gated by RequireAdmin).
 //
-// GET /v1/admin/runs?page=&page_size=&task_id=&model=&user_email=&q=&status=&type=&anchor_id=
+// GET /v1/admin/runs?page=&page_size=&task_id=&model=&user_email=&q=&status=&type=&has_task=&anchor_id=
 //
-//	status:    "success" | "error"         (default: any)
-//	type:      "production" | "test"        (default: both)
-//	anchor_id: point-in-time snapshot id    (default: newest run now)
+//	status:    "success" | "error"          (default: any)
+//	type:      "production" | "test"         (default: both)
+//	has_task:  "true"                        (when set, excludes compare/playground runs)
+//	anchor_id: point-in-time snapshot id     (default: newest run now)
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	page := queryIntOrDefault(r, "page", 1)
 	if page < 1 {
@@ -62,6 +63,10 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	case "test":
 		t := true
 		filter.IsTest = &t
+	}
+	if r.URL.Query().Get("has_task") == "true" {
+		t := true
+		filter.HasTask = &t
 	}
 
 	runs, total, anchor, err := db.ListAllRuns(h.DB, filter, page, pageSize)

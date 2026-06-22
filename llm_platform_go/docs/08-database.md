@@ -118,6 +118,47 @@ One row per (run_id, model, user_id) triplet. If a user re-rates an output, the 
 
 ---
 
+### `gateway_attempts` — full fallback walk trace
+
+The most detailed observability table. One row per model the fallback walk touched for each prediction. While the `runs` table records **what the caller received**, this table records **everything that happened behind it**: every model tried, why it was tried or skipped, what it returned, and its exact cost.
+
+A single prediction with a 3-model chain (primary + 2 fallbacks) where the primary was skipped and the first fallback failed produces 3 rows with `seq` 0, 1, 2.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `run_id` | TEXT | Links to the `runs` row |
+| `task_id` | TEXT | Which task (null for playground) |
+| `seq` | INTEGER | Walk order: 0 = configured primary, 1 = first fallback, … |
+| `model` | TEXT | Friendly model name |
+| `provider` | TEXT | "openai", "groq", "gemini", "anthropic" |
+| `outcome` | TEXT | `success`, `error`, `schema_invalid`, `skipped_unhealthy`, `cache_hit` |
+| `fallback_used` | INTEGER | 0/1: was this a fallback model (seq > 0)? |
+| `fallback_reason` | TEXT | Why the walk advanced past this model (empty on success) |
+| `response` | TEXT | The model's raw output — **set even for `schema_invalid`**, so bad outputs are preserved |
+| `error` | TEXT | Classified error message |
+| `http_status` | INTEGER | Last upstream HTTP status (0 if no response reached, e.g. skipped) |
+| `infra_failure` | INTEGER | 0/1: was this a provider-infrastructure problem (5xx/429/network)? |
+| `retry_count` | INTEGER | Upstream HTTP attempts made for this model (1 = no retry, 2 = one retry, …) |
+| `latency_ms` | INTEGER | This model call's wall-clock duration |
+| `input_tokens` | INTEGER | Prompt token count for this attempt |
+| `output_tokens` | INTEGER | Response token count |
+| `total_tokens` | INTEGER | Sum |
+| `cost_usd` | REAL | Dollar cost for this attempt |
+| `is_test` | INTEGER | 0/1: Studio test-panel call |
+| `created_at` | DATETIME | Timestamp (all attempts in one run share the same timestamp) |
+
+Indexes: `run_id` (join from `runs`), `task_id`, `model`, `outcome`, `created_at`.
+
+**How to read a run's trace:**
+```sql
+SELECT seq, model, outcome, fallback_reason, http_status, latency_ms, cost_usd
+FROM gateway_attempts
+WHERE run_id = 'abc-123'
+ORDER BY seq ASC;
+```
+
+---
+
 ### `model_health_events` — circuit breaker audit trail
 
 Every time the per-(task, model) circuit breaker changes state, a row is inserted here.
@@ -168,18 +209,20 @@ if err != nil {
 
 ### The problem
 
-Writing a run record to SQLite takes 1–5 milliseconds. Under concurrent load, the single-writer lock means writes queue up. If 100 concurrent predictions all try to write at the same time, the 100th one waits 99–500ms just for the DB write — after already spending 500ms waiting for the LLM response.
+Writing to SQLite takes 1–5 milliseconds per INSERT. Under concurrent load, the single-writer lock means writes queue up. If 100 concurrent predictions all try to write at the same time, the 100th one waits 99–500ms just for the DB write — after already spending 500ms waiting for the LLM response.
 
 ### The solution: channels and goroutines
 
 > **🔤 Go concept: channels**
 > A **channel** in Go is a typed queue that safely passes values between goroutines. Writing to a channel (`ch <- value`) puts a value in; reading from it (`value := <-ch`) takes one out. Channels are safe to use from multiple goroutines simultaneously — no mutex needed.
 
-The `RunWriter` works like this:
+The platform uses **three** async writers — one per table that's written on the hot path:
+
+#### `RunWriter` — one row per prediction answer
 
 ```
 Handler goroutine:
-    runWriter.Write(row)  →  [puts row in channel]
+    runWriter.Write(row)  →  [puts RunRow in channel]
 
 Background RunWriter goroutine:
     loop:
@@ -188,13 +231,46 @@ Background RunWriter goroutine:
             INSERT INTO runs VALUES (...), (...), (...)
 ```
 
-The handler returns the prediction result to the user and drops the row into the channel. It doesn't wait for the INSERT. The RunWriter drains the channel in batches.
+The handler returns the prediction result to the user and drops the row into the channel. It doesn't wait for the INSERT. The RunWriter drains the channel in batches. Default buffer: 2048 rows.
+
+#### `GatewayAttemptWriter` — one row per model touched in the walk
+
+```
+Handler goroutine (for each attempt):
+    attemptWriter.Write(attempt)  →  [puts GatewayAttempt in channel]
+
+Background GatewayAttemptWriter goroutine:
+    loop:
+        for each attempt in channel:
+            INSERT INTO gateway_attempts VALUES (...)
+```
+
+A single prediction can touch multiple models (primary + fallbacks). Each model attempt gets its own row in `gateway_attempts`, written via this separate async writer. Default buffer: 4096 rows (larger because one prediction produces several attempts).
+
+**Why a separate writer for attempts?** Attempt rows are higher volume than run rows and contain detailed trace data (response content, error classifications, retry counts). Keeping them on a separate writer prevents noisy trace writes from competing with the simpler run writes.
+
+#### `HealthEventWriter` — circuit breaker state transitions
+
+Same pattern. Every time a (task, model) circuit breaker changes state (failure, tripped, recovered, manual reset), the event is written to `model_health_events` via an async writer. Default buffer: 512 rows (low volume — state changes are rare).
 
 ### What if the buffer fills up?
 
-The channel has a finite capacity. If predictions arrive faster than the writer can drain them, the channel fills up. At that point, `runWriter.Write(row)` immediately drops the row (doesn't block) and increments a "dropped rows" counter.
+Each writer's channel has a finite capacity. If writes arrive faster than the writer can drain them, the channel fills up. At that point, `Write(row)` immediately drops the row (doesn't block) and increments an atomic `dropped` counter.
 
-**Is this okay?** Yes. Losing observability data is acceptable — you might miss some rows in the dashboard. Blocking a prediction because the DB is slow is not acceptable — it would increase user-visible latency. The tradeoff is explicit.
+**Is this okay?** Yes. Losing observability data is acceptable — you might miss a row in the dashboard. Blocking a prediction because the DB is slow is not acceptable — it would increase user-visible latency. The tradeoff is explicit and the dropped count is logged.
+
+```go
+func (w *GatewayAttemptWriter) Write(a *types.GatewayAttempt) bool {
+    select {
+    case w.ch <- a:
+        return true
+    default:
+        n := w.dropped.Add(1)
+        log.Printf("attemptwriter: buffer full, dropped attempt row (total dropped: %d)", n)
+        return false
+    }
+}
+```
 
 ---
 

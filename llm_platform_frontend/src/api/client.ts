@@ -269,6 +269,7 @@ export const api = {
     if (f.type) p.set('type', f.type);
     // Pin paging to a point-in-time snapshot so new runs don't shift the pages.
     if (f.anchorId && f.anchorId > 0) p.set('anchor_id', String(f.anchorId));
+    if (f.hasTask) p.set('has_task', 'true');
     return fetchJSON<TRunListResponse>(`${BASE}/v1/admin/runs?${p.toString()}`);
   },
 

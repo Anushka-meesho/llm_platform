@@ -295,6 +295,7 @@ type RunFilter struct {
 	// id <= MaxID are considered, so rows inserted after the anchor never shift
 	// the pages while the user is browsing. 0 = no anchor (every run).
 	MaxID int
+	HasTask *bool // when true: only runs with a task_id (excludes compare/playground runs)
 }
 
 // where builds the SQL WHERE clause + args shared by ListAllRuns and its count.
@@ -328,6 +329,9 @@ func (f RunFilter) where() (string, []any) {
 	if f.MaxID > 0 {
 		clauses = append(clauses, "id <= ?")
 		args = append(args, f.MaxID)
+	}
+	if f.HasTask != nil && *f.HasTask {
+		clauses = append(clauses, "task_id IS NOT NULL AND task_id != 'playground'") // 'playground' == tasks.PlaygroundTaskID
 	}
 	if len(clauses) == 0 {
 		return "", nil

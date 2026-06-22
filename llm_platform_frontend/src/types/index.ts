@@ -287,6 +287,7 @@ export type TRunFilters = {
   // fixed run id so paging doesn't shift; omitted/0 asks the server for a fresh
   // snapshot at the newest run.
   anchorId?: number;
+  hasTask?: boolean;
 };
 
 // ── Admin: model health (per-(task, model) circuit breaker) ───────────────────

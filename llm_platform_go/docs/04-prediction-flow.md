@@ -12,6 +12,7 @@ sequenceDiagram
     participant Mid as Auth Middleware
     participant H as Handler
     participant EP as executePrediction
+    participant RL as Rate Limiter
     participant C as Cache
     participant FB as Fallback Chain
     participant P as LLM Provider
@@ -27,17 +28,21 @@ sequenceDiagram
     EP->>EP: 2. Render prompt template with inputs
     EP->>EP: 3. Extract images (if multimodal)
     EP->>EP: 4. Build chat messages [system, user]
-    EP->>C: 5. Cache lookup (per-model)
+    EP->>RL: 5. Reserve capacity (estimate input tokens)
+    RL-->>EP: allowed (or 413/429 if over limit)
+    EP->>C: 6. Cache lookup (per-model, inside fallback walk)
     C-->>EP: miss
-    EP->>FB: 6. CallWithFallbackOpts(models, messages)
+    EP->>FB: 7. CallWithFallbackOpts(models, messages)
     FB->>P: Call primary model (gpt-4o)
     P-->>FB: Response text + token counts
-    FB->>FB: 7. Validate output against output schema
-    FB-->>EP: ModelResult (success)
-    EP->>C: 8. Store in cache (24h TTL)
-    EP-->>H: predictOutcome
-    H-->>App: 200 OK {output, tokens, cost_usd, latency_ms}
-    H--)DB: 9. Log run (async, non-blocking)
+    FB->>FB: 8. Validate output against output schema
+    FB-->>EP: ModelResult + Attempts trace
+    EP->>RL: 9. Reconcile reservation (actual tokens consumed)
+    EP--)DB: 10. Log gateway attempts (async, per model touched)
+    EP->>C: 11. Store in cache (24h TTL)
+    EP-->>H: predictOutcome {output, gateway_latency_ms, ...}
+    H-->>App: 200 OK {output, tokens, cost_usd, latency_ms, gateway_latency_ms}
+    H--)DB: 12. Log run (async, non-blocking)
 ```
 
 ---
@@ -132,6 +137,33 @@ All LLM providers expect messages in a "conversation" format, even for single-tu
 
 ---
 
+## Step 5: Rate limiting
+
+Before any cache lookup or LLM call, the rate limiter runs three gates in sequence:
+
+```go
+if opts.enforceLimits && h.Limiter.Enabled() {
+    est := h.Limiter.Estimate(systemPrompt+"\n"+prompt, len(images))
+    res, dec := h.Limiter.Reserve(task.ID, est)
+    if !dec.Allowed {
+        return nil, limiterError(dec)  // 413 or 429
+    }
+    reservation = res
+}
+```
+
+1. **Input size check** — if the estimated input tokens exceed `RATE_MAX_INPUT_TOKENS`, the request is rejected with `413 Payload Too Large`. This is a *deterministic* rejection: retrying the same oversized input will always fail.
+2. **Request-rate check** — if the task already received `RATE_MAX_REQUESTS` in the current window, the request is rejected with `429 Too Many Requests` and a `Retry-After` header.
+3. **Token budget check** — if the estimated tokens would push the task over `RATE_MAX_TOKENS` for the window, the request is rejected with `429`.
+
+The token estimate is computed as `ceil(len(text) / CharsPerToken) + images × TokensPerImage`. This is a cheap over-estimate — the real count isn't known until the provider responds.
+
+If the request is allowed, a **reservation** is created. After the fallback walk finishes, the reservation is reconciled to the tokens actually consumed (see Step 9 below).
+
+**Rate limiting only applies to production predicts.** Studio test panel runs (`is_test=true`) and shadow comparisons bypass the limiter.
+
+---
+
 ## Step 6: Cache lookup
 
 Before making any LLM API call, the platform checks the prediction cache:
@@ -177,6 +209,8 @@ This is where the actual LLM API calls happen. See [05-fallback-chain.md](05-fal
 - And so on, until a model succeeds or all models are exhausted.
 - The circuit breaker skips models it knows are currently unhealthy.
 
+The walk returns a `ModelResult` that now carries an `Attempts` slice — the full gateway trace, one entry per model the walk touched. Each entry records the outcome, fallback reason, HTTP status, whether it was an infra failure, retry count, latency, and token costs.
+
 ---
 
 ## Step 8: Output validation
@@ -196,7 +230,52 @@ This is a key insight: **output schema validation is part of the fallback logic*
 
 ---
 
-## Step 9: Cache fill
+## Step 9: Reconcile rate-limit reservation
+
+```go
+if reservation.Active() {
+    actualTokens := 0
+    for _, a := range result.Attempts {
+        actualTokens += a.TotalTokens
+    }
+    h.Limiter.Reconcile(reservation, actualTokens)
+}
+```
+
+After the walk, the rate-limit reservation is settled to the **tokens actually consumed** — the sum across every attempt (winner + failed/fallback + schema-invalid + retries). This is the true spend even when the request ultimately failed or fell back.
+
+If the actual consumption is less than the estimate (common — the estimate is a cheap over-count), the window's token counter is adjusted down. If more (rare), it's adjusted up. This ensures the budget gate reflects real usage, not rough estimates.
+
+A cache hit consumed nothing upstream, so its attempts total is effectively zero — the reservation is reconciled to 0 and the window is freed.
+
+## Step 10: Gateway attempt tracing
+
+```go
+h.recordAttempts(runID, &task.ID, result.Attempts, opts.isTest)
+```
+
+Before the cache fill or run insert, every model the walk touched is persisted to the `gateway_attempts` table. One row per model, in walk order:
+
+| Field | What it records |
+|-------|----------------|
+| `seq` | Walk order (0 = configured primary, 1 = first fallback, …) |
+| `outcome` | `success`, `error`, `schema_invalid`, `skipped_unhealthy`, `cache_hit` |
+| `fallback_used` | Was this attempt a fallback (seq > 0)? |
+| `fallback_reason` | Why the walk moved past this model (empty on success) |
+| `response` | The model's raw output — set even on schema_invalid, so the bad output is preserved |
+| `http_status` | Last upstream HTTP status (0 if no response reached) |
+| `infra_failure` | Whether it was a provider-infrastructure problem (5xx/429/network) |
+| `retry_count` | How many upstream HTTP attempts were made |
+| `latency_ms` | This model call's duration |
+| `input_tokens` / `output_tokens` / `cost_usd` | Per-attempt costs |
+
+This trace is written via the async `GatewayAttemptWriter`, so it never delays the response.
+
+**Why this matters:** the `runs` table shows *what the caller received*. The `gateway_attempts` table shows *everything that happened behind it*. When a request fell back three times before succeeding, you see exactly why each model was skipped and what it returned.
+
+---
+
+## Step 11: Cache fill
 
 ```go
 cache.Set(ctx, key, entry, ttl)
@@ -208,26 +287,26 @@ If the result was a success and schema-valid, it's stored in the cache with the 
 
 ---
 
-## Step 10: Return the response
+## Step 12: Return the response
 
 ```go
 return &predictOutcome{
-    TaskRunID:   uuid.NewString(),
-    Model:       result.Model,
-    Output:      parsedOutput,
-    RawResponse: result.Response,
-    Cached:      result.CacheHit,
-    FallbackUsed: result.FallbackUsed,
-    Usage:       tokenUsage{...},
-    LatencyMs:   result.LatencyMs,
+    RunID:            runID,
+    PromptVersion:    promptVersion,
+    Result:           result,
+    Output:           output,
+    OutputValid:      outputValid,
+    GatewayLatencyMs: int(time.Since(gatewayStart).Milliseconds()),
 }, nil
 ```
 
-The handler serializes this to JSON and sends it back. The response reaches the caller while the DB write is still in progress (next step).
+The handler serializes this to JSON and sends it back. The response reaches the caller while the DB writes are still in progress (next step).
+
+**`GatewayLatencyMs`** is the end-to-end wall-clock time the platform spent on this prediction — from the moment `executePrediction` started to the moment it returned. It covers input validation, prompt rendering, the complete fallback walk (including any failed/skipped models and retries), output validation, and cache operations. `Result.LatencyMs`, by contrast, is only the winning model's HTTP call duration. The difference between the two is the platform's own overhead plus the time spent on losing models.
 
 ---
 
-## Step 11: Async run logging
+## Step 13: Async run logging
 
 ```go
 h.Runs.Write(types.RunRow{

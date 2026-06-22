@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"llm_platform_go/internal/config"
@@ -65,6 +66,45 @@ func (m ChatMessage) MarshalJSON() ([]byte, error) {
 		Role    string `json:"role"`
 		Content []any  `json:"content"`
 	}{m.Role, parts})
+}
+
+// UnmarshalJSON handles both wire formats a provider may return for content:
+//   - plain string: `"content": "text"` (most models)
+//   - array: `"content": [{"type":"text","text":"..."},...]` (Gemini thinking models,
+//     which return multi-part responses including thought tokens)
+//
+// All text parts are concatenated; non-text parts (thought tokens, etc.) are discarded.
+func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Role = raw.Role
+
+	var s string
+	if err := json.Unmarshal(raw.Content, &s); err == nil {
+		m.Content = s
+		return nil
+	}
+
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw.Content, &parts); err != nil {
+		return fmt.Errorf("content is neither string nor array: %w", err)
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Type == "text" && p.Text != "" {
+			sb.WriteString(p.Text)
+		}
+	}
+	m.Content = sb.String()
+	return nil
 }
 
 // chatResponse is the OpenAI-compatible chat completions response body.
@@ -144,7 +184,14 @@ func (p *openAICompatProvider) Call(ctx context.Context, req *chatRequest) (*cha
 		_ = json.Unmarshal(respBody, &eb)
 		msg := eb.Error.Message
 		if msg == "" {
-			msg = http.StatusText(resp.StatusCode)
+			// A security proxy (e.g. Zscaler) returns an HTML block page instead of
+			// a JSON error body. Detect this so the user sees a network-policy message
+			// rather than the generic HTTP status text.
+			if strings.HasPrefix(strings.TrimSpace(string(respBody)), "<") {
+				msg = "request blocked by network security policy — check VPN/firewall access to the gateway"
+			} else {
+				msg = http.StatusText(resp.StatusCode)
+			}
 		}
 		return nil, &APIError{HTTPStatusCode: resp.StatusCode, Message: msg}
 	}
