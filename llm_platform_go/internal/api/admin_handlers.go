@@ -13,11 +13,12 @@ import (
 // AdminListRuns serves the admin prompt-history list: every user's runs,
 // newest first, paginated and filterable. Admin-only (gated by RequireAdmin).
 //
-// GET /v1/admin/runs?page=&page_size=&task_id=&model=&user_email=&q=&status=&type=&has_task=
+// GET /v1/admin/runs?page=&page_size=&task_id=&model=&user_email=&q=&status=&type=&has_task=&anchor_id=
 //
-//	status:   "success" | "error"            (default: any)
-//	type:     "production" | "test"          (default: both)
-//	has_task: "true"                         (when set, excludes compare/playground runs)
+//	status:    "success" | "error"          (default: any)
+//	type:      "production" | "test"         (default: both)
+//	has_task:  "true"                        (when set, excludes compare/playground runs)
+//	anchor_id: point-in-time snapshot id     (default: newest run now)
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	page := queryIntOrDefault(r, "page", 1)
 	if page < 1 {
@@ -31,11 +32,21 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		pageSize = 100
 	}
 
+	// anchor_id pins the list to a point-in-time snapshot: only runs at or below
+	// it are listed, so paging through history doesn't shift as new runs arrive.
+	// Absent / <= 0 means "start a fresh snapshot at the newest run now"; the
+	// resolved anchor is returned so the client can pin its next page to it.
+	anchorID := queryIntOrDefault(r, "anchor_id", 0)
+	if anchorID < 0 {
+		anchorID = 0
+	}
+
 	filter := db.RunFilter{
 		TaskID:    r.URL.Query().Get("task_id"),
 		Model:     r.URL.Query().Get("model"),
 		UserEmail: r.URL.Query().Get("user_email"),
 		Query:     r.URL.Query().Get("q"),
+		MaxID:     anchorID,
 	}
 	switch r.URL.Query().Get("status") {
 	case "success":
@@ -58,7 +69,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		filter.HasTask = &t
 	}
 
-	runs, total, err := db.ListAllRuns(h.DB, filter, page, pageSize)
+	runs, total, anchor, err := db.ListAllRuns(h.DB, filter, page, pageSize)
 	if err != nil {
 		writeErr(w, r, Internal(CodeDBError, "list runs").WithCause(err))
 		return
@@ -69,6 +80,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		PageSize:   pageSize,
 		TotalRuns:  total,
 		TotalPages: db.TotalPages(total, pageSize),
+		AnchorID:   anchor,
 		Runs:       runs,
 	})
 }

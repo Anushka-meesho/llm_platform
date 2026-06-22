@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useState } from 'react';
 import { Typography, cn } from '@meesho/merlin-ui-tailwind';
+import { api } from '../api/client';
 import { useChat } from '../hooks/useChat';
 import { useSessions } from '../hooks/useSessions';
 import Sidebar from '../components/Sidebar';
@@ -12,10 +13,22 @@ const ComparePage = () => {
   const chat = useChat();
   const sessions = useSessions();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // The playground runs under the built-in "playground" task, so its configured
+  // image upload limits apply here. Best-effort: the input works without them.
+  const [imageLimits, setImageLimits] = useState({ maxImageKB: 0, maxImages: 0 });
 
   useEffect(() => {
     sessions.fetchPage(1);
   }, [sessions.fetchPage]);
+
+  useEffect(() => {
+    api
+      .getTask('playground')
+      .then((t) =>
+        setImageLimits({ maxImageKB: t.max_image_kb ?? 0, maxImages: t.max_images ?? 0 }),
+      )
+      .catch(() => {}); // limits are optional; ignore failures
+  }, []);
 
   const handleSubmit = useCallback(
     async (text: string, files: File[]) => {
@@ -92,6 +105,8 @@ const ComparePage = () => {
           conversations={chat.conversations}
           maxOutputTokens={chat.maxOutputTokens}
           setMaxOutputTokens={chat.setMaxOutputTokens}
+          maxImageKB={imageLimits.maxImageKB}
+          maxImages={imageLimits.maxImages}
         />
       </div>
     </div>

@@ -180,7 +180,7 @@ func (h *Handler) TestTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opts := predictOptions{isTest: true, overrideModel: req.Model}
+	opts := predictOptions{isTest: true, overrideModel: req.Model, enforceSizeLimits: true}
 	if req.Version > 0 && req.Version != task.PromptVersion {
 		v, err := h.Tasks.GetVersion(task.ID, req.Version)
 		if errors.Is(err, tasks.ErrVersionNotFound) {

@@ -40,6 +40,12 @@ type Task struct {
 	// provider call. Off by default; TTL 0 = backend default (24h).
 	CacheEnabled    bool `json:"cache_enabled"`
 	CacheTTLSeconds int  `json:"cache_ttl_seconds,omitempty"`
+	// Per-task input size limits (UI-configurable guardrails, independent of the
+	// global rate limiter). Each is a hard ceiling enforced on production
+	// predicts; 0 means "no limit". Text and image limits are set separately.
+	MaxPromptChars int `json:"max_prompt_chars,omitempty"` // max characters of the text (system + user) sent to the model
+	MaxImageKB     int `json:"max_image_kb,omitempty"`     // max size of each uploaded image, in KB
+	MaxImages      int `json:"max_images,omitempty"`       // max number of images per prediction
 	Active         bool            `json:"active"`
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"`
@@ -76,6 +82,15 @@ func (t *Task) Validate() error {
 	}
 	if t.CacheTTLSeconds < 0 {
 		return errors.New("cache_ttl_seconds must not be negative")
+	}
+	if t.MaxPromptChars < 0 {
+		return errors.New("max_prompt_chars must not be negative")
+	}
+	if t.MaxImageKB < 0 {
+		return errors.New("max_image_kb must not be negative")
+	}
+	if t.MaxImages < 0 {
+		return errors.New("max_images must not be negative")
 	}
 	if len(t.InputSchema) > 0 {
 		if _, err := compileSchema(t.InputSchema); err != nil {

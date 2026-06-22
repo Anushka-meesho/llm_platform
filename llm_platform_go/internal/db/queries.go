@@ -12,7 +12,7 @@ import (
 )
 
 func InsertRun(db *sql.DB, r *types.RunRow) error {
-	_, err := db.Exec(`
+	_, err := exec(db, `
 		INSERT INTO runs
 			(run_id, session_id, prompt, system_prompt, image, model, response,
 			 latency_ms, input_tokens, output_tokens, total_tokens,
@@ -32,7 +32,7 @@ func InsertRun(db *sql.DB, r *types.RunRow) error {
 // InsertGatewayAttempt persists one model attempt within a run's fallback walk.
 // created_at is supplied so a batch of attempts from one run shares a timestamp.
 func InsertGatewayAttempt(db *sql.DB, a *types.GatewayAttempt) error {
-	_, err := db.Exec(`
+	_, err := exec(db, `
 		INSERT INTO gateway_attempts
 			(run_id, task_id, seq, model, provider, outcome, fallback_used,
 			 fallback_reason, response, error, http_status, infra_failure, retry_count,
@@ -50,7 +50,7 @@ func InsertGatewayAttempt(db *sql.DB, a *types.GatewayAttempt) error {
 
 // ListGatewayAttempts returns every attempt for one run_id, in walk order.
 func ListGatewayAttempts(db *sql.DB, runID string) ([]types.GatewayAttempt, error) {
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT id, run_id, task_id, seq, model, provider, outcome, fallback_used,
 		       fallback_reason, response, error, http_status, infra_failure, retry_count,
 		       latency_ms, input_tokens, output_tokens, total_tokens, cost_usd,
@@ -127,9 +127,9 @@ func ParseImagesColumn(s string) []string {
 // (including Studio test calls — real spend is real spend). Backs the budget gate.
 func TaskSpendToday(db *sql.DB, taskID string) (float64, error) {
 	var spend float64
-	err := db.QueryRow(`
+	err := queryRow(db, `
 		SELECT COALESCE(SUM(cost_usd), 0) FROM runs
-		WHERE task_id = ? AND created_at >= date('now')`, taskID).Scan(&spend)
+		WHERE task_id = ? AND created_at >= `+todayExpr(), taskID).Scan(&spend)
 	return spend, err
 }
 
@@ -142,25 +142,25 @@ func TaskDailyStats(db *sql.DB, taskID string, days int) ([]types.DailyPoint, *t
 
 	var totals types.TaskStats
 	totals.TaskID = taskID
-	err := db.QueryRow(`
+	err := queryRow(db, `
 		SELECT COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0),
 		       COALESCE(AVG(latency_ms),0), COALESCE(AVG(success),0)
 		FROM runs
-		WHERE task_id = ? AND created_at >= date('now', ?)`,
-		taskID, fmt.Sprintf("-%d days", days)).
+		WHERE task_id = ? AND created_at >= `+daysAgoExpr(days),
+		taskID).
 		Scan(&totals.Runs, &totals.TotalTokens, &totals.CostUSD,
 			&totals.AvgLatencyMs, &totals.SuccessRate)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT substr(created_at,1,10) AS day,
 		       COALESCE(SUM(cost_usd),0), COALESCE(SUM(total_tokens),0), COUNT(*)
 		FROM runs
-		WHERE task_id = ? AND created_at >= date('now', ?)
+		WHERE task_id = ? AND created_at >= `+daysAgoExpr(days)+`
 		GROUP BY day ORDER BY day ASC`,
-		taskID, fmt.Sprintf("-%d days", days))
+		taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -180,7 +180,7 @@ func TaskDailyStats(db *sql.DB, taskID string, days int) ([]types.DailyPoint, *t
 // GetRunByID returns all rows for one run_id (a /run produces one row per
 // model; a task predict produces exactly one). Scoped to the user.
 func GetRunByID(db *sql.DB, userID, runID string) ([]types.RunRow, error) {
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT id, run_id, session_id, prompt, system_prompt, model, response,
 		       latency_ms, input_tokens, output_tokens, total_tokens,
 		       cost_usd, success, error, user_id, user_email,
@@ -221,7 +221,7 @@ func GetRunByID(db *sql.DB, userID, runID string) ([]types.RunRow, error) {
 // InsertHealthEvent persists one (task, model) circuit transition for later
 // observation. created_at is supplied so it matches the in-memory event time.
 func InsertHealthEvent(db *sql.DB, e *types.HealthEvent) error {
-	_, err := db.Exec(`
+	_, err := exec(db, `
 		INSERT INTO model_health_events
 			(task_id, model, provider, event, reason, consecutive_failures, cooldown_ms, state, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -251,13 +251,13 @@ func ListHealthEvents(db *sql.DB, taskID, model string, page, pageSize int) ([]t
 	}
 
 	var total int
-	if err := db.QueryRow("SELECT COUNT(*) FROM model_health_events"+whereSQL, args...).Scan(&total); err != nil {
+	if err := queryRow(db, "SELECT COUNT(*) FROM model_health_events"+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	offset := (page - 1) * pageSize
 	qArgs := append(append([]any{}, args...), pageSize, offset)
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT id, task_id, model, provider, event, reason,
 		       consecutive_failures, cooldown_ms, state, created_at
 		FROM model_health_events`+whereSQL+`
@@ -291,7 +291,11 @@ type RunFilter struct {
 	Query     string // case-insensitive substring of the prompt text
 	Success   *bool  // nil = either; else filter on success
 	IsTest    *bool  // nil = both production and test; else filter on is_test
-	HasTask   *bool  // when true: only runs with a task_id (excludes compare/playground runs)
+	// MaxID anchors the list to a point-in-time snapshot: only runs with
+	// id <= MaxID are considered, so rows inserted after the anchor never shift
+	// the pages while the user is browsing. 0 = no anchor (every run).
+	MaxID int
+	HasTask *bool // when true: only runs with a task_id (excludes compare/playground runs)
 }
 
 // where builds the SQL WHERE clause + args shared by ListAllRuns and its count.
@@ -307,11 +311,11 @@ func (f RunFilter) where() (string, []any) {
 		args = append(args, f.Model)
 	}
 	if f.UserEmail != "" {
-		clauses = append(clauses, "user_email LIKE ? COLLATE NOCASE")
+		clauses = append(clauses, ciLike("user_email"))
 		args = append(args, "%"+f.UserEmail+"%")
 	}
 	if f.Query != "" {
-		clauses = append(clauses, "prompt LIKE ? COLLATE NOCASE")
+		clauses = append(clauses, ciLike("prompt"))
 		args = append(args, "%"+f.Query+"%")
 	}
 	if f.Success != nil {
@@ -321,6 +325,10 @@ func (f RunFilter) where() (string, []any) {
 	if f.IsTest != nil {
 		clauses = append(clauses, "is_test = ?")
 		args = append(args, boolToInt(*f.IsTest))
+	}
+	if f.MaxID > 0 {
+		clauses = append(clauses, "id <= ?")
+		args = append(args, f.MaxID)
 	}
 	if f.HasTask != nil && *f.HasTask {
 		clauses = append(clauses, "task_id IS NOT NULL AND task_id != 'playground'") // 'playground' == tasks.PlaygroundTaskID
@@ -335,52 +343,66 @@ func (f RunFilter) where() (string, []any) {
 // first, with their total count for pagination. Rows are lightweight: the
 // prompt is truncated to a preview and images are reduced to a count, so a page
 // stays small no matter how large the underlying prompts or base64 images are.
-func ListAllRuns(database *sql.DB, f RunFilter, page, pageSize int) ([]types.RunListItem, int, error) {
+//
+// The list is anchored to a point-in-time snapshot via f.MaxID: only runs with
+// id <= MaxID are returned, so rows inserted while the user pages through the
+// history never shift the slices under them. When f.MaxID is 0 the current
+// MAX(id) is resolved as the anchor; either way the anchor actually used is
+// returned so the caller can pin subsequent page requests to it.
+func ListAllRuns(database *sql.DB, f RunFilter, page, pageSize int) ([]types.RunListItem, int, int, error) {
+	if f.MaxID <= 0 {
+		// No anchor supplied — pin to the newest row right now. This is the
+		// "current time" snapshot; every page the caller requests against this
+		// anchor sees the same fixed set of rows.
+		var maxID int
+		if err := queryRow(database, "SELECT COALESCE(MAX(id), 0) FROM runs").Scan(&maxID); err != nil {
+			return nil, 0, 0, err
+		}
+		f.MaxID = maxID
+	}
+
 	whereSQL, whereArgs := f.where()
 
 	var total int
-	if err := database.QueryRow("SELECT COUNT(*) FROM runs"+whereSQL, whereArgs...).Scan(&total); err != nil {
-		return nil, 0, err
+	if err := queryRow(database, "SELECT COUNT(*) FROM runs"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, 0, err
 	}
 
 	offset := (page - 1) * pageSize
 	args := append(append([]any{}, whereArgs...), pageSize, offset)
 	// id DESC ≈ newest-first (id is the autoincrement insert order) and uses the
 	// primary key, so paging stays cheap as the table grows.
-	rows, err := database.Query(`
+	rows, err := query(database, `
 		SELECT id, run_id, task_id, user_email, model, provider,
 		       substr(prompt, 1, 200),
-		       image,
+		       `+imageCountExpr()+` AS image_count,
 		       success, cache_hit, fallback_used, is_test,
 		       latency_ms, total_tokens, cost_usd, created_at
 		FROM runs`+whereSQL+`
 		ORDER BY id DESC
 		LIMIT ? OFFSET ?`, args...)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	defer rows.Close()
 
 	items := []types.RunListItem{}
 	for rows.Next() {
 		var it types.RunListItem
-		var image sql.NullString
+		var imageCount int
 		var successInt, cacheInt, fallbackInt, testInt int
 		var createdAtStr string
 		if err := rows.Scan(
 			&it.ID, &it.RunID, &it.TaskID, &it.UserEmail, &it.Model, &it.Provider,
 			&it.PromptPreview,
-			&image,
+			&imageCount,
 			&successInt, &cacheInt, &fallbackInt, &testInt,
 			&it.LatencyMs, &it.TotalTokens, &it.CostUSD, &createdAtStr,
 		); err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
-		if image.Valid {
-			imgs := ParseImagesColumn(image.String)
-			it.ImageCount = len(imgs)
-			it.HasImage = it.ImageCount > 0
-		}
+		it.ImageCount = imageCount
+		it.HasImage = imageCount > 0
 		it.Success = successInt == 1
 		it.CacheHit = cacheInt == 1
 		it.FallbackUsed = fallbackInt == 1
@@ -388,14 +410,14 @@ func ListAllRuns(database *sql.DB, f RunFilter, page, pageSize int) ([]types.Run
 		it.CreatedAt = parseTime(createdAtStr)
 		items = append(items, it)
 	}
-	return items, total, rows.Err()
+	return items, total, f.MaxID, rows.Err()
 }
 
 // GetRunDetail returns the full record for one run_id across all users
 // (admin-only): the shared prompt/inputs plus one result per model row. Returns
 // (nil, nil) when the run_id is unknown.
 func GetRunDetail(database *sql.DB, runID string) (*types.RunDetailResponse, error) {
-	rows, err := database.Query(`
+	rows, err := query(database, `
 		SELECT prompt, system_prompt, image, model, response,
 		       latency_ms, input_tokens, output_tokens, total_tokens,
 		       cost_usd, success, error, user_id, user_email,
@@ -480,7 +502,7 @@ func GetRunDetail(database *sql.DB, runID string) (*types.RunDetailResponse, err
 // DistinctRunModels lists the distinct models that appear in the runs table,
 // alphabetically — used to populate the admin history's model filter.
 func DistinctRunModels(database *sql.DB) ([]string, error) {
-	rows, err := database.Query(`SELECT DISTINCT model FROM runs ORDER BY model ASC`)
+	rows, err := query(database, `SELECT DISTINCT model FROM runs ORDER BY model ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -507,9 +529,9 @@ func nullStrPtr(ns sql.NullString) *string {
 // UpsertFeedback records (or updates) a star rating for one model response.
 // One rating per (run_id, model, user); re-rating overwrites the prior value.
 func UpsertFeedback(db *sql.DB, runID, model, userID string, rating int) error {
-	_, err := db.Exec(`
+	_, err := exec(db, `
 		INSERT INTO feedback (run_id, model, user_id, rating, created_at)
-		VALUES (?,?,?,?, datetime('now'))
+		VALUES (?,?,?,?, `+nowExpr()+`)
 		ON CONFLICT(run_id, model, user_id)
 		DO UPDATE SET rating = excluded.rating, created_at = excluded.created_at`,
 		runID, model, userID, rating,
@@ -527,7 +549,7 @@ func DashboardStats(db *sql.DB, userID string) (*types.DashboardResponse, error)
 	}
 
 	// Per-task breakdown — the platform's primary cost dimension.
-	trows, err := db.Query(`
+	trows, err := query(db, `
 		SELECT
 			COALESCE(task_id, 'untagged')   AS task,
 			COUNT(*)                        AS runs,
@@ -557,7 +579,7 @@ func DashboardStats(db *sql.DB, userID string) (*types.DashboardResponse, error)
 
 	// Per-model breakdown. Ratings are joined from a pre-aggregated subquery so
 	// the LEFT JOIN can't fan out and inflate run/token/cost sums.
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT
 			r.model,
 			COUNT(*)                        AS runs,
@@ -595,7 +617,7 @@ func DashboardStats(db *sql.DB, userID string) (*types.DashboardResponse, error)
 	}
 
 	// Daily time series.
-	drows, err := db.Query(`
+	drows, err := query(db, `
 		SELECT
 			substr(created_at, 1, 10)     AS day,
 			COALESCE(SUM(cost_usd),0)     AS cost_usd,
@@ -629,7 +651,7 @@ func ListSessions(db *sql.DB, userID string, page, pageSize int) ([]types.Sessio
 	}
 
 	offset := (page - 1) * pageSize
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT
 			session_id,
 			MIN(prompt)      AS first_prompt,
@@ -668,7 +690,7 @@ func ListSessions(db *sql.DB, userID string, page, pageSize int) ([]types.Sessio
 
 // GetSession returns all runs for one user's session in chronological order.
 func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT id, run_id, session_id, prompt, system_prompt, image, model, response,
 		       latency_ms, input_tokens, output_tokens, total_tokens,
 		       cost_usd, success, error, user_id, user_email, created_at
@@ -717,7 +739,7 @@ func GetSession(db *sql.DB, userID, sessionID string) ([]types.RunRow, error) {
 // average). We instead select the session's run_ids in a subquery and count
 // each feedback row exactly once.
 func GetLeaderboard(db *sql.DB, userID, sessionID string) ([]types.LeaderboardEntry, error) {
-	rows, err := db.Query(`
+	rows, err := query(db, `
 		SELECT f.model,
 		       AVG(CAST(f.rating AS REAL)) AS avg_score,
 		       COUNT(*)                    AS rating_count
@@ -755,7 +777,7 @@ func DeleteSessions(db *sql.DB, userID string, sessionIDs []string) (int64, erro
 		args = append(args, id)
 	}
 	args = append(args, userID)
-	res, err := db.Exec(
+	res, err := exec(db,
 		fmt.Sprintf("DELETE FROM runs WHERE session_id IN (%s) AND user_id = ?", placeholders),
 		args...,
 	)
@@ -767,7 +789,7 @@ func DeleteSessions(db *sql.DB, userID string, sessionIDs []string) (int64, erro
 
 func countSessions(db *sql.DB, userID string) (int, error) {
 	var n int
-	err := db.QueryRow(
+	err := queryRow(db,
 		"SELECT COUNT(DISTINCT session_id) FROM runs WHERE session_id IS NOT NULL AND user_id = ?",
 		userID,
 	).Scan(&n)

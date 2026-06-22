@@ -47,6 +47,15 @@ properties:
   cache_ttl_seconds:
     type: integer
     minimum: 0
+  max_prompt_chars: # 0 → no text-length limit
+    type: integer
+    minimum: 0
+  max_image_kb: # 0 → no per-image size limit
+    type: integer
+    minimum: 0
+  max_images: # 0 → no limit on image count
+    type: integer
+    minimum: 0
   active:
     type: boolean
   created_at:

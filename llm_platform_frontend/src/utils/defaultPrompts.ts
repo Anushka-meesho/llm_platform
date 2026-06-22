@@ -38,6 +38,22 @@ function arrayItemType(schema: JsonSchema): string {
   return items && typeof items.type === 'string' ? items.type : 'item';
 }
 
+// isImageField reports whether a field carries image input — a string (or an
+// array's items) tagged format:"image", or the implicit image/images names.
+// Image values must never be inlined into the prompt with {{.field}}: they are
+// (often huge) base64 data URLs that travel to the model as attachments, so the
+// generated template only *gates* on their presence.
+function isImageField(f: Field): boolean {
+  const s = f.schema;
+  if (s.type === 'string' && s.format === 'image') return true;
+  if (s.type === 'array') {
+    const items = s.items as JsonSchema | undefined;
+    if (items && items.format === 'image') return true;
+  }
+  const n = f.name.toLowerCase();
+  return n === 'image' || n === 'images';
+}
+
 function hasFields(schema: JsonSchema | null | undefined): boolean {
   const props = schema?.properties as Record<string, unknown> | undefined;
   return !!props && Object.keys(props).length > 0;
@@ -144,7 +160,7 @@ export function buildDefaultPrompts(opts: {
       '',
       'You will be given:',
       ...inFields.map((f) => {
-        const ft = typeOf(f.schema) ?? 'string';
+        const ft = isImageField(f) ? 'image' : (typeOf(f.schema) ?? 'string');
         const desc = typeof f.schema.description === 'string' ? ` — ${f.schema.description}` : '';
         return `- ${titleCase(f.name)} (${ft})${f.required ? '' : ', optional'}${desc}`;
       }),
@@ -165,6 +181,12 @@ export function buildDefaultPrompts(opts: {
     tpl.push('', 'Input:');
     for (const f of inFields) {
       const label = titleCase(f.name);
+      if (isImageField(f)) {
+        // Never inline image bytes — gate on presence only; the image itself is
+        // sent to the model as an attachment.
+        tpl.push(`{{if .${f.name}}}- ${label}: see the attached image(s).{{end}}`);
+        continue;
+      }
       const line = `- ${label}: {{.${f.name}}}`;
       tpl.push(f.required ? line : `{{if .${f.name}}}- ${label}: {{.${f.name}}}{{end}}`);
     }

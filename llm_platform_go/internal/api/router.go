@@ -32,6 +32,7 @@ type RouterDeps struct {
 	Limiter        *ratelimit.Limiter       // optional per-task request/token rate limiter
 	Auth           AuthConfig
 	AllowedOrigins []string // CORS — the frontend origin(s)
+	AuthMode       string   // "demo" (passwordless dev login) or "sso" (real IdP)
 }
 
 func NewRouter(deps RouterDeps) http.Handler {
@@ -64,17 +65,30 @@ func NewRouter(deps RouterDeps) http.Handler {
 	r.Use(recoverer) // custom: logs panic + stack with request id, returns the standard envelope
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   origins,
-		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
-		AllowCredentials: true, // session cookie must be sent cross-origin in dev
+		AllowCredentials: true, // session cookie must be sent cross-origin (subdomain topology)
 	}))
 
+	// Liveness vs readiness: /health is a cheap "process is up" probe; /ready
+	// pings the DB so an orchestrator stops routing traffic when the backend
+	// can't serve. Both are public (no auth) for probe access.
 	r.Get("/health", h.HealthCheck)
+	r.Get("/ready", h.ReadyCheck)
 
-	// Auth — public (demo SSO stand-in).
-	r.Get("/auth/demo-users", h.DemoUsers)
-	r.With(v("auth_login")).Post("/auth/login", h.Login)
-	r.Post("/auth/logout", h.Logout)
+	// Auth routes depend on the mode. In demo mode the passwordless pick-a-user
+	// login is registered for local dev; in sso mode it is NOT registered at all
+	// (so the unauthenticated session-mint path cannot exist in prod), and the
+	// IdP redirect/callback handlers take its place.
+	if deps.AuthMode == "sso" {
+		r.Get("/auth/sso/login", h.SSOLogin)
+		r.Get("/auth/sso/callback", h.SSOCallback)
+		r.Post("/auth/logout", h.Logout)
+	} else {
+		r.Get("/auth/demo-users", h.DemoUsers)
+		r.With(v("auth_login")).Post("/auth/login", h.Login)
+		r.Post("/auth/logout", h.Logout)
+	}
 
 	// Everything else requires a valid session.
 	r.Group(func(pr chi.Router) {

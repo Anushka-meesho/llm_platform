@@ -3,15 +3,41 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
+// insecureJWTDefault is the dev-only fallback secret. Validate() rejects it when
+// APP_ENV=prod so a production server can never sign tokens with a known key.
+const insecureJWTDefault = "dev-insecure-secret-change-me"
+
 type Config struct {
+	// AppEnv is "dev" (default) or "prod". In prod, Validate() hard-fails on any
+	// insecure default (known JWT secret, missing origins, non-secure cookie, …)
+	// so a misconfigured server refuses to boot rather than running unsafely.
+	AppEnv string
+
+	// AuthMode selects how humans authenticate: "demo" (passwordless pick-a-user,
+	// dev only) or "sso" (real IdP). Prod must be "sso"; the demo login routes are
+	// not even registered otherwise.
+	AuthMode string
+
 	GroqKey     string
-	DBPath      string
 	Port        string
 	PricingPath string
+
+	// Database backend. DBDriver is "sqlite" (default, location = DBPath) or
+	// "postgres" (location = DBDSN connection string). Only one location field is
+	// used per driver.
+	DBDriver string
+	DBPath   string
+	DBDSN    string
+
+	// AllowedOrigins is the CORS allowlist (the frontend origin(s)). Required in
+	// prod; in dev an empty list falls back to the Vite dev origin.
+	AllowedOrigins []string
 
 	// Provider base URLs — override to route through a proxy/gateway or a self-hosted endpoint.
 	GroqBaseURL string
@@ -73,17 +99,25 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
+		AppEnv:   strings.ToLower(getEnvOrDefault("APP_ENV", "dev")),
+		AuthMode: strings.ToLower(getEnvOrDefault("AUTH_MODE", "demo")),
+
 		GroqKey:     os.Getenv("GROQ_API_KEY"),
-		DBPath:      getEnvOrDefault("DB_PATH", "./llm_platform.db"),
 		Port:        getEnvOrDefault("PORT", "8000"),
 		PricingPath: getEnvOrDefault("PRICING_PATH", "./pricing.json"),
+
+		DBDriver: strings.ToLower(getEnvOrDefault("DB_DRIVER", "sqlite")),
+		DBPath:   getEnvOrDefault("DB_PATH", "./llm_platform.db"),
+		DBDSN:    os.Getenv("DB_DSN"),
+
+		AllowedOrigins: splitAndTrim(os.Getenv("ALLOWED_ORIGINS")),
 
 		GroqBaseURL: getEnvOrDefault("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
 
 		MeeshoGatewayBaseURL: getEnvOrDefault("MEESHO_GATEWAY_BASE_URL", "http://llm-gateway.prd.meesho.int/v1"),
 		MeeshoGatewayVK:      os.Getenv("MEESHO_GATEWAY_VK"),
 
-		JWTSecret:      getEnvOrDefault("JWT_SECRET", "dev-insecure-secret-change-me"),
+		JWTSecret:      getEnvOrDefault("JWT_SECRET", insecureJWTDefault),
 		AuthCookieName: getEnvOrDefault("AUTH_COOKIE_NAME", "llm_platform_token"),
 		AuthIssuer:     getEnvOrDefault("AUTH_ISSUER", "llm-platform-demo"),
 		CookieDomain:   os.Getenv("COOKIE_DOMAIN"),
@@ -125,6 +159,67 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// IsProd reports whether the server is configured for production.
+func (c *Config) IsProd() bool { return c.AppEnv == "prod" }
+
+// IsInsecureJWTSecret reports whether s is unset or the known dev default — i.e.
+// unsafe to sign production tokens with. Shared by Validate and cmd/bootstrap.
+func IsInsecureJWTSecret(s string) bool { return s == "" || s == insecureJWTDefault }
+
+// Validate enforces production safety invariants. In dev it is a no-op (returning
+// only fast-fail driver checks); in prod every dangerous default becomes a boot
+// error so a misconfigured server refuses to start. Call it right after Load().
+func (c *Config) Validate() error {
+	// Driver sanity applies in every environment.
+	switch c.DBDriver {
+	case "sqlite":
+		if c.DBPath == "" {
+			return fmt.Errorf("DB_DRIVER=sqlite requires DB_PATH")
+		}
+	case "postgres":
+		if c.DBDSN == "" {
+			return fmt.Errorf("DB_DRIVER=postgres requires DB_DSN")
+		}
+	default:
+		return fmt.Errorf("DB_DRIVER must be 'sqlite' or 'postgres', got %q", c.DBDriver)
+	}
+
+	switch c.AuthMode {
+	case "demo", "sso":
+	default:
+		return fmt.Errorf("AUTH_MODE must be 'demo' or 'sso', got %q", c.AuthMode)
+	}
+
+	if !c.IsProd() {
+		return nil
+	}
+
+	// --- Production-only hard requirements. ---
+	var problems []string
+	if IsInsecureJWTSecret(c.JWTSecret) {
+		problems = append(problems, "JWT_SECRET must be set to a strong non-default value")
+	}
+	if c.AuthMode == "demo" {
+		problems = append(problems, "AUTH_MODE=demo is not allowed in prod (use sso); the passwordless login is dev-only")
+	}
+	if len(c.AllowedOrigins) == 0 {
+		problems = append(problems, "ALLOWED_ORIGINS must list the frontend origin(s)")
+	}
+	if !c.CookieSecure {
+		problems = append(problems, "COOKIE_SECURE must be true (HTTPS-only session cookie)")
+	}
+	if c.DBDriver == "sqlite" && !filepath.IsAbs(c.DBPath) {
+		problems = append(problems, fmt.Sprintf("DB_PATH must be an absolute path in prod, got %q", c.DBPath))
+	}
+	if !filepath.IsAbs(c.PricingPath) {
+		problems = append(problems, fmt.Sprintf("PRICING_PATH must be an absolute path in prod, got %q", c.PricingPath))
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("insecure production config:\n  - %s", strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
 // MissingProviderKeys lists provider keys that are not configured, for an
 // informational startup warning.
 func (c *Config) MissingProviderKeys() []string {
@@ -136,6 +231,20 @@ func (c *Config) MissingProviderKeys() []string {
 		missing = append(missing, "MEESHO_GATEWAY_VK")
 	}
 	return missing
+}
+
+// splitAndTrim parses a comma-separated env value into a trimmed, non-empty list.
+func splitAndTrim(v string) []string {
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func getEnvOrDefault(key, fallback string) string {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -126,6 +127,18 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 	userID := user.Subject
 	userEmail := user.Email
 	runID := uuid.New().String()
+
+	// The Compare playground is itself a task (PlaygroundTaskID), so its
+	// configured input size limits apply here too. Enforce them up front against
+	// the prompt text and any attached images, before spending on model calls.
+	images := imagesFromConversations(req.ModelConversations)
+	if pt, err := h.Tasks.Get(tasks.PlaygroundTaskID); err == nil {
+		if herr := enforceInputLimits(pt, req.SystemPrompt+"\n"+req.Prompt, images); herr != nil {
+			writeErr(w, r, herr)
+			return
+		}
+	}
+
 	wallStart := time.Now()
 
 	runResult := llm.RunAll(r.Context(), h.Clients, &req)
@@ -137,7 +150,6 @@ func (h *Handler) RunEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	playgroundID := tasks.PlaygroundTaskID
-	images := imagesFromConversations(req.ModelConversations)
 
 	for _, mr := range runResult.Results {
 		var sessionID *string
@@ -345,6 +357,22 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		"status":           "ok",
 		"models_available": llm.AllModels(),
 	})
+}
+
+// ReadyCheck is the readiness probe: it pings the database so an orchestrator
+// (k8s, a load balancer) stops routing traffic to an instance that can't serve.
+// Returns 503 with {"status":"not_ready"} when the DB is unreachable.
+func (h *Handler) ReadyCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.DB.PingContext(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "not_ready",
+			"reason": "database unreachable",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ready"})
 }
 
 // GET /pricing — serves the pricing table so the frontend estimates with the

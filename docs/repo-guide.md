@@ -1,9 +1,17 @@
 # LLM Platform — Complete Repository Guide
 
-**Last updated:** 2026-06-17
+**Last updated:** 2026-06-19
 **Scope:** `llm_platform_go` (backend) + `llm_platform_frontend` (operator Studio UI) +
 `llm_platform_client` (consumer-facing client portal). The Python `llm_platform_v0` is
 superseded and excluded.
+
+> **Deployment readiness (2026-06-19):** the backend is being prepared to deploy as its
+> own repo, separate from the frontend, on subdomains of one parent domain. That work
+> added: a **pluggable database** (SQLite *or* Postgres via `DB_DRIVER`), an `APP_ENV=prod`
+> config gate (`config.Validate()` refuses insecure boots), an `AUTH_MODE` switch (demo
+> login vs an SSO scaffold), `cmd/migrate` + `cmd/bootstrap`, graceful shutdown + HTTP
+> timeouts, and a `/ready` probe. See `llm_platform_go/docs/DEPLOY.md`. RBAC is **two roles**
+> today — `admin` and `client` (see §3.3).
 
 ---
 
@@ -25,10 +33,12 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 - **Resilient routing:** fallback chains + a **per-(task, model)** health breaker that skips a model for one task after repeated failures (incl. schema-invalid output) with exponential-backoff cooldown + admin reset, `X-Platform-Degraded` contract
 - **Admin observability:** a cross-tenant **prompt-history** viewer (every user's runs, filterable + paginated) and a **model-health** console (live circuit states + persisted fallback/health events), both admin-only
 - **Budget enforcement:** per-task daily caps → 429 + `Retry-After` (0 = exempt)
-- **Service auth + RBAC:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready) with a role; role-based authorization enforced at the gateway (creator / approver / caller / viewer / admin — see §3.3)
+- **Per-task rate limiting:** a per-task rolling window caps requests, total tokens, and per-request input size → 413 (oversized input) / 429 (rate or token budget) with `Retry-After`; reserve-then-reconcile against tokens actually consumed (`internal/ratelimit`, see §3.9)
+- **Service auth + RBAC:** `cmd/issue-token` mints long-lived `svc:*` Bearer tokens (CIS-ready) with a role; role-based authorization enforced at the gateway. **Two roles today — `admin` and `client`** (see §3.3)
 - **Prompt registry:** first-class versions (draft → test → deploy), auto-history, Studio UI (Tasks page)
 - **Shadow harness:** `/v1/shadow/compare` measures field-level match rate + latency p50/p95 vs labelled expectations
-- **Observability:** async buffered run writer (hot path never blocks on SQLite), per-task stats endpoint
+- **Observability:** async buffered **run writer** (one row per call) **and gateway-attempt writer** (one row per model the fallback walk touched — full per-attempt trace incl. fallbacks, skips, cache hits, and schema-invalid responses), neither blocking the hot path; per-task stats endpoint (see §3.7)
+- **Pluggable database:** SQLite (default) **or** Postgres, selected by `DB_DRIVER`; the query layer is dialect-aware (`internal/db/dialect.go`). Postgres is implemented but pending validation against a live instance (see §3.7)
 - **Prediction cache (Redis):** per-task opt-in exact-match cache — key pins prompt version + rendered prompt + model + params + schema; hits are zero-cost `cached:true` responses (pulled forward from Phase 3.3)
 - Demo SSO + swappable user store, JWT cookie auth
 - Multi-model playground (Compare UI), pre-call cost estimation, 1–5★ feedback
@@ -39,10 +49,11 @@ Python in the hot path. All routing, prompt management, tracing, and eval are bu
 - **Client portal** (`llm_platform_client`, :5174): consumer-facing catalog + live Try-it
   predict panel, authenticated as a baked-in `svc:demo-client` service token (no login)
 
-Planning docs: `docs/gap-analysis-roadmap.md` (gap analysis vs. the design doc),
+Planning / ops docs: `docs/gap-analysis-roadmap.md` (gap analysis vs. the design doc),
 `docs/phase-workflow.md` (execution plan for Phases 1–4),
 `docs/deployment-guide.md` (every dev/demo assumption to swap before a real
-deployment, mapped to the seam that contains it).
+deployment, mapped to the seam that contains it), and
+`llm_platform_go/docs/DEPLOY.md` (the concrete split-repo / config / first-run runbook).
 
 ---
 
@@ -54,22 +65,28 @@ llm_platform/
 │                                  #   (./dev.sh restart|start|stop|status|logs); pids+logs in .dev/
 ├── docs/                          # planning + this guide
 ├── llm_platform_go/               # Go backend (single binary)
-│   ├── cmd/server/main.go         # boot sequence
-│   ├── cmd/issue-token/main.go    # mint long-lived svc:* Bearer tokens (CIS etc.)
+│   ├── cmd/server/main.go         # boot sequence (validate → open DB → serve; graceful shutdown)
+│   ├── cmd/issue-token/main.go    # mint long-lived svc:* Bearer tokens (-role client|admin)
+│   ├── cmd/migrate/main.go        # apply DB schema out-of-band (prod doesn't auto-migrate)
+│   ├── cmd/bootstrap/main.go      # first-run: gen JWT secret, validate, migrate, lock DB, mint break-glass admin
+│   ├── docs/DEPLOY.md             # split-repo / cross-origin / first-run runbook
 │   ├── internal/
-│   │   ├── api/                   # HTTP layer: router, middleware, handlers
-│   │   ├── auth/                  # JWT issue/parse, cookie management
+│   │   ├── api/                   # HTTP layer: router, middleware, handlers, SSO scaffold
+│   │   ├── auth/                  # JWT issue/parse, cookie management, RBAC (admin/client)
 │   │   ├── cache/                 # prediction cache: Redis / memory behind Cache iface
-│   │   ├── config/                # env-driven configuration
-│   │   ├── db/                    # SQLite open/migrate + SQL queries + async run/health writers
+│   │   ├── config/                # env-driven config + Validate() (prod safety gate)
+│   │   ├── db/                    # open/migrate (sqlite|postgres), dialect seam, SQL queries, async writers
 │   │   ├── health/                # per-(task, model) circuit-breaker tracker
 │   │   ├── llm/                   # provider clients, model routing, pricing, fallback walk
+│   │   ├── ratelimit/             # per-task request/token rolling-window limiter
+│   │   ├── schema/               # embedded request-body JSON Schemas (422 before handler)
 │   │   ├── tasks/                 # Task registry: model, store, validate, render, seed
-│   │   ├── types/                 # request/response contracts + RunRow
+│   │   ├── types/                 # request/response contracts + RunRow + GatewayAttempt
 │   │   └── users/                 # identity seam: Store interface + DemoStore
 │   ├── tests/                     # black-box HTTP + DB tests
 │   ├── pricing.json               # per-model $/1M token rates
-│   └── .env                       # local secrets (gitignored)
+│   ├── .env.example               # annotated config template (copy to .env)
+│   └── .env                       # local secrets (gitignored; never committed)
 ├── llm_platform_frontend/         # React 19 + Vite + Tailwind 4 + Meesho merlin-ui
 │   └── src/
 │       ├── api/client.ts          # typed fetch wrapper (cookie credentials)
@@ -98,45 +115,67 @@ llm_platform/
 1. `godotenv.Load()` — `.env` is optional; real env vars also work.
 2. `config.Load()` — fails only if **zero** provider keys are set; missing individual
    keys log a warning and that provider fails at call time.
-3. `llm.LoadPricing(pricing.json)` — cost table into memory.
-4. `db.Open` (SQLite, WAL, single writer) → `db.Migrate` (idempotent).
-5. `llm.BuildClients` — one `Provider` per backend. There are **two**: `Groq` (direct
+3. **`config.Validate()`** — in `APP_ENV=prod` this **hard-fails the boot** on any insecure
+   default: dev/blank `JWT_SECRET`, `AUTH_MODE=demo`, missing `ALLOWED_ORIGINS`,
+   `COOKIE_SECURE=false`, or a relative `DB_PATH`/`PRICING_PATH`. In dev it's a no-op
+   beyond driver sanity. (See §3.2.)
+4. `llm.LoadPricing(pricing.json)` — cost table into memory.
+5. `db.Open(DB_DRIVER, DB_PATH, DB_DSN)` — `sqlite` (WAL, single writer) **or** `postgres`
+   (pgx, real pool). **Migrations:** auto-run here in dev only; in prod they're applied
+   out-of-band via `cmd/migrate` (so a rolling deploy never blocks on / races a schema change).
+6. `llm.BuildClients` — one `Provider` per backend. There are **two**: `Groq` (direct
    API) and `Meesho` (the internal bifrost gateway, OpenAI-compatible with `x-bf-vk`
    auth). Every non-Groq model is served through the Meesho gateway.
-6. `tasks.NewStore` → `tasks.SeedPlayground` — seeds only the built-in `playground` task.
-   Product tasks live in the DB and are authored at runtime via the Studio (no YAML seeding).
-7. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
-8. `db.NewRunWriter` — async observability writer; `Close()` flushes on shutdown.
-9. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) health
-   breaker (thresholds from config; transitions persisted via the async health writer).
-   See §3.6.
-10. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
+7. `tasks.NewStore` → `tasks.SeedPlayground` + `tasks.SeedAttributeExtraction` — seeds the
+   built-in `playground` task and the live `attribute-extraction` task (idempotent; never
+   overwrites). Other product tasks live in the DB, authored at runtime via the Studio.
+8. `users.NewDemoStore()` — **the identity swap seam** (see §3.4).
+9. `db.NewRunWriter` + `db.NewGatewayAttemptWriter` — async observability writers (run rows
+   + per-attempt gateway trace); `Close()` flushes each on shutdown. See §3.7.
+10. `db.NewHealthEventWriter` + `health.NewTracker(...)` — the per-(task, model) health
+    breaker (thresholds from config; transitions persisted via the async health writer). See §3.6.
+11. `ratelimit.New(...)` — per-task request/token rolling-window limiter (§3.9).
+12. Prediction cache by `CACHE_BACKEND`: Redis (boot fails on bad addr) / in-process
     memory / off.
-11. `api.NewRouter(RouterDeps{...})` → `http.ListenAndServe(:PORT)`.
+13. `api.NewRouter(RouterDeps{...})` → an `http.Server` with read/write/idle **timeouts**;
+    `ListenAndServe` in a goroutine. **SIGINT/SIGTERM → graceful shutdown**: stop accepting,
+    drain in-flight requests, then close the async writers so buffered rows flush.
 
 ### 3.2 Configuration — `internal/config`
 
 | Env var | Default | Purpose |
 |---|---|---|
+| `APP_ENV` | `dev` | `prod` turns on `config.Validate()` (rejects insecure defaults) and disables inline migrations |
+| `AUTH_MODE` | `demo` | `demo` = passwordless pick-a-user login (dev); `sso` = IdP redirect/callback, demo login unregistered |
+| `DB_DRIVER` | `sqlite` | `sqlite` (location = `DB_PATH`) or `postgres` (location = `DB_DSN`) |
+| `DB_DSN` | — | Postgres connection string, e.g. `postgres://user:pass@host:5432/db?sslmode=require` (required when `DB_DRIVER=postgres`) |
 | `GROQ_API_KEY` | — | Groq API key (direct); at least one of this or `MEESHO_GATEWAY_VK` is required at boot |
 | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq base URL — override for a proxy/self-hosted endpoint |
 | `MEESHO_GATEWAY_VK` | — | Virtual key for the Meesho internal LLM gateway (sent as the `x-bf-vk` header); serves every non-Groq model (GPT-4o, Gemini 2.5, Claude) |
 | `MEESHO_GATEWAY_BASE_URL` | `http://llm-gateway.prd.meesho.int/v1` | Meesho gateway base URL (OpenAI-compatible `/chat/completions`) |
-| `DB_PATH` | `./llm_platform.db` | SQLite file |
+| `DB_PATH` | `./llm_platform.db` | SQLite file (used only when `DB_DRIVER=sqlite`; must be absolute in prod) |
 | `PORT` | `8000` | HTTP port |
 | `PRICING_PATH` | `./pricing.json` | Cost table |
 | `JWT_SECRET` | dev placeholder | Signs session tokens — **set a real one outside dev** |
 | `AUTH_COOKIE_NAME` | `llm_platform_token` | Session cookie |
 | `AUTH_ISSUER` | `llm-platform-demo` | JWT `iss` |
 | `TOKEN_EXPIRY` | `12h` | Session lifetime |
-| `COOKIE_DOMAIN` / `COOKIE_SECURE` | empty / false | Cookie scoping (set Secure under HTTPS) |
-| `ALLOWED_ORIGINS` | `http://localhost:5173` | CORS allowlist (credentials mode) |
+| `COOKIE_DOMAIN` / `COOKIE_SECURE` | empty / false | Cookie scoping (set `COOKIE_DOMAIN=.example.com` + `COOKIE_SECURE=true` for the subdomain topology; Secure required in prod) |
+| `ALLOWED_ORIGINS` | `http://localhost:5173` (dev fallback) | CORS allowlist, comma-separated (credentials mode); **required in prod** — the frontend origin(s) |
+| `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` / `OIDC_POST_LOGIN_URL` | — | SSO config, read only when `AUTH_MODE=sso`; consumed by the IdP handshake scaffold in `auth_sso_handlers.go` (§3.3) |
 | `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | — | Prediction cache backend; addr set → Redis (boot fails on bad addr) |
 | `CACHE_BACKEND` | derived | `redis` \| `memory` (in-process, dev only) \| `off` (default when no `REDIS_ADDR`) |
 | `HEALTH_BREAKER_ENABLED` | `true` | Per-(task, model) health breaker on/off (off = every model is tried every time) |
 | `HEALTH_FAILURE_THRESHOLD` | `3` | Consecutive failures (provider error OR schema-invalid output) before a model is tripped unhealthy for a task |
 | `HEALTH_BASE_COOLDOWN` | `30s` | First unhealthy cooldown window; doubles on each re-trip |
 | `HEALTH_MAX_COOLDOWN` | `30m` | Cap for the backed-off cooldown |
+| `RATE_LIMIT_ENABLED` | `true` | Per-task request/token rate limiter on/off (§3.9) |
+| `RATE_WINDOW` | `1m` | Rolling window per task |
+| `RATE_MAX_REQUESTS` | `600` | Max accepted requests per task per window (0 = unlimited) |
+| `RATE_MAX_TOKENS` | `200000` | Max tokens consumed per task per window (0 = unlimited) |
+| `RATE_MAX_INPUT_TOKENS` | `16000` | Max estimated input tokens for one request → 413 (0 = unlimited) |
+| `RATE_CHARS_PER_TOKEN` | `4` | Token estimation divisor |
+| `RATE_TOKENS_PER_IMAGE` | `1000` | Flat token estimate per attached image |
 
 ### 3.3 Auth — `internal/auth`
 
@@ -150,39 +189,52 @@ the `Authorization: Bearer` header **or** the HttpOnly session cookie (`TokenFro
 The Bearer path means **service-to-service auth already works mechanically** — what's
 missing (Phase 1) is a way to mint long-lived service principals distinct from UI sessions.
 
-**Role-based authorization (`internal/auth/rbac.go`).** The PFS User Journey separates a
-prompt **creator** (authors/iterates), an **approver** (owns the publish gate — Gate 2),
-and a service **caller** (only invokes predict). RBAC encodes that as six capabilities —
-`task:read`, `task:predict`, `task:write` (create/update/draft/test/shadow), `task:deploy`
-(the publish gate, deliberately split from `task:write`), `task:delete` (destructive —
-deleting a whole task or pruning prompt versions; admin-only), and `task:view_prompt` (see the prompt text itself —
-withheld from callers, who integrate against the task contract and "never touch prompts" per
-the PFS) — mapped to five roles:
+**Role-based authorization (`internal/auth/rbac.go`).** Two principals exist: the human
+**operator** (`admin`), who runs the platform via the Studio and holds every capability, and
+the service **client**, a backend that only invokes the product predict API and never sees
+prompts. RBAC encodes this as six capabilities — `task:read`, `task:predict`, `task:write`
+(create/update/draft/test/shadow), `task:deploy` (the publish gate, deliberately split from
+`task:write`), `task:delete` (destructive — deleting a whole task or pruning prompt versions),
+and `task:view_prompt` (see the prompt text itself — withheld from clients, who integrate
+against the task contract and "never touch prompts" per the PFS) — mapped to two roles:
 
 | Role | read | predict | write | deploy | delete | view_prompt |
 |---|---|---|---|---|---|---|
 | `admin` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `creator` | ✓ | ✓ | ✓ | — | — | ✓ |
-| `approver` | ✓ | ✓ | — | ✓ | — | ✓ |
-| `caller` | ✓ | ✓ | — | — | — | — |
-| `viewer` | ✓ | — | — | — | — | ✓ |
+| `client` | ✓ | ✓ | — | — | — | — |
 
-**Prompt redaction:** a caller (anyone without `task:view_prompt`) gets task config, schemas,
+> The capability set is finer-grained than the two roles (it anticipates future
+> creator/approver splits), but only `admin` and `client` are wired today. `write`,
+> `deploy`, and `delete` are therefore effectively admin-only.
+
+**Prompt redaction:** a `client` (anyone without `task:view_prompt`) gets task config, schemas,
 and its own run outputs, but `GET /v1/tasks`, `GET /v1/tasks/{id}`, and
 `GET /v1/tasks/{id}/versions` blank the `prompt_template` / `system_prompt` fields
-(`redactedTask` copies the cached task so the shared config-cache entry is never mutated).
+(`redactedTask` in `handlers.go` copies the cached task so the shared config-cache entry is
+never mutated; `ListPromptVersions` blanks version bodies the same way).
 
 The role rides **inside the signed JWT** (`Claims.Role`), so the gateway authorizes from the
 token alone — no per-request identity-store lookup (hot path stays DB-free). A token with no
-role claim resolves to `caller` (`DefaultRole`) — least privilege that can still predict +
-read, so pre-RBAC service tokens (e.g. the client portal's baked `svc:demo-client`) keep
-working. `RequirePermission(perm)` middleware (`internal/api/middleware.go`) gates each `/v1`
-route in `router.go` and returns **403** on denial; Studio playground routes (`/run`,
-`/sessions`, `/feedback`, `/dashboard`, `/pricing`, `/auth/me`) stay open to any authenticated
-user. Login stamps the role from `users.User.Role`; `cmd/issue-token -role` mints service
-tokens with a role (validated against `KnownRole`). The demo store seeds one user per role.
-Frontend mirrors the matrix in `src/auth/permissions.ts` (UI gating only — the gateway is the
-source of truth) and the Studio hides/disables edit/deploy actions per role.
+role claim resolves to `admin` (`DefaultRole`, kept for backward compatibility — `issue-token`
+always stamps an explicit role). `RequirePermission(perm)` middleware
+(`internal/api/middleware.go`) gates each `/v1` route in `router.go` and returns **403** on
+denial; the admin observability routes use `RequireAdmin` (gated on the `admin` *role*, not a
+capability). Studio playground routes (`/run`, `/sessions`, `/feedback`, `/dashboard`,
+`/pricing`, `/auth/me`) stay open to any authenticated user. Demo login stamps the role from
+`users.User.Role`; `cmd/issue-token -role` mints service tokens with a role (default `client`,
+validated against `KnownRole`).
+
+**Auth mode (`AUTH_MODE`).** `demo` registers the passwordless pick-a-user login
+(`/auth/demo-users`, `/auth/login`) for local dev. `sso` unregisters those entirely and instead
+registers `/auth/sso/login` + `/auth/sso/callback` — an **OIDC scaffold** in
+`auth_sso_handlers.go` that shares the session-cookie tail (`issueSession`) with the demo path.
+The IdP handshake itself is a documented `TODO` (returns `501` until the `OIDC_*` env is wired);
+the break-glass admin token from `cmd/bootstrap` provides access until then. `config.Validate()`
+forbids `AUTH_MODE=demo` in prod.
+
+Frontend mirrors the matrix in `src/auth/permissions.ts` (admin-only today; UI gating only — the
+gateway is the source of truth) and the Studio hides/disables edit/deploy/delete actions for
+non-admins.
 
 ### 3.4 Identity seam — `internal/users`
 
@@ -193,12 +245,12 @@ type Store interface {
 }
 ```
 
-`DemoStore` is in-memory, seeded with one user per RBAC role (`u-admin`, `u-creator`,
-`u-approver`, `u-viewer` — see §3.3), persists **nothing** (by design — there is no demo
-data to migrate). `User.Role` is the field the login handler stamps into the session token.
-**Moving to real SSO = implement `Store` against the IdP + change one constructor line in
-`main.go`** (the IdP supplies the role). Nothing else in the codebase knows where users
-come from.
+`DemoStore` is in-memory, seeded with a single user — `u-admin` (`admin@demo.local`, role
+`admin`) — and persists **nothing** (by design — there is no demo data to migrate). `User.Role`
+is the field the demo login handler stamps into the session token. **Moving to real SSO =
+implement `Store` against the IdP + change one constructor line in `main.go`** (the IdP supplies
+the identity and role); the SSO route scaffold (§3.3) is the place the callback resolves a user
+and calls `issueSession`. Nothing else in the codebase knows where users come from.
 
 ### 3.5 Task registry — `internal/tasks` (the platform core)
 
@@ -370,11 +422,28 @@ are misses — Redis going down degrades performance, never predictions.
 
 ### 3.7 Database — `internal/db`
 
-SQLite via `modernc.org/sqlite` (pure Go, no cgo). WAL mode, `busy_timeout=5000`,
-`SetMaxOpenConns(1)` (single writer). **Migration strategy:** idempotent
-`CREATE TABLE IF NOT EXISTS` + guarded `ALTER TABLE ADD COLUMN` (ignore "duplicate
-column") — existing DBs upgrade in place on boot. Follow this pattern for all future
-schema changes.
+**Pluggable backend (`db.Open(driver, sqlitePath, postgresDSN)`):**
+- **`sqlite`** (default) via `modernc.org/sqlite` (pure Go, no cgo). WAL mode,
+  `busy_timeout=5000`, `foreign_keys=ON`, `SetMaxOpenConns(1)` (single writer). Fully tested.
+- **`postgres`** via `jackc/pgx/v5/stdlib`, with a real pool (`MaxOpenConns=20`, idle/lifetime
+  tuned). Implemented but **pending validation against a live Postgres** (no instance was
+  available when it was written — see `docs/DEPLOY.md` for the two spots to confirm:
+  numeric→float dashboard scans, and `shadow_reports.id` which uses `LastInsertId`, unsupported
+  by pgx).
+
+**Dialect seam (`dialect.go`):** the process-global `activeDriver` is set by `Open`. All hand-
+written queries use portable `?` placeholders and route through `exec`/`query`/`queryRow` (and
+the exported `db.Exec`/`db.Query`/`db.QueryRow`/`db.Rebind` for the `tasks` store and shadow
+handler), which rewrite `?`→`$n` on Postgres. The few diverging fragments are behind helpers:
+`nowExpr()`, `todayExpr()`, `daysAgoExpr(n)`, `ciLike(col)`. `created_at` is stored as TEXT in
+**both** backends (canonical `YYYY-MM-DD HH:MM:SS`) so scanning, `substr()`, and ordering are
+identical.
+
+**Migration strategy:** `Migrate` dispatches on the driver. SQLite keeps the original idempotent
+`CREATE TABLE IF NOT EXISTS` + guarded `ALTER TABLE ADD COLUMN` (ignore "duplicate column") so
+existing dev DBs upgrade in place; Postgres applies an idempotent schema in `schema_postgres.go`
+(`CREATE … IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, native types). Migrations auto-run on boot
+in dev only; in prod run `cmd/migrate` out-of-band. Follow this pattern for future schema changes.
 
 **Timestamp parsing gotcha:** we write `DATETIME` columns as `"2006-01-02 15:04:05"`
 (`fmtTime`), but the `modernc.org/sqlite` driver recognizes `DATETIME`/`TIMESTAMP`
@@ -415,6 +484,16 @@ manual_reset}`. Indexed on `(task_id, model)` and `created_at`. The live circuit
 state is in-memory (`internal/health`); this table is the persisted history for the
 admin model-health console and post-hoc analysis.
 
+**`gateway_attempts`** — the full per-attempt trace of a prediction's fallback walk: **one row
+per model the walk touched**, in walk order (`seq`, 0 = configured primary), under the run's
+`run_id`. Where `runs` holds the single answer served, this holds everything behind it —
+`outcome ∈ {success, error, schema_invalid, skipped_unhealthy, cache_hit}`, `fallback_used` +
+`fallback_reason`, the model's `response`, classified `error` + `http_status` + `infra_failure`,
+`retry_count`, per-call `latency_ms`, usage, cost, and `is_test`. Indexed on `run_id`, `task_id`,
+`model`, `outcome`, `created_at`. Surfaced by `ListGatewayAttempts(run_id)` and attached to the
+admin run-detail response (`RunDetailResponse.Attempts`), so the History drawer shows the whole
+fallback story for one run, not just the winner.
+
 **Queries** (`queries.go`): `InsertRun`, `GetRunByID` (poll), `ListSessions` /
 `GetSession` / `DeleteSessions` (all user-scoped), `UpsertFeedback`,
 `DashboardStats(userID)` → totals + `by_task` (runs/tokens/cost/avg-latency/success-rate)
@@ -433,17 +512,22 @@ back-compatible with legacy single-string rows).
 `InsertRun`; non-blocking `Write` with dropped-row counter; `Close()` flushes on
 shutdown. Handlers go through `Handler.insertRun`, which uses the writer when set and
 falls back to synchronous inserts when nil (tests stay deterministic).
+**`GatewayAttemptWriter`** (`attemptwriter.go`): the same pattern for `gateway_attempts` (larger
+buffer, 4096, because one run emits several attempt rows) → `InsertGatewayAttempt`.
 **`HealthEventWriter`** (`healthwriter.go`): the same pattern for `model_health_events`
 — a buffered channel drained to `InsertHealthEvent`, wired as the health tracker's
-event sink so transitions persist off the request hot path.
+event sink so transitions persist off the request hot path. All three `Close()` are
+idempotent and flushed by the graceful-shutdown path (§3.1).
 
 ### 3.8 HTTP API — `internal/api`
 
 `router.go` — chi router; RequestID/Logger/Recoverer; CORS restricted to
-`ALLOWED_ORIGINS` with `AllowCredentials: true`.
+`ALLOWED_ORIGINS` with `AllowCredentials: true` and methods `GET/POST/PUT/DELETE/OPTIONS`.
 
-**Public:** `GET /health` · `GET /auth/demo-users` · `POST /auth/login {user_id}` (sets
-cookie) · `POST /auth/logout`.
+**Public:** `GET /health` (liveness) · `GET /ready` (readiness — pings the DB, `503` when it
+can't serve). **Auth routes depend on `AUTH_MODE`:** in `demo` — `GET /auth/demo-users` ·
+`POST /auth/login {user_id}` (sets cookie) · `POST /auth/logout`; in `sso` — `GET /auth/sso/login`
+· `GET /auth/sso/callback` · `POST /auth/logout` (the demo login routes are not registered at all).
 
 **Behind `RequireAuth`** (and, for `/v1/tasks/*`, `RequirePermission` — see the RBAC
 matrix in §3.3; the Studio playground rows below are open to any authenticated user):
@@ -457,7 +541,7 @@ matrix in §3.3; the Studio playground rows below are open to any authenticated 
 | `GET /sessions/{id}/leaderboard` | Per-session model leaderboard: avg manual ★ per model (`{session_id, entries:[{model, avg_score, rating_count}]}`), ordered by score. User-scoped; the SQL selects the session's `run_id`s in a subquery so each `feedback` row counts once (a fan-out stores one `runs` row per model under one `run_id`, so a naive join inflates) |
 | `POST /feedback {run_id, model, rating}` | 1–5★ upsert |
 | `GET /dashboard` | Per-user usage: totals, by_task, by_model, daily |
-| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. **`POST` is how tasks are authored** (`task:write` → creator/admin; no YAML seeding). PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
+| `POST /v1/tasks` · `GET /v1/tasks` · `GET/PUT /v1/tasks/{id}` | Registry CRUD. **`POST` is how tasks are authored** (`task:write` → admin; no YAML seeding). PUT has **merge semantics** — absent fields keep current values; an explicit `"input_schema": null` / `"output_schema": null` **clears** that schema (the only way to remove one). Schemas re-validate on write → 422 if not compilable |
 | `DELETE /v1/tasks/{id}` | Delete a whole task + its prompt-version history (run rows kept for audit). **admin-only** (`task:delete`); **404** unknown · **409** for the built-in `playground` task |
 | `POST /v1/tasks/{id}/predict {inputs}` | **The product endpoint** (see below) |
 | `GET /v1/tasks/runs/{run_id}` | Poll a run (becomes async-result fetch in Phase 3) |
@@ -516,14 +600,34 @@ platform wall-clock (input validation + the whole fallback walk, including faile
 + output validation + cache work). Gateway ≥ model; the client portal shows both plus the
 computed `(+Nms overhead)`.
 
+### 3.9 Per-task rate limiter — `internal/ratelimit`
+
+A per-task **rolling-window** limiter (config in §3.2, `RATE_*`) sits in front of production
+predicts, independent of the daily budget gate. Each task gets its own window (default 1m) with
+its own lock — tasks never serialize against each other. Three gates:
+
+1. **Per-request input cap** (`MaxInputTokens`) — an estimate over the request's chars
+   (`/RateCharsPerToken`) plus `RateTokensPerImage` per image; over the cap → **413**
+   (`input_too_large`), no `Retry-After` (retrying the same input won't help).
+2. **Request-rate cap** (`MaxRequests` per window) → **429** with `Retry-After` = time to window refill.
+3. **Token budget** (`MaxTokens` per window) → **429** with `Retry-After`.
+
+It uses a **reserve-then-reconcile** pattern: `executePrediction` reserves the request's estimate
+up front, then `Reconcile`s to the tokens actually consumed (input+output across every attempt,
+incl. failed/fallback ones). A request that ran always counts toward the request gate even if it
+failed. A `0` for any `Max…` disables that gate; `RATE_LIMIT_ENABLED=false` turns the whole thing
+off. Test/shadow runs are not rate-limited.
+
 ---
 
 ## 4. Frontend Deep Dive
 
 **Stack:** React 19, Vite 8, Tailwind 4, `@meesho/merlin-ui-tailwind` (design system),
-`js-tiktoken`. No router library — a `view` state switch in `AppShell`. Dev proxy
-(`vite.config.ts`) forwards `/run /sessions /health /auth /pricing /feedback /dashboard /v1`
-to `:8000`.
+`js-tiktoken`. No router library — a `view` state switch in `AppShell`. In dev the API base is
+`''` and the Vite proxy (`vite.config.ts`) forwards `/run /sessions /health /auth /pricing
+/feedback /dashboard /v1` to `:8000`; for a split-repo prod build `src/api/client.ts` reads
+`const BASE = (import.meta.env.VITE_BACKEND_URL ?? '').replace(/\/+$/, '')` so calls target the
+backend's origin (see `.env.example` and `DEPLOY.md`).
 
 **Auth flow:** `main.tsx` wraps the app in `AuthProvider` (`src/auth/AuthContext.tsx`),
 which bootstraps via `GET /auth/me` (401 = logged out, no crash). `App.tsx` is the gate:
@@ -532,11 +636,14 @@ spinner → `LoginScreen` (one-click demo users from `/auth/demo-users`) → `Ap
 client (`src/api/client.ts`) sends `credentials: 'include'` on every call and throws
 typed `ApiError{status}`.
 
-**Pages** (top-nav in `AppShell` — `compare | tasks | versions | estimate | dashboard`,
-plus `history | health` shown **only to admins** (`user.role === 'admin'`) — which also
-fetches `/pricing` once and feeds `setPricing`):
+**Pages** (top-nav in `AppShell` — `compare | tasks | dashboard`, plus `history | health | test`
+shown **only to admins** (`user.role === 'admin'`); the shell fetches `/pricing` once and feeds
+`setPricing`). Note: there is no longer an *Estimate* tab, and `VersionsPage` exists as a
+component home but is not wired into the current top-nav (version management lives inside the
+Tasks detail). The admin **Test** tab embeds the client portal (`ClientPortalPage`) for in-Studio
+predict testing.
 - **Tasks / Studio** (`TasksPage`) — master/detail over the registry. A **+ New** button
-  (creator/admin) opens a `CreateTaskForm` that authors a task from scratch — id (live slug +
+  (admin) opens a `CreateTaskForm` that authors a task from scratch — id (live slug +
   duplicate check), name, description, primary model + fallback chain, temperature, max
   tokens, daily budget, cache on/off + TTL, system prompt, prompt template, and optional
   input/output schemas (reusing `SchemaEditor`) — and POSTs it to `/v1/tasks`. The detail
@@ -554,15 +661,16 @@ fetches `/pricing` once and feeds `setPricing`):
   test (schema-generated input form, version/model overrides, validity badge) →
   deploy (confirm)**, version history (the reusable `components/VersionHistory`
   — paginated "show N at a time", side-by-side compare vs the live prompt,
-  deploy, and **admin-only delete** of inactive versions). The
+  deploy, and delete of inactive versions). The
   edit→test→deploy loop runs entirely in the browser. **All write/deploy/delete
   actions are role-gated** (`auth/permissions.ts` mirrors the backend matrix —
-  UI gating only; the gateway enforces): non-creators see disabled editors + a
-  read-only banner, only approver/admin see Deploy, only admin sees Delete.
-- **Versions** (`VersionsPage`) — a dedicated, task-agnostic home for prompt
-  history: pick a task on the left, manage its versions on the right via the same
-  `VersionHistory` component the Studio task detail embeds (identical compare /
-  deploy / delete / pagination behaviour).
+  UI gating only; the gateway enforces): with the current two roles these are all
+  **admin-only**, so a `client` sees disabled editors + a read-only banner.
+- **Versions** (`VersionsPage`, *not currently in the top-nav*) — a dedicated, task-agnostic
+  home for prompt history: pick a task on the left, manage its versions on the right via the same
+  `VersionHistory` component the Studio task detail embeds (identical compare / deploy / delete /
+  pagination behaviour). The component is the live path (embedded in Tasks); the standalone page
+  is retained but unlinked.
 - **Compare** (`ComparePage` + `useChat`/`useSessions` + `Sidebar`/`ChatArea`/
   `ChatInput`/`SystemPromptBar`) — N-model side-by-side multi-turn chat, image attach,
   temperature/max-token controls, session history, per-response latency/tokens/cost
@@ -574,10 +682,6 @@ fetches `/pricing` once and feeds `setPricing`):
   framed as the manual precursor to the eval layer. This is the future Prompt Studio
   "sample test panel". **Its API contract (`/run`, `/sessions`) must not leak into
   `/v1/tasks/*`.**
-- **Estimate** (`EstimatePage`) — single + batch (blank-line/`---` separated) prompts ×
-  model multi-select × expected output tokens → per-model token/cost table + totals.
-  Client-side only: `countTokens` (cl100k_base, stated approximation) + `estimateCost`
-  fed by backend `/pricing` (fallback table in `utils/tokens.ts` for offline).
 - **Dashboard** (`DashboardPage`) — summary cards, **By task** table (runs/tokens/cost/
   latency/success), By model table (incl. avg ★), daily-spend CSS bars. No chart lib.
 - **History** (`AdminRunsPage`, admin-only) — cross-tenant prompt history: a filterable,
@@ -593,6 +697,9 @@ fetches `/pricing` once and feeds `setPricing`):
   one-click **Mark healthy** override (`POST /v1/admin/model-health/reset`); plus a filterable
   **event log** (failure / tripped / recovered / manual_reset) — click a status row to filter
   the log to that pair.
+- **Test** (`ClientPortalPage`, admin-only) — embeds the consumer client-portal experience inside
+  the Studio so an operator can exercise the real `POST /v1/tasks/{id}/predict` against a task
+  (the same surface external callers use; see §the client portal in the work doc).
 
 **Types:** `src/types/index.ts` mirrors the Go JSON contracts exactly (`TRunResponse`,
 `TDashboard{by_task,by_model,daily}`, `TUser`, `TPricing`, the admin
@@ -627,9 +734,13 @@ cd llm_platform_frontend && npm run dev             # :5173 (proxies to :8000)
 # Client portal
 cd llm_platform_client && npm run dev               # :5174 (proxies /v1 /health /pricing to :8000)
 
-# Mint a service token (e.g. for the client portal or CIS). -role defaults to caller
-# (read + predict); use admin|creator|approver|viewer for a different principal.
-cd llm_platform_go && go run ./cmd/issue-token -sub svc:cis -email cis@svc.local -role caller -ttl 8760h
+# Mint a service token (e.g. for the client portal or CIS). -role defaults to client
+# (read + predict); use admin for a Studio operator principal.
+cd llm_platform_go && go run ./cmd/issue-token -sub svc:cis -email cis@svc.local -role client -ttl 8760h
+
+# First-run / deploy helpers (see docs/DEPLOY.md)
+cd llm_platform_go && go run ./cmd/migrate                 # apply schema (sqlite|postgres per DB_DRIVER)
+cd llm_platform_go && go run ./cmd/bootstrap -issue-admin  # gen secret, validate, migrate, lock DB, mint admin
 
 # Verify
 go build ./... && go vet ./... && go test ./...     # backend
@@ -642,10 +753,10 @@ npm run build && npm run lint                       # frontend (3 pre-existing h
   `newTestServerWithClients` injects fake providers.
 - `auth_feedback_test.go` — demo store, token round-trip, login flow, feedback +
   dashboard aggregates, per-user isolation.
-- `rbac_test.go` — the full role × permission matrix (`TestRBACMatrix`) and that a
-  token with no role claim resolves to `caller` (`TestDefaultRoleForTokenWithoutClaim`).
-- `prompt_redaction_test.go` — callers without `task:view_prompt` get
-  `prompt_template`/`system_prompt` blanked on task + version reads.
+- `rbac_test.go` — the role × permission matrix (`TestRBACMatrix`) and that a
+  token with no role claim resolves to `admin` (`TestDefaultRoleForTokenWithoutClaim`).
+- `prompt_redaction_test.go` (`TestPromptVisibility`) — a `client` (no `task:view_prompt`) gets
+  `prompt_template`/`system_prompt` blanked on task + version reads; `admin` sees them.
 - `delete_version_test.go` — version delete is admin-only and 409s on the active version.
 - `schema_update_test.go` — PUT merge semantics for schemas, incl. `"input_schema": null`
   clearing one.
@@ -697,12 +808,19 @@ RBAC and admin 403 tests).
    Every run row must carry `task_id`.
 3. **The platform never owns caller business logic** — no "if confidence < X then
    route to QC" inside the platform.
-4. **Seams to preserve:** `users.Store` (identity), `llm.Provider` (model backends),
-   `internal/db` query functions (storage engine), `pricing.json` (rates).
+4. **Seams to preserve:** `users.Store` (identity — the SSO swap point), `llm.Provider` (model
+   backends), `internal/db` query functions + `dialect.go` (storage engine — now realized as a
+   sqlite|postgres switch; keep new SQL portable / route through the dialect helpers),
+   `pricing.json` (rates).
 5. **Playground ≠ product API** — Compare UI talks to `/run`/`/sessions`; services talk
    to `/v1/tasks/*`. Multi-turn chat semantics must not leak into the product API.
-6. **Migrations are idempotent boot-time upgrades** (guarded ALTERs). Demo-era data is
-   throwaway; schema migrates, data does not.
+6. **Migrations are idempotent** and **per-dialect** (`Migrate` dispatches on the driver; SQLite
+   guarded ALTERs, Postgres `… IF NOT EXISTS`). They auto-run on boot **in dev only**; prod
+   applies them out-of-band via `cmd/migrate`. Demo-era data is throwaway; schema migrates, data
+   does not.
+11. **Prod refuses to boot misconfigured.** `config.Validate()` (gated by `APP_ENV=prod`) is the
+    single place insecure defaults are rejected; never weaken it to "log and continue". New
+    secrets/origins/secure-cookie requirements belong there.
 7. **Observability writes never fail a response**; prediction responses distinguish
    "model failed" (502) from "output didn't validate" (200 + `output_valid:false`).
 8. **Frontend pricing/types always follow the backend** (`/pricing`, mirrored types).

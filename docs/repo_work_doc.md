@@ -6,6 +6,8 @@ The platform is a **task-keyed LLM prediction service** plus a **Studio** for au
 
 There are **three deployables**: the Go backend (single binary), the **Studio** frontend (`llm_platform_frontend`, :5173) for teams that *operate* the platform, and the **client portal** (`llm_platform_client`, :5174) for teams that *call* it (catalog + live Try-it predict against `/v1/tasks/*`, authenticated as a service token — see §11). The superseded Python prototype `llm_platform_v0` is out of scope.
 
+> **Deployment readiness (2026-06-19).** The backend now supports a **pluggable database** (SQLite *or* Postgres via `DB_DRIVER`), an `APP_ENV=prod` boot gate (`config.Validate()` rejects insecure defaults), an `AUTH_MODE` switch (demo login vs an SSO scaffold), `cmd/migrate` + `cmd/bootstrap`, graceful shutdown + HTTP timeouts, and a `/ready` probe. RBAC is **two roles** — `admin` and `client` (§4). The split-repo / cross-origin / first-run runbook is `llm_platform_go/docs/DEPLOY.md`.
+
 ---
 
 ## 1. System architecture
@@ -14,7 +16,7 @@ There are **three deployables**: the Go backend (single binary), the **Studio** 
 %%{init: {'flowchart': {'nodeSpacing': 70, 'rankSpacing': 110, 'curve': 'basis', 'useMaxWidth': true}}}%%
 flowchart LR
   subgraph Client["Frontends (React + Vite)"]
-    UI["Studio :5173<br/>Compare / Tasks / Versions / Estimate / Dashboard<br/>+ History / Health (admin)"]
+    UI["Studio :5173<br/>Compare / Tasks / Dashboard<br/>+ History / Health / Test (admin)"]
     CP["Client portal :5174<br/>Catalog / Try-it (svc token)"]
   end
 
@@ -30,12 +32,17 @@ flowchart LR
     HB["Health breaker (per task+model)<br/>incl. schema-invalid"]
   end
 
-  subgraph Providers["Providers"]
-    OAI["OpenAI"]; GRQ["Groq"]; GEM["Gemini"]; ANT["Anthropic"]; MSH["Meesho gateway"]
+  subgraph Backends["Provider backends — 2 HTTP clients"]
+    GRQ["Groq API (direct, Bearer)<br/>llama-groq"]
+    subgraph MSH["Meesho gateway (x-bf-vk)"]
+      OAI["OpenAI: gpt-4o · gpt-4o-mini"]
+      GEM["Gemini: 2.5-pro · 2.5-flash"]
+      ANT["Anthropic: claude-sonnet-4-6"]
+    end
   end
 
   subgraph State["State"]
-    DB[("SQLite (WAL)")]
+    DB[("Database<br/>SQLite (WAL) | Postgres")]
     CACHE[("Prediction cache<br/>Redis | memory | off")]
     STORE["Task config store<br/>(in-proc cache + editMu)"]
     HEALTH["Health tracker<br/>(in-proc, per task+model)"]
@@ -47,7 +54,9 @@ flowchart LR
   H <--> STORE
   H <-->|"admin: snapshot / reset"| HEALTH
   STORE <--> DB
-  EP --> FB --> REG --> Providers
+  EP --> FB --> REG
+  REG -->|"llama-groq"| GRQ
+  REG -->|"all other models"| MSH
   FB <-->|"allow / record"| HB
   HB <--> HEALTH
   HEALTH -->|"async events"| DB
@@ -56,9 +65,10 @@ flowchart LR
 ```
 
 **Process boundaries**
-- One Go server process. Task config lives in SQLite, fronted by an in-process config cache (5s TTL) coordinated by a read/write lock (`editMu`).
+- One Go server process. Task config lives in the database (SQLite or Postgres), fronted by an in-process config cache (5s TTL) coordinated by a read/write lock (`editMu`).
 - The prediction cache is a separate store: Redis in production, in-process memory for dev, or off.
-- All observability writes (run rows) go through an async writer so they never block the request hot path.
+- All observability writes — **run rows and the per-attempt gateway trace** (`gateway_attempts`, §9) — go through async writers so they never block the request hot path.
+- A per-task **rate limiter** (rolling window) and the per-task daily **budget gate** both sit in front of production predicts (§6).
 
 ---
 
@@ -66,8 +76,8 @@ flowchart LR
 
 **Backend (`llm_platform_go/`)**
 - Go, [chi](https://github.com/go-chi/chi) router + CORS middleware, request-id/logger/recoverer.
-- SQLite via `modernc.org/sqlite` (pure-Go, no cgo), WAL mode, single writer connection.
-- JWT sessions (HS256), httpOnly cookie.
+- **Pluggable DB** behind a dialect seam (`internal/db/dialect.go`): SQLite via `modernc.org/sqlite` (pure-Go, no cgo; WAL, single writer) **or** Postgres via `jackc/pgx/v5` (real pool). Selected by `DB_DRIVER`. Portable `?` placeholders are rewritten to `$n` for Postgres. (Postgres is implemented but pending live validation — see §9.)
+- JWT sessions (HS256), httpOnly cookie; or SSO via an OIDC scaffold (`AUTH_MODE=sso`, §4).
 - Providers: direct HTTP to OpenAI-compatible backends — one client for Groq's direct API and one for the Meesho gateway (which serves every non-Groq model). No native vendor SDKs.
 - Prediction cache: `redis/go-redis/v9` or in-process memory.
 - JSON Schema validation: `santhosh-tekuri/jsonschema/v6`. Prompt templating: Go `text/template`.
@@ -140,35 +150,37 @@ flowchart TD
 
 ## 4. Authentication & RBAC
 
-### Login flow
+### Auth modes
+`AUTH_MODE` selects how humans authenticate:
+- **`demo`** (default, dev) — the passwordless pick-a-user login below (`/auth/demo-users`, `/auth/login`).
+- **`sso`** — the demo routes are **not registered**; `/auth/sso/login` + `/auth/sso/callback` take their place (an OIDC scaffold in `auth_sso_handlers.go` that shares the cookie-minting tail with demo login; the IdP handshake is a documented `TODO` returning `501` until the `OIDC_*` env is wired). `config.Validate()` forbids `demo` in prod.
+
+### Login flow (demo mode)
 1. `POST /auth/login {user_id}` → looks up a user in the identity store (the demo store is an in-memory SSO stand-in).
 2. Issues an HS256 JWT with claims `sub, email, name, role, iss, iat, exp`.
-3. Sets an httpOnly cookie (`llm_platform_token` by default), `SameSite=Lax`, `Secure` configurable, `MaxAge = TOKEN_EXPIRY` (default 12h).
+3. Sets an httpOnly cookie (`llm_platform_token` by default), `SameSite=Lax`, `Secure` configurable, `MaxAge = TOKEN_EXPIRY` (default 12h). For the subdomain deploy topology set `COOKIE_DOMAIN=.example.com` + `COOKIE_SECURE=true`.
 4. `RequireAuth` middleware accepts the token via `Authorization: Bearer …` or the cookie, validates signature + expiry, and puts the `auth.User` on the request context. Role is embedded in the token, so the predict hot path needs no identity lookup.
 
-The demo store seeds one user per role:
+The demo store seeds a **single** user:
 
 | id | email | role |
 |---|---|---|
 | `u-admin` | admin@demo.local | admin |
-| `u-creator` | creator@demo.local | creator |
-| `u-approver` | approver@demo.local | approver |
-| `u-viewer` | viewer@demo.local | viewer |
 
-A token with no role claim defaults to **caller** (least privilege that still allows predict + read).
+A token with no role claim defaults to **admin** (`DefaultRole`, kept for backward compatibility; `issue-token` always stamps an explicit role).
 
 ### Roles × permissions
+
+Two roles are wired today: the human **operator** (`admin`) and the service **client**. The capability set is finer-grained (it anticipates future creator/approver splits), so `write`/`deploy`/`delete` are effectively admin-only.
 
 | Role | task:read | task:predict | task:write | task:deploy | task:delete | task:view_prompt |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
 | **admin** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **creator** | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
-| **approver** | ✓ | ✓ | ✗ | ✓ | ✗ | ✓ |
-| **caller** (default) | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
-| **viewer** | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| **client** | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 
-- `RequirePermission(perm)` runs after `RequireAuth` and returns `403` (`role 'X' is not permitted to task:Y`) when the role lacks the capability.
-- **Prompt redaction**: callers without `task:view_prompt` get `prompt_template` and `system_prompt` blanked in task/version responses — they see the contract (schemas, metadata), not the prompt internals.
+- `RequirePermission(perm)` runs after `RequireAuth` and returns `403` (`role 'X' is not permitted to task:Y`) when the role lacks the capability. The cross-tenant admin views use `RequireAdmin` (the `admin` *role*, not a capability).
+- **Prompt redaction**: a `client` (no `task:view_prompt`) gets `prompt_template` and `system_prompt` blanked in task/version responses — it sees the contract (schemas, metadata), not the prompt internals.
+- `cmd/issue-token -role` mints service tokens (default `client`); `KnownRole` validates the flag.
 
 ---
 
@@ -180,9 +192,11 @@ All errors are `{"detail": "<message>"}` with the HTTP status carrying the meani
 
 | Method · Path | Accepts | Returns |
 |---|---|---|
-| `GET /health` | — | `{status:"ok", models_available:[…]}` |
-| `GET /auth/demo-users` | — | `{users:[{id,email,name,role}]}` |
-| `POST /auth/login` | `{user_id}` | `{user:{…}}` + sets cookie · 401 unknown · 422 missing |
+| `GET /health` | — | liveness: `{status:"ok", models_available:[…]}` |
+| `GET /ready` | — | readiness: pings the DB → `{status:"ready"}` (200) or `{status:"not_ready",reason}` (503) |
+| `GET /auth/demo-users` *(demo mode only)* | — | `{users:[{id,email,name,role}]}` |
+| `POST /auth/login` *(demo mode only)* | `{user_id}` | `{user:{…}}` + sets cookie · 401 unknown · 422 missing |
+| `GET /auth/sso/login` · `GET /auth/sso/callback` *(sso mode only)* | — | IdP redirect / callback (OIDC scaffold; `501` until wired — §4) |
 | `POST /auth/logout` | — (auth) | `{status:"logged out"}` (clears cookie) |
 | `GET /auth/me` | — (auth) | `{user:{…}}` · 401 if not authed |
 | `GET /pricing` | — (auth) | `{pricing:{model:{input_cost_per_1k,output_cost_per_1k}}}` |
@@ -336,6 +350,14 @@ stateDiagram-v2
 - **Scope**: production predicts only. Live state is **in-process** and resets on restart; every transition (`failure` / `tripped` / `recovered` / `manual_reset`) is persisted to `model_health_events` via an async writer. Admins view state and force a reset via `/v1/admin/model-health*` (§5.5).
 - **Config**: `HEALTH_BREAKER_ENABLED` (default `true`) turns the whole thing off — every model is then tried every time.
 
+### Per-task rate limiter (`internal/ratelimit`)
+A per-task **rolling-window** limiter in front of production predicts, independent of the daily budget gate. Each task gets its own window (default 1m) with its own lock — tasks never serialize against each other. Three gates:
+- **Per-request input cap** (`RATE_MAX_INPUT_TOKENS`): estimate = chars/`RATE_CHARS_PER_TOKEN` + `RATE_TOKENS_PER_IMAGE` per image; over the cap → **413** (`input_too_large`), no `Retry-After`.
+- **Request-rate cap** (`RATE_MAX_REQUESTS`/window) → **429** with `Retry-After` = time to window refill.
+- **Token budget** (`RATE_MAX_TOKENS`/window) → **429** with `Retry-After`.
+
+It uses **reserve-then-reconcile**: `executePrediction` reserves the request's estimate up front, then reconciles to tokens actually consumed (input+output across every attempt, incl. failed/fallback ones). A request that ran always counts toward the request gate. A `0` for any `Max…` disables that gate; `RATE_LIMIT_ENABLED=false` disables the limiter. Test/shadow runs are not rate-limited.
+
 ### Retry & cost
 - **Retry**: up to 3 attempts per model, backing off 2s/4s/6s, only for retryable statuses (`429/500/503`). Context cancellation/timeout stops retries.
 - **Cost**: `CalculateCost(model, in, out)` uses `pricing.json` (`{model:{input_per_1m, output_per_1m}}`), rounded to 6 decimals; unknown models cost `0`. Loaded once at startup from `PRICING_PATH`.
@@ -359,7 +381,7 @@ Defaults: `temperature 0→0.2`, `max_tokens 0→1000`, `prompt_version 0→1`, 
 
 ### Task lifecycle & source of truth
 - **The DB is the single source of truth for tasks.** There is no file/YAML seeding layer — tasks are created, edited, and deleted at runtime through the Studio (`POST/PUT/DELETE /v1/tasks`) and persist in the `tasks` table.
-- **Authoring** (`POST /v1/tasks`, `task:write` → creator/admin): the Studio's *New task* form supplies every field that used to live in a config file (id, name, description, schemas, prompt, model + fallbacks, sampling, budget, cache). The backend validates the slug, schemas, template, and model, activates the task, and seeds prompt version 1.
+- **Authoring** (`POST /v1/tasks`, `task:write` → admin): the Studio's *New task* form supplies every field that used to live in a config file (id, name, description, schemas, prompt, model + fallbacks, sampling, budget, cache). The backend validates the slug, schemas, template, and model, activates the task, and seeds prompt version 1.
 - **Deletion** (`DELETE /v1/tasks/{id}`, `task:delete` → admin only): removes the task and its prompt-version history; run rows are kept for audit. The built-in `playground` task is protected (`409`).
 - **Startup seeding** is limited to `SeedPlayground`, which idempotently creates the built-in free-form playground task the Compare UI's `/run` attributes to. A fresh database therefore starts with only that task.
 
@@ -388,20 +410,23 @@ flowchart LR
 
 ---
 
-## 9. Data model (SQLite, WAL)
+## 9. Data model (SQLite or Postgres)
+
+The schema is identical across backends (selected by `DB_DRIVER`); `created_at` is stored as TEXT (`YYYY-MM-DD HH:MM:SS`) in both so scans/ordering match. SQLite migrates via guarded `ALTER`s; Postgres via `schema_postgres.go` (`… IF NOT EXISTS`).
 
 | Table | Purpose | Notable columns |
 |---|---|---|
 | `tasks` | task registry / config | id (PK), name, description, input_schema, output_schema, prompt_template, system_prompt, prompt_version, model, fallback_models (JSON), temperature, max_tokens, daily_budget_usd, active, cache_enabled, cache_ttl_seconds, created_at, updated_at |
 | `prompt_versions` | prompt history & drafts | id, task_id, version, prompt_template, system_prompt, note, created_by, created_at · unique (task_id, version) |
-| `runs` | every call (predict, /run, test, cache hits) | run_id, session_id, prompt, system_prompt, **image** (JSON array of data URLs/URLs, NULL for text-only), model, response, latency_ms, input/output/total_tokens, cost_usd, success, error, user_id, user_email, task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at |
+| `runs` | the served answer — one row per model call (predict, /run, test, cache hits) | run_id, session_id, prompt, system_prompt, **image** (JSON array of data URLs/URLs, NULL for text-only), model, response, latency_ms, input/output/total_tokens, cost_usd, success, error, user_id, user_email, task_id, prompt_version, provider, fallback_used, cache_hit, is_test, created_at |
+| `gateway_attempts` | the full fallback-walk trace — **one row per model the walk touched** | id, run_id, task_id, seq (0=primary), model, provider, outcome (success\|error\|schema_invalid\|skipped_unhealthy\|cache_hit), fallback_used, fallback_reason, response, error, http_status, infra_failure, retry_count, latency_ms, input/output/total_tokens, cost_usd, is_test, created_at · indexed run_id, task_id, model, outcome, created_at |
 | `feedback` | star ratings | run_id, model, user_id, rating · unique (run_id, model, user_id) |
 | `shadow_reports` | accuracy comparisons | id, task_id, created_by, items, match_rate, avg_latency_ms, p95_latency_ms, total_cost_usd, details (JSON), created_at |
 | `model_health_events` | per-(task, model) breaker history | id, task_id, model, provider, event (failure\|tripped\|recovered\|manual_reset), reason, consecutive_failures, cooldown_ms, state, created_at · indexed (task_id, model) + created_at |
 
-- **Single writer** (`SetMaxOpenConns(1)`) + `busy_timeout=5000` avoid "database is locked".
-- **`RunWriter`**: a 1024-entry buffered channel drained by one goroutine; handlers submit run rows without blocking. If the buffer is full, the row is dropped and counted (a prediction is never blocked by observability). `Close()` flushes on shutdown.
-- **`HealthEventWriter`**: the same buffered-channel + drain-goroutine pattern for `model_health_events`, wired as the health tracker's event sink so health-state transitions persist off the request hot path.
+- **SQLite**: single writer (`SetMaxOpenConns(1)`) + `busy_timeout=5000` avoid "database is locked". **Postgres**: a real pool (`MaxOpenConns=20`); implemented but **pending validation against a live instance** — confirm numeric→float dashboard scans and `shadow_reports.id` (uses `LastInsertId`, unsupported by pgx → switch to `RETURNING id` if needed). See `DEPLOY.md`.
+- **`RunWriter`** (`runs`) and **`GatewayAttemptWriter`** (`gateway_attempts`, larger 4096 buffer since one run emits several attempts) and **`HealthEventWriter`** (`model_health_events`) are all the same pattern: a buffered channel drained by one goroutine; handlers submit without blocking; a full buffer drops + counts the row (a prediction is never blocked by observability). All `Close()` are idempotent and flushed by graceful shutdown.
+- The full per-run trace is read by `ListGatewayAttempts(run_id)` and attached to the admin run-detail response (§5.5, `RunDetailResponse.Attempts`).
 - The `image` column is written/read via `imagesToColumn`/`ParseImagesColumn` (JSON array; legacy single-string rows still parse), so one or many images share one column.
 
 ---
@@ -410,9 +435,13 @@ flowchart LR
 
 | Var | Default | Controls |
 |---|---|---|
+| `APP_ENV` | `dev` | `prod` turns on `config.Validate()` (rejects insecure defaults) + disables inline migrations |
+| `AUTH_MODE` | `demo` | `demo` (passwordless login) or `sso` (IdP redirect/callback; demo login unregistered) |
 | `PORT` | `8000` | HTTP port |
-| `DB_PATH` | `./llm_platform.db` | SQLite file |
-| `PRICING_PATH` | `./pricing.json` | cost table |
+| `DB_DRIVER` | `sqlite` | `sqlite` (location = `DB_PATH`) or `postgres` (location = `DB_DSN`) |
+| `DB_PATH` | `./llm_platform.db` | SQLite file (used when `DB_DRIVER=sqlite`; absolute in prod) |
+| `DB_DSN` | — | Postgres connection string (used when `DB_DRIVER=postgres`) |
+| `PRICING_PATH` | `./pricing.json` | cost table (absolute in prod) |
 | `GROQ_API_KEY` / `GROQ_BASE_URL` | — / `api.groq.com/openai/v1` | Groq (direct API) |
 | `MEESHO_GATEWAY_VK` / `MEESHO_GATEWAY_BASE_URL` | — / internal gateway URL | Meesho gateway (`x-bf-vk`) — serves every non-Groq model (GPT-4o, Gemini, Claude). At least one of this or `GROQ_API_KEY` is required at boot. |
 | `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | — / — / `0` | Redis cache |
@@ -424,31 +453,35 @@ flowchart LR
 | `JWT_SECRET` | `dev-insecure-secret-change-me` | session signing key |
 | `AUTH_COOKIE_NAME` | `llm_platform_token` | cookie name |
 | `AUTH_ISSUER` | `llm-platform-demo` | JWT `iss` |
-| `COOKIE_DOMAIN` / `COOKIE_SECURE` | — / `false` | cookie scope/security |
+| `COOKIE_DOMAIN` / `COOKIE_SECURE` | — / `false` | cookie scope/security (`.example.com` + `true` for subdomain prod; Secure required in prod) |
 | `TOKEN_EXPIRY` | `12h` | session lifetime |
-| `ALLOWED_ORIGINS` | `http://localhost:5173` | CORS origins |
+| `ALLOWED_ORIGINS` | `http://localhost:5173` (dev fallback) | CORS origins, comma-separated; **required in prod** |
+| `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` / `OIDC_POST_LOGIN_URL` | — | SSO config (read when `AUTH_MODE=sso`) |
+| `RATE_LIMIT_ENABLED` | `true` | per-task rate limiter on/off (§6) |
+| `RATE_WINDOW` | `1m` | rolling window per task |
+| `RATE_MAX_REQUESTS` / `RATE_MAX_TOKENS` / `RATE_MAX_INPUT_TOKENS` | `600` / `200000` / `16000` | per-window request cap, per-window token cap, per-request input cap (0 = off) |
+| `RATE_CHARS_PER_TOKEN` / `RATE_TOKENS_PER_IMAGE` | `4` / `1000` | input-token estimation |
 
-At least one provider key is required at boot (a warning logs the missing ones; the server still starts — those models fail at call time).
+At least one provider key is required at boot (a warning logs the missing ones; the server still starts — those models fail at call time). The annotated template lives in `llm_platform_go/.env.example`.
 
 ---
 
 ## 11. Frontend
 
-Single-page app gated by `/auth/me` (spinner → login → app). Navigation lives in `AppShell`; pricing is fetched once on mount and feeds client-side cost estimates.
+Single-page app gated by `/auth/me` (spinner → login → app). Navigation lives in `AppShell`; pricing is fetched once on mount and feeds client-side cost estimates. In dev the API base is `''` (Vite proxy → `:8000`); a split-repo prod build sets `const BASE = (import.meta.env.VITE_BACKEND_URL ?? '').replace(/\/+$/,'')` (see `.env.example`).
 
 | Page | What a user does |
 |---|---|
 | **Compare** (playground) | Pick 2–N models, enter prompt/system prompt (+ images), tune temperature/max tokens, see side-by-side responses (one scrolling `ModelColumn` per model) with latency/tokens/cost, rate 1–5★, browse/load/delete sessions, open the **🏆 Leaderboard** modal (avg ★ per model for the session, via `GET /sessions/{id}/leaderboard`; disabled until a session exists) |
-| **Tasks (Studio)** | **Create a task** (creator/admin — a *New task* form covering id/name/description, model + fallback chain, sampling, budget, cache, prompt, and input/output schemas); browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model (client-measured round-trip latency); view/compare/deploy version history; **delete a task** (admin only) |
-| **Versions** | Dedicated version browser per task: paginated history, compare two versions, deploy (approver/admin), delete (admin) |
-| **Estimate** | Pre-flight token + cost calculator (single or batch) across all models, before spending anything |
+| **Tasks (Studio)** | **Create a task** (admin — a *New task* form covering id/name/description, model + fallback chain, sampling, budget, cache, prompt, and input/output schemas); browse tasks; view config + 30-day stats; edit system + prompt template; save drafts; edit input/output schemas (visual field editor or raw JSON); configure model routing; **test** against any version/model; view/compare/deploy version history (the embedded `VersionHistory` component); **delete a task** (admin) |
 | **Dashboard** | Totals (runs/tokens/spend), per-task and per-model breakdowns, daily spend trend, ratings, success rates |
-| **History** *(admin)* | Cross-tenant prompt history: filter/search every user's runs (task, model, user, status, prod-vs-test, prompt text), paginated; click a row for a detail drawer with the full prompt, image grid, and per-model responses. Lightweight list (server-truncated previews) so it stays fast on huge prompts/images |
+| **History** *(admin)* | Cross-tenant prompt history: filter/search every user's runs (task, model, user, status, prod-vs-test, prompt text), paginated; click a row for a detail drawer with the full prompt, image grid, per-model responses, and the **gateway-attempt trace** (every model the fallback walk touched). Lightweight list (server-truncated previews) so it stays fast on huge prompts/images |
 | **Health** *(admin)* | Per-(task, model) circuit-breaker console: live status table (auto-polls every 4s — state, cooldown remaining, failures, trips, last reason) with a **Mark healthy** override, plus a filterable event log (failure/tripped/recovered/manual_reset) |
+| **Test** *(admin)* | Embeds the consumer client-portal UI (`ClientPortalPage`) inside the Studio so an operator can run real `POST /v1/tasks/{id}/predict` calls against a task |
 
-The **History** and **Health** tabs render only when `user.role === 'admin'` (the backend `RequireAdmin` is the real gate; the nav check just hides them). **API client** (`src/api/client.ts`): one method per endpoint above — including the admin `adminRuns`/`adminRun`/`adminRunModels` and `modelHealth`/`modelHealthEvents`/`resetModelHealth` — all with `credentials:'include'`; an `ApiError` carries the HTTP status so a `401` can trigger re-auth.
+The **History**, **Health**, and **Test** tabs render only when `user.role === 'admin'` (the backend `RequireAdmin` is the real gate; the nav check just hides them). There is no longer an *Estimate* tab; `VersionsPage` exists but isn't wired into the top-nav (version management lives in the Tasks detail). **API client** (`src/api/client.ts`): one method per endpoint above — including the admin `adminRuns`/`adminRun`/`adminRunModels` and `modelHealth`/`modelHealthEvents`/`resetModelHealth` — all with `credentials:'include'`; an `ApiError` carries the HTTP status so a `401` can trigger re-auth.
 
-**Client RBAC** (`src/auth/permissions.ts`) mirrors the backend table and hides/disables controls by role — create task & save draft (`task:write` → creator/admin), deploy (`task:deploy` → approver/admin), delete task & prune versions (`task:delete` → admin only). The backend remains the source of truth and enforces every check. Callers without `view_prompt` never receive prompt text.
+**Client RBAC** (`src/auth/permissions.ts`) mirrors the backend and hides/disables controls by role; with the current two roles, create/save-draft/deploy/delete are all **admin-only**, so a `client` sees read-only editors. The backend remains the source of truth and enforces every check; a `client` without `view_prompt` never receives prompt text.
 
 **Notable components/utils**: `SchemaEditor` (dual visual/raw JSON Schema editor), `VersionHistory` (reused by Studio + Versions), `ChatArea`/`ModelColumn`/`MessageBubble` (Compare column layout + response + rating), `LeaderboardModal` (per-session model ranking), `useChat`/`useSessions` hooks, `tokens.ts` (tiktoken counting + cost), `schema.ts` (JSON Schema ↔ field list).
 
@@ -456,7 +489,7 @@ The **History** and **Health** tabs render only when `user.role === 'admin'` (th
 
 A **second, consumer-facing** React app for teams that *call* the platform (vs. the Studio above, which is for teams that *operate* it). It talks **only** to the product API — `/v1/tasks/*` — plus `/health` and `/pricing`, and never to the playground/Studio routes.
 
-- **No login.** Every request carries a long-lived **service JWT** in `Authorization: Bearer`, exactly like a machine caller (e.g. CIS). A working demo token for `svc:demo-client` (signed with the dev `JWT_SECRET`, expires 2036) is baked into `src/auth/token.ts`; `VITE_API_TOKEN` overrides it. The token is decoded client-side **for display only** (`decodePrincipal`) — the backend validates the signature on every request. With no role claim it resolves to the `caller` role (read + predict, prompt text redacted).
+- **No login.** Every request carries a long-lived **service JWT** in `Authorization: Bearer`, exactly like a machine caller (e.g. CIS). A working demo token for `svc:demo-client` (signed with the dev `JWT_SECRET`, expires 2036) is baked into `src/auth/token.ts`; `VITE_API_TOKEN` overrides it. The token is decoded client-side **for display only** (`decodePrincipal`) — the backend validates the signature on every request. The baked sample token carries **no role claim**, so it resolves to `DefaultRole` (**admin**) — fine for a local demo, but a real consumer token should be minted with `-role client` (read + predict; prompt text redacted) so it gets least privilege.
 - **Catalog** (`CatalogPage`) — every registered task as a callable API product; inactive tasks are listed but flagged (predict returns 409). The catalog auto-refreshes on window focus and every 30s (so a Studio deploy shows up).
 - **Task detail** (`TaskDetailPage`) — the I/O contract (input/output JSON Schemas), a live **Try it** panel that hits the real `POST /v1/tasks/{id}/predict` (coerces field inputs to the schema type; shows `output_valid`, fallback/degraded/cached badges, model/provider, usage, cost, `task_run_id`; surfaces a 429 budget error with the `Retry-After` window), a 30-day usage chart (all callers), and copy-paste **curl** integration snippets + a copy-token button. The result card shows **two latencies** — `{gateway_latency_ms}ms gateway / {latency_ms}ms model` plus the computed `(+Nms overhead)` (gateway − model). **Image fields** render a single unified picker (`ImagePicker`) for both string (`image`) and array (`images`) fields — a removable thumbnail grid where each tile has a corner ✕ and opens a click-to-zoom lightbox with its own Remove button; files are read into base64 data URLs and sent with the predict request.
 - **API client** (`src/api/client.ts`): `listTasks`, `getTask`, `predict` (returns `{result, degraded}` reading the `X-Platform-Degraded` header), `getRun`, `taskStats`, `pricing`. `ApiError` carries the status and parsed `Retry-After`. Built with plain Tailwind (no Merlin dependency); proxies `/v1`, `/health`, `/pricing` to `:8000`. Its `types.ts` is a subset mirror of the Go contracts — keep in sync with the Studio's `types/index.ts`.
@@ -475,7 +508,8 @@ A **second, consumer-facing** React app for teams that *call* the platform (vs. 
 - **Backend**: `cd llm_platform_go && go run ./cmd/server` (listens on `:8000`; needs ≥1 provider key in `.env`).
 - **Frontend (Studio)**: `cd llm_platform_frontend && npm run dev` (Vite on `:5173`, proxies API to `:8000`).
 - **Client portal**: `cd llm_platform_client && npm run dev` (Vite on `:5174`, proxies `/v1`, `/health`, `/pricing` to `:8000`).
-- **Service token** (for the portal or a machine caller): `cd llm_platform_go && go run ./cmd/issue-token -sub svc:my-team -email my-team@svc.local -role caller -ttl 8760h`.
+- **Service token** (for the portal or a machine caller): `cd llm_platform_go && go run ./cmd/issue-token -sub svc:my-team -email my-team@svc.local -role client -ttl 8760h` (default role is `client`).
+- **Migrate / first-run** (deploy): `go run ./cmd/migrate` applies the schema for the configured `DB_DRIVER`; `go run ./cmd/bootstrap -issue-admin` generates a `JWT_SECRET`, validates prod config, migrates, locks down a SQLite file, and mints a break-glass admin token. See `llm_platform_go/docs/DEPLOY.md`.
 - **Tests**: `cd llm_platform_go && go test ./...` (add `-race` for the concurrency paths).
 
 ---

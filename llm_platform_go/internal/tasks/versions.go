@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"llm_platform_go/internal/db"
 )
 
 // ErrVersionNotFound is returned when a prompt version doesn't exist.
@@ -28,17 +30,17 @@ type PromptVersion struct {
 func (s *Store) maxVersion(taskID string) (int, error) {
 	var v int
 	err := s.db.QueryRow(
-		`SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE task_id = ?`, taskID,
+		db.Rebind(`SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE task_id = ?`), taskID,
 	).Scan(&v)
 	return v, err
 }
 
 // appendVersion records a prompt_versions row.
 func (s *Store) appendVersion(taskID string, version int, tmpl, sys, note, by string) error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(db.Rebind(`
 		INSERT INTO prompt_versions
 			(task_id, version, prompt_template, system_prompt, note, created_by, created_at)
-		VALUES (?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?)`),
 		taskID, version, tmpl, sys, note, by, fmtTime(time.Now()),
 	)
 	return err
@@ -52,9 +54,9 @@ func (s *Store) ListVersions(taskID string) ([]PromptVersion, error) {
 		return nil, err
 	}
 
-	rows, err := s.db.Query(`
+	rows, err := s.db.Query(db.Rebind(`
 		SELECT task_id, version, prompt_template, system_prompt, note, created_by, created_at
-		FROM prompt_versions WHERE task_id = ? ORDER BY version DESC`, taskID)
+		FROM prompt_versions WHERE task_id = ? ORDER BY version DESC`), taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +93,7 @@ func (s *Store) DeleteVersion(taskID string, version int) error {
 		return ErrVersionActive
 	}
 	res, err := s.db.Exec(
-		`DELETE FROM prompt_versions WHERE task_id = ? AND version = ?`, taskID, version)
+		db.Rebind(`DELETE FROM prompt_versions WHERE task_id = ? AND version = ?`), taskID, version)
 	if err != nil {
 		return err
 	}
@@ -103,9 +105,9 @@ func (s *Store) DeleteVersion(taskID string, version int) error {
 
 // GetVersion returns one specific version.
 func (s *Store) GetVersion(taskID string, version int) (*PromptVersion, error) {
-	row := s.db.QueryRow(`
+	row := s.db.QueryRow(db.Rebind(`
 		SELECT task_id, version, prompt_template, system_prompt, note, created_by, created_at
-		FROM prompt_versions WHERE task_id = ? AND version = ?`, taskID, version)
+		FROM prompt_versions WHERE task_id = ? AND version = ?`), taskID, version)
 
 	var v PromptVersion
 	var createdAt string
@@ -159,9 +161,9 @@ func (s *Store) Deploy(taskID string, version int) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`
+	res, err := s.db.Exec(db.Rebind(`
 		UPDATE tasks SET prompt_template = ?, system_prompt = ?, prompt_version = ?, updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ?`),
 		v.PromptTemplate, v.SystemPrompt, v.Version, fmtTime(time.Now()), taskID)
 	if err != nil {
 		return err

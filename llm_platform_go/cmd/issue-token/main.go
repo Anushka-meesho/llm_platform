@@ -26,7 +26,7 @@ func main() {
 	sub := flag.String("sub", "", "principal subject, e.g. svc:cis (required)")
 	email := flag.String("email", "", "principal email, e.g. cis@svc.local (required)")
 	name := flag.String("name", "", "display name")
-	role := flag.String("role", auth.DefaultRole, "RBAC role: admin")
+	role := flag.String("role", auth.RoleClient, "RBAC role: admin or client")
 	ttl := flag.Duration("ttl", 8760*time.Hour, "token lifetime (default 1 year)")
 	issuer := flag.String("issuer", "", "JWT issuer (default: AUTH_ISSUER env or llm-platform-demo)")
 	flag.Parse()
@@ -36,7 +36,7 @@ func main() {
 		os.Exit(2)
 	}
 	if !auth.KnownRole(*role) {
-		log.Fatalf("unknown role %q (want: admin)", *role)
+		log.Fatalf("unknown role %q (want: admin or client)", *role)
 	}
 
 	_ = godotenv.Load() // pick up JWT_SECRET from .env when run from the repo

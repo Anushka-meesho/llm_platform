@@ -41,16 +41,25 @@ const (
 	PermTaskViewPrompt Permission = "task:view_prompt"
 )
 
-// Defined roles.
+// Defined roles. Two principals exist: the human operator (admin) who runs the
+// platform via the Studio, and the service caller (client) — a backend that only
+// invokes the product predict API and never touches prompts.
 const (
-	RoleAdmin = "admin" // superuser: every capability
+	RoleAdmin  = "admin"  // superuser: every capability (Studio operators)
+	RoleClient = "client" // service principal: invoke predict only; never sees prompts
 )
 
-// DefaultRole is assigned when a token carries no role claim.
+// DefaultRole is assigned when a token carries no role claim. It stays admin for
+// backward compatibility with existing tokens; issue-token always sets an
+// explicit role, so the default only applies to hand-crafted/legacy tokens.
 const DefaultRole = RoleAdmin
 
 var rolePermissions = map[string]map[Permission]bool{
 	RoleAdmin: {PermTaskRead: true, PermTaskPredict: true, PermTaskWrite: true, PermTaskDeploy: true, PermTaskDelete: true, PermTaskViewPrompt: true},
+	// Client: a backend service. Reads the task contract (config/schema/metadata)
+	// and invokes predict; deliberately NOT granted view_prompt, write, deploy,
+	// or delete — per the PFS, callers integrate against the contract, not prompts.
+	RoleClient: {PermTaskRead: true, PermTaskPredict: true},
 }
 
 // KnownRole reports whether role is a defined role. Used to validate the
