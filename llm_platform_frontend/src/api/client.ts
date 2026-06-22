@@ -18,7 +18,12 @@ import type {
   THealthEventsResponse,
 } from '../types';
 
-const BASE = '';
+// In dev, BASE is '' so calls are same-origin relative paths and Vite's proxy
+// (vite.config.ts) forwards them to the backend. In prod the frontend is served
+// from a different origin than the API, so VITE_BACKEND_URL (baked in at build
+// time, e.g. https://api.example.com) points calls at the backend. Trailing
+// slashes are trimmed so `${BASE}/v1/...` never doubles up.
+const BASE = (import.meta.env.VITE_BACKEND_URL ?? '').replace(/\/+$/, '');
 
 // ApiError carries everything needed to tell the user (and us) exactly what went
 // wrong: the HTTP status, the backend's machine-readable `code`, and the
@@ -262,6 +267,8 @@ export const api = {
     if (f.q) p.set('q', f.q);
     if (f.status) p.set('status', f.status);
     if (f.type) p.set('type', f.type);
+    // Pin paging to a point-in-time snapshot so new runs don't shift the pages.
+    if (f.anchorId && f.anchorId > 0) p.set('anchor_id', String(f.anchorId));
     return fetchJSON<TRunListResponse>(`${BASE}/v1/admin/runs?${p.toString()}`);
   },
 

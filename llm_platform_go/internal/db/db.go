@@ -4,30 +4,69 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver name: "pgx"
 	_ "modernc.org/sqlite"
 )
 
-func Open(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
+// Open connects to the configured database. driver is "sqlite" (location is a
+// file path) or "postgres" (location is a DSN/connection string). It also sets
+// the process-global activeDriver so the dialect helpers in dialect.go emit the
+// right SQL. Pooling is tuned per backend: SQLite is a single writer (WAL allows
+// concurrent readers); Postgres gets a real pool.
+func Open(driver, sqlitePath, postgresDSN string) (*sql.DB, error) {
+	switch driver {
+	case "", "sqlite":
+		activeDriver = SQLite
+		db, err := sql.Open("sqlite", sqlitePath)
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite: %w", err)
+		}
+		// Single writer — prevents "database is locked" under concurrent requests.
+		db.SetMaxOpenConns(1)
+		if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			return nil, fmt.Errorf("set WAL mode: %w", err)
+		}
+		if _, err = db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+			return nil, fmt.Errorf("set busy_timeout: %w", err)
+		}
+		if _, err = db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+			return nil, fmt.Errorf("set foreign_keys: %w", err)
+		}
+		return db, nil
 
-	// Single writer — prevents "database is locked" under concurrent requests.
-	db.SetMaxOpenConns(1)
+	case "postgres":
+		activeDriver = Postgres
+		db, err := sql.Open("pgx", postgresDSN)
+		if err != nil {
+			return nil, fmt.Errorf("open postgres: %w", err)
+		}
+		// A real pool: Postgres handles concurrent writers, unlike single-file SQLite.
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		if err = db.Ping(); err != nil {
+			return nil, fmt.Errorf("ping postgres: %w", err)
+		}
+		return db, nil
 
-	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return nil, fmt.Errorf("set WAL mode: %w", err)
+	default:
+		return nil, fmt.Errorf("unknown DB driver %q (want sqlite or postgres)", driver)
 	}
-	if _, err = db.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		return nil, fmt.Errorf("set busy_timeout: %w", err)
-	}
-
-	return db, nil
 }
 
+// Migrate brings the schema up to date for the active driver. SQLite upgrades
+// existing dev databases in place via guarded ALTERs; Postgres applies an
+// idempotent schema (CREATE/ALTER … IF NOT EXISTS).
 func Migrate(db *sql.DB) error {
+	if activeDriver == Postgres {
+		return migratePostgres(db)
+	}
+	return migrateSQLite(db)
+}
+
+func migrateSQLite(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS runs (
 			id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +113,9 @@ func Migrate(db *sql.DB) error {
 			temperature      REAL NOT NULL DEFAULT 0.2,
 			max_tokens       INTEGER NOT NULL DEFAULT 1000,
 			daily_budget_usd REAL NOT NULL DEFAULT 0,
+			max_prompt_chars INTEGER NOT NULL DEFAULT 0,
+			max_image_kb     INTEGER NOT NULL DEFAULT 0,
+			max_images       INTEGER NOT NULL DEFAULT 0,
 			active           INTEGER NOT NULL DEFAULT 1,
 			created_at       DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at       DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -176,6 +218,10 @@ func Migrate(db *sql.DB) error {
 		// Prediction cache: per-task opt-in + TTL (0 = backend default 24h).
 		"ALTER TABLE tasks ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE tasks ADD COLUMN cache_ttl_seconds INTEGER NOT NULL DEFAULT 0",
+		// Per-task input size limits (UI-configurable guardrails). 0 = no limit.
+		"ALTER TABLE tasks ADD COLUMN max_prompt_chars INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE tasks ADD COLUMN max_image_kb INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE tasks ADD COLUMN max_images INTEGER NOT NULL DEFAULT 0",
 		// Multimodal predictions: the image input (base64 data URL / image URL)
 		// submitted with the run, persisted for audit/replay. NULL for text-only runs.
 		"ALTER TABLE runs ADD COLUMN image TEXT",

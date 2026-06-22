@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"llm_platform_go/internal/db"
 )
 
 // ErrNotFound is returned when no task matches the id.
@@ -62,6 +64,7 @@ func (s *Store) invalidate(id string) {
 const taskColumns = `id, name, description, input_schema, output_schema,
 	prompt_template, system_prompt, prompt_version, model, fallback_models,
 	temperature, max_tokens, daily_budget_usd, cache_enabled, cache_ttl_seconds,
+	max_prompt_chars, max_image_kb, max_images,
 	active, created_at, updated_at`
 
 // Create inserts a new task. Fails if the id already exists.
@@ -81,15 +84,17 @@ func (s *Store) createLocked(t *Task) error {
 	t.CreatedAt, t.UpdatedAt = now, now
 	t.Active = true
 
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(db.Rebind(`
 		INSERT INTO tasks (`+taskColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		t.ID, t.Name, t.Description,
 		nullableJSON(t.InputSchema), nullableJSON(t.OutputSchema),
 		t.PromptTemplate, t.SystemPrompt, t.PromptVersion, t.Model,
 		marshalStrings(t.FallbackModels),
 		t.Temperature, t.MaxTokens, t.DailyBudgetUSD,
-		boolToInt(t.CacheEnabled), t.CacheTTLSeconds, boolToInt(t.Active),
+		boolToInt(t.CacheEnabled), t.CacheTTLSeconds,
+		t.MaxPromptChars, t.MaxImageKB, t.MaxImages,
+		boolToInt(t.Active),
 		fmtTime(t.CreatedAt), fmtTime(t.UpdatedAt),
 	)
 	if err != nil {
@@ -122,7 +127,7 @@ func (s *Store) getRaw(id string) (*Task, error) {
 	}
 	s.cacheMu.Unlock()
 
-	row := s.db.QueryRow(`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id)
+	row := s.db.QueryRow(db.Rebind(`SELECT `+taskColumns+` FROM tasks WHERE id = ?`), id)
 	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -193,20 +198,23 @@ func (s *Store) updateLocked(t *Task) error {
 	t.CreatedAt = existing.CreatedAt
 	t.UpdatedAt = time.Now().UTC()
 
-	_, err = s.db.Exec(`
+	_, err = s.db.Exec(db.Rebind(`
 		UPDATE tasks SET
 			name = ?, description = ?, input_schema = ?, output_schema = ?,
 			prompt_template = ?, system_prompt = ?, prompt_version = ?, model = ?,
 			fallback_models = ?, temperature = ?, max_tokens = ?,
 			daily_budget_usd = ?, cache_enabled = ?, cache_ttl_seconds = ?,
+			max_prompt_chars = ?, max_image_kb = ?, max_images = ?,
 			active = ?, updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ?`),
 		t.Name, t.Description,
 		nullableJSON(t.InputSchema), nullableJSON(t.OutputSchema),
 		t.PromptTemplate, t.SystemPrompt, t.PromptVersion, t.Model,
 		marshalStrings(t.FallbackModels),
 		t.Temperature, t.MaxTokens, t.DailyBudgetUSD,
-		boolToInt(t.CacheEnabled), t.CacheTTLSeconds, boolToInt(t.Active),
+		boolToInt(t.CacheEnabled), t.CacheTTLSeconds,
+		t.MaxPromptChars, t.MaxImageKB, t.MaxImages,
+		boolToInt(t.Active),
 		fmtTime(t.UpdatedAt), t.ID,
 	)
 	if err != nil {
@@ -238,10 +246,10 @@ func (s *Store) Delete(id string) error {
 	if _, err := s.getRaw(id); err != nil {
 		return err // ErrNotFound or a real DB error
 	}
-	if _, err := s.db.Exec(`DELETE FROM prompt_versions WHERE task_id = ?`, id); err != nil {
+	if _, err := s.db.Exec(db.Rebind(`DELETE FROM prompt_versions WHERE task_id = ?`), id); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM tasks WHERE id = ?`, id); err != nil {
+	if _, err := s.db.Exec(db.Rebind(`DELETE FROM tasks WHERE id = ?`), id); err != nil {
 		return err
 	}
 	s.invalidate(id)
@@ -263,7 +271,9 @@ func scanTask(r rowScanner) (*Task, error) {
 		&t.ID, &t.Name, &t.Description, &inSchema, &outSchema,
 		&t.PromptTemplate, &t.SystemPrompt, &t.PromptVersion, &t.Model, &fallbacks,
 		&t.Temperature, &t.MaxTokens, &t.DailyBudgetUSD,
-		&cacheEnabled, &t.CacheTTLSeconds, &active,
+		&cacheEnabled, &t.CacheTTLSeconds,
+		&t.MaxPromptChars, &t.MaxImageKB, &t.MaxImages,
+		&active,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {

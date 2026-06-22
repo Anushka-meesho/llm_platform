@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"llm_platform_go/internal/auth"
+	"llm_platform_go/internal/db"
 	"llm_platform_go/internal/tasks"
 )
 
@@ -136,7 +137,7 @@ func (h *Handler) ShadowCompare(w http.ResponseWriter, r *http.Request) {
 		"p50_latency_ms":      report.P50LatencyMs,
 		"mismatches":          report.Mismatches,
 	})
-	res, err := h.DB.Exec(`
+	res, err := db.Exec(h.DB, `
 		INSERT INTO shadow_reports
 			(task_id, created_by, items, match_rate, avg_latency_ms, p95_latency_ms,
 			 total_cost_usd, details, created_at)
@@ -148,6 +149,9 @@ func (h *Handler) ShadowCompare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, Internal(CodeInternal, "persist shadow report").WithCause(err))
 		return
 	}
+	// LastInsertId works on SQLite (modernc); the Postgres driver (pgx) does not
+	// support it, so on Postgres report.ID stays 0. Switch this insert to
+	// "INSERT … RETURNING id" + QueryRow if the shadow-report ID is needed on PG.
 	if id, err := res.LastInsertId(); err == nil {
 		report.ID = int(id)
 	}
@@ -255,7 +259,7 @@ func (h *Handler) ListShadowReports(w http.ResponseWriter, r *http.Request) {
 	}
 	query += " ORDER BY id DESC LIMIT 50"
 
-	rows, err := h.DB.Query(query, args...)
+	rows, err := db.Query(h.DB, query, args...)
 	if err != nil {
 		writeErr(w, r, Internal(CodeDBError, "list shadow reports").WithCause(err))
 		return

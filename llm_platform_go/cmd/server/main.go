@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"llm_platform_go/internal/api"
 	"llm_platform_go/internal/cache"
@@ -37,6 +41,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
+	// In prod this rejects every insecure default (dev JWT secret, missing
+	// ALLOWED_ORIGINS, non-secure cookie, relative paths, AUTH_MODE=demo) so a
+	// misconfigured server refuses to boot rather than running unsafely.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+	log.Printf("starting in %s mode (auth=%s, db=%s)", cfg.AppEnv, cfg.AuthMode, cfg.DBDriver)
 	if missing := cfg.MissingProviderKeys(); len(missing) > 0 {
 		log.Printf("warning: provider keys not set %v — those models will fail at call time", missing)
 	}
@@ -45,13 +56,19 @@ func main() {
 		log.Fatalf("pricing error: %v", err)
 	}
 
-	database, err := db.Open(cfg.DBPath)
+	database, err := db.Open(cfg.DBDriver, cfg.DBPath, cfg.DBDSN)
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	// Migrations auto-run in dev for a zero-friction local boot. In prod they are
+	// applied out-of-band via `cmd/migrate` (or cmd/bootstrap) before the new
+	// build serves traffic, so a rolling deploy never blocks on — or races — a
+	// schema change.
+	if cfg.IsProd() {
+		log.Printf("prod: skipping inline migrations (run `cmd/migrate` before deploy)")
+	} else if err := db.Migrate(database); err != nil {
 		log.Fatalf("migration error: %v", err)
 	}
 
@@ -72,11 +89,6 @@ func main() {
 	// (Postgres, internal SSO/IdP, …) to point the platform at production
 	// identity; nothing else changes. The demo store persists nothing.
 	userStore := users.NewDemoStore()
-
-	var allowedOrigins []string
-	if v := os.Getenv("ALLOWED_ORIGINS"); v != "" {
-		allowedOrigins = strings.Split(v, ",")
-	}
 
 	// Async observability writer — trace inserts off the request hot path.
 	runWriter := db.NewRunWriter(database, 0)
@@ -163,12 +175,52 @@ func main() {
 			Secure:      cfg.CookieSecure,
 			TokenExpiry: cfg.TokenExpiry,
 		},
-		AllowedOrigins: allowedOrigins,
+		AllowedOrigins: cfg.AllowedOrigins,
+		AuthMode:       cfg.AuthMode,
 	})
 
 	addr := ":" + cfg.Port
-	log.Printf("LLM Platform Go server listening on %s", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
+	server := &http.Server{
+		Addr:    addr,
+		Handler: router,
+		// Bound how long a single connection may hold resources, so slow or idle
+		// clients can't exhaust the server (Slowloris). WriteTimeout is generous
+		// because predictions can legitimately take many seconds.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections, let
+	// in-flight requests drain, then close the async writers so their buffered
+	// rows flush instead of being dropped on exit.
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("LLM Platform Go server listening on %s", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErr:
 		log.Fatalf("server error: %v", err)
+	case sig := <-stop:
+		log.Printf("received %s — shutting down gracefully", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown timed out: %v", err)
+		}
+		// Drain the async writers before the deferred database.Close() runs, so
+		// queued trace/run/health rows are persisted rather than lost.
+		runWriter.Close()
+		attemptWriter.Close()
+		healthWriter.Close()
+		log.Printf("shutdown complete")
 	}
 }

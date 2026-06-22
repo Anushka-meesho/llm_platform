@@ -312,6 +312,7 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
         <div className="flex flex-col gap-2">
           {fields.map((f) => {
             const filled = (values[f.name] ?? '') !== '';
+            const img = imageField(f);
             return (
               <div key={f.name} className="block">
                 <div className="flex items-center justify-between gap-2 mb-0.5">
@@ -336,10 +337,11 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
                     </button>
                   )}
                 </div>
-                {imageFieldMode(f) ? (
+                {img ? (
                   <ImagePicker
                     value={values[f.name] ?? ''}
-                    multi={imageFieldMode(f) === 'multi'}
+                    multi={img.multi}
+                    max={img.max}
                     onChange={(next) => setValues((prev) => ({ ...prev, [f.name]: next }))}
                   />
                 ) : (
@@ -490,32 +492,50 @@ function coerce(raw: string, schema: Record<string, unknown>): unknown {
   }
 }
 
-function imageFieldMode(f: Field): 'single' | 'multi' | null {
+// imageField decides whether to render a field as an image picker, and how. It
+// recognises the current contract — an array of format:"image" strings (any
+// name; maxItems is the cap) — and keeps legacy heuristics (the implicit
+// image/images names, or a description mentioning a photo/URL) for tasks
+// authored before image fields were typed. `multi` means the value is encoded
+// as a JSON array; `max` caps how many images (0 = no limit).
+function imageField(f: Field): { multi: boolean; max: number } | null {
+  const t = f.schema.type;
+  const items = f.schema.items as { type?: string; format?: string } | undefined;
+  const maxItems = typeof f.schema.maxItems === 'number' ? f.schema.maxItems : 0;
+
+  // Current contract: array of image-marked strings.
+  if (t === 'array' && items?.format === 'image' && (!items.type || items.type === 'string')) {
+    return { multi: true, max: maxItems };
+  }
+
+  // Legacy heuristics.
   const name = f.name.toLowerCase();
   const d = ((f.schema.description as string | undefined) ?? '').toLowerCase();
   const looksImage =
+    name === 'image' ||
     name === 'images' ||
     d.includes('data url') ||
     d.includes('image url') ||
     d.includes('product photo') ||
     d.includes('photo');
   if (!looksImage) return null;
-  if (f.schema.type === 'array') {
-    const items = f.schema.items as { type?: string } | undefined;
+  if (t === 'array') {
     const itemType = items?.type;
-    return !itemType || itemType === 'string' ? 'multi' : null;
+    return !itemType || itemType === 'string' ? { multi: true, max: maxItems } : null;
   }
-  if (f.schema.type && f.schema.type !== 'string') return null;
-  return 'single';
+  if (t && t !== 'string') return null;
+  return { multi: false, max: 1 }; // legacy single image as a bare string
 }
 
 const ImagePicker = ({
   value,
   multi,
+  max,
   onChange,
 }: {
   value: string;
   multi: boolean;
+  max: number; // cap on number of images (0 = no limit)
   onChange: (next: string) => void;
 }) => {
   const [zoom, setZoom] = useState<number | null>(null);
@@ -551,7 +571,9 @@ const ImagePicker = ({
       ),
     ).then((dataUrls) => {
       const picked = dataUrls.filter(Boolean);
-      commit(multi ? [...urls, ...picked] : picked.slice(0, 1));
+      let next = multi ? [...urls, ...picked] : picked.slice(0, 1);
+      if (max > 0) next = next.slice(0, max);
+      commit(next);
     });
     e.target.value = '';
   };
@@ -566,7 +588,7 @@ const ImagePicker = ({
       <input
         type="file"
         accept="image/*"
-        multiple={multi}
+        multiple={multi && max !== 1}
         onChange={onPick}
         className="text-sm text-primary-text file:mr-3 file:rounded-md file:border file:border-solid file:border-primary-border file:bg-secondary-bg file:text-primary-text file:px-3 file:py-1.5 file:cursor-pointer file:font-medium hover:file:bg-tertiary-bg"
       />

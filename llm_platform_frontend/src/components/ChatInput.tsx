@@ -12,6 +12,11 @@ type TChatInputProps = {
   conversations: Record<string, TUIMessage[]>;
   maxOutputTokens: number;
   setMaxOutputTokens: (n: number) => void;
+  // Per-task image upload limits (from the playground task config). 0/undefined
+  // = no limit. Enforced authoritatively by the backend; checked here too so an
+  // oversized or excess image is rejected before it's ever sent.
+  maxImageKB?: number;
+  maxImages?: number;
 };
 
 const ChatInput = ({
@@ -22,6 +27,8 @@ const ChatInput = ({
   conversations,
   maxOutputTokens,
   setMaxOutputTokens,
+  maxImageKB = 0,
+  maxImages = 0,
 }: TChatInputProps) => {
   // The unsent message draft persists so a half-typed prompt survives a reload.
   // Attached files are File objects (not serializable), so they stay in-memory.
@@ -29,19 +36,52 @@ const ChatInput = ({
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [showBudget, setShowBudget] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFiles = useCallback((selected: FileList | null) => {
-    if (!selected) return;
-    const arr = Array.from(selected);
-    setFiles((prev) => [...prev, ...arr]);
-    arr.forEach((f) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        setPreviews((prev) => [...prev, reader.result as string]);
-      reader.readAsDataURL(f);
-    });
-  }, []);
+  const handleFiles = useCallback(
+    (selected: FileList | null) => {
+      if (!selected) return;
+      let accepted = Array.from(selected);
+      const rejected: string[] = [];
+
+      // Drop images over the per-image size limit (f.size is bytes).
+      if (maxImageKB > 0) {
+        const limitBytes = maxImageKB * 1024;
+        accepted = accepted.filter((f) => {
+          if (f.size > limitBytes) {
+            rejected.push(`${f.name} (${Math.ceil(f.size / 1024)} KB)`);
+            return false;
+          }
+          return true;
+        });
+      }
+
+      // Cap the total number of attached images against what's already attached.
+      if (maxImages > 0) {
+        const room = Math.max(0, maxImages - files.length);
+        if (accepted.length > room) {
+          accepted = accepted.slice(0, room);
+          rejected.push(`max ${maxImages} image${maxImages === 1 ? '' : 's'}`);
+        }
+      }
+
+      // files and previews append the same list in the same order, so they stay
+      // in lockstep (removeFile drops the same index from both).
+      if (accepted.length > 0) {
+        setFiles((prev) => [...prev, ...accepted]);
+        accepted.forEach((f) => {
+          const reader = new FileReader();
+          reader.onload = () => setPreviews((prev) => [...prev, reader.result as string]);
+          reader.readAsDataURL(f);
+        });
+      }
+
+      const cap = maxImageKB > 0 ? ` (max ${maxImageKB} KB each)` : '';
+      setImageError(rejected.length > 0 ? `Skipped: ${rejected.join(', ')}${cap}.` : null);
+    },
+    [maxImageKB, maxImages, files.length],
+  );
 
   const removeFile = useCallback((index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -55,6 +95,7 @@ const ChatInput = ({
     setText('');
     setFiles([]);
     setPreviews([]);
+    setImageError(null);
     await onSubmit(t, f);
   }, [text, files, isLoading, onSubmit, setText]);
 
@@ -119,6 +160,10 @@ const ChatInput = ({
         </div>
       )}
 
+      {imageError && (
+        <div className="mb-2 text-xs text-error-text">{imageError}</div>
+      )}
+
       <div className="flex items-end gap-2 mb-2">
         <Button
           variant="ghost"
@@ -146,7 +191,10 @@ const ChatInput = ({
           multiple
           accept="image/*"
           className="hidden"
-          onChange={(e) => handleFiles(e.target.files)}
+          onChange={(e) => {
+            handleFiles(e.target.files);
+            e.target.value = ''; // allow re-selecting the same file after a reject
+          }}
         />
 
         <div className="flex-1">

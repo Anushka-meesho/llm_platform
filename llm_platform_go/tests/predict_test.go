@@ -5,11 +5,78 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"llm_platform_go/internal/llm"
 	"llm_platform_go/internal/tasks"
 )
+
+// TestPredictEnforcesInputLimits covers the per-task input size guardrails: the
+// text-length, image-count, and per-image-size ceilings each reject an oversized
+// predict with 413 before any model call, while a within-limits predict still
+// succeeds.
+func TestPredictEnforcesInputLimits(t *testing.T) {
+	fake := fakeModelServer(t, `{"label":"ok"}`)
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
+	srv, _ := newTestServerWithClients(t, clients)
+
+	taskJSON := `{
+		"id": "limited",
+		"name": "Limited",
+		"model": "gpt-4o-mini",
+		"prompt_template": "Describe {{.text}}",
+		"max_prompt_chars": 200,
+		"max_image_kb": 1,
+		"max_images": 1,
+		"input_schema": {"type":"object","required":["text"],"properties":{"text":{"type":"string"},"image":{"type":"string"},"images":{"type":"array","items":{"type":"string"}}}},
+		"output_schema": {"type":"object","required":["label"],"properties":{"label":{"type":"string"}}}
+	}`
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/tasks", taskJSON))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create task: err=%v status=%v", err, resp.StatusCode)
+	}
+
+	const smallImg = "data:image/png;base64,AAAAAAAA"          // ~6 bytes decoded
+	bigImg := "data:image/png;base64," + strings.Repeat("A", 2000) // ~1500 bytes decoded, over 1 KB
+
+	predict := func(inputs map[string]any) int {
+		body, _ := json.Marshal(map[string]any{"inputs": inputs})
+		r, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/tasks/limited/predict", string(body)))
+		if err != nil {
+			t.Fatalf("predict: %v", err)
+		}
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+
+	cases := []struct {
+		name   string
+		inputs map[string]any
+		want   int
+	}{
+		{"text too long", map[string]any{"text": strings.Repeat("x", 300)}, http.StatusRequestEntityTooLarge},
+		{"too many images", map[string]any{"text": "hi", "images": []string{smallImg, smallImg}}, http.StatusRequestEntityTooLarge},
+		{"image too large", map[string]any{"text": "hi", "image": bigImg}, http.StatusRequestEntityTooLarge},
+		{"within limits", map[string]any{"text": "hi", "image": smallImg}, http.StatusOK},
+	}
+	for _, c := range cases {
+		if got := predict(c.inputs); got != c.want {
+			t.Errorf("%s: got status %d, want %d", c.name, got, c.want)
+		}
+	}
+
+	// The Studio test panel enforces the same size ceilings as production.
+	testBody, _ := json.Marshal(map[string]any{"inputs": map[string]any{"text": strings.Repeat("x", 300)}})
+	tr, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/tasks/limited/test", string(testBody)))
+	if err != nil {
+		t.Fatalf("test predict: %v", err)
+	}
+	_ = tr.Body.Close()
+	if tr.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("test endpoint oversized text: got status %d, want 413", tr.StatusCode)
+	}
+}
 
 // fakeModelServer serves an OpenAI-compatible /chat/completions endpoint that
 // always returns `content` with fixed usage numbers.
@@ -234,6 +301,85 @@ func TestPredictForwardsAndStoresMultipleImages(t *testing.T) {
 	}
 	if len(storedImages) != 2 || storedImages[0] != imageA || storedImages[1] != imageB {
 		t.Errorf("run images not stored in order: got %v", storedImages)
+	}
+}
+
+// TestPredictForwardsCustomNamedImageField covers the typed-image contract: an
+// image field can have any name (here "photos") as long as its array items carry
+// format:"image". The gateway must still forward and persist the images, proving
+// images are recognised by schema shape, not by the literal name image/images.
+func TestPredictForwardsCustomNamedImageField(t *testing.T) {
+	const dataURL = "data:image/png;base64,ZZZZZZZZ"
+
+	var gotContent any
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Content any `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if len(body.Messages) > 0 {
+			gotContent = body.Messages[len(body.Messages)-1].Content
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": `{"label":"ok"}`}}},
+			"usage":   map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	t.Cleanup(fake.Close)
+
+	clients := &llm.Clients{Meesho: llm.NewOpenAICompatProvider(fake.URL, "test-key")}
+	srv, database := newTestServerWithClients(t, clients)
+
+	taskBody := `{
+		"id": "photo-task",
+		"name": "Photo Task",
+		"model": "gpt-4o-mini",
+		"prompt_template": "Describe {{if .photos}}the photos{{end}}",
+		"input_schema": {"type":"object","properties":{"photos":{"type":"array","items":{"type":"string","format":"image"},"maxItems":1}}},
+		"output_schema": {"type":"object","required":["label"],"properties":{"label":{"type":"string"}}}
+	}`
+	resp, err := http.DefaultClient.Do(authReq(t, http.MethodPost, srv.URL+"/v1/tasks", taskBody))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create task: err=%v status=%v", err, resp.StatusCode)
+	}
+
+	predictBody, _ := json.Marshal(map[string]any{"inputs": map[string]any{"photos": []string{dataURL}}})
+	resp, err = http.DefaultClient.Do(authReq(t, http.MethodPost,
+		srv.URL+"/v1/tasks/photo-task/predict", string(predictBody)))
+	if err != nil {
+		t.Fatalf("predict: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("predict status: got %d, want 200", resp.StatusCode)
+	}
+
+	parts, ok := gotContent.([]any)
+	if !ok {
+		t.Fatalf("provider got non-multimodal content %T: %v", gotContent, gotContent)
+	}
+	var sawImage bool
+	for _, p := range parts {
+		m, _ := p.(map[string]any)
+		if m["type"] == "image_url" {
+			if iu, _ := m["image_url"].(map[string]any); iu != nil && iu["url"] == dataURL {
+				sawImage = true
+			}
+		}
+	}
+	if !sawImage {
+		t.Errorf("custom-named image field not forwarded to provider: %v", parts)
+	}
+
+	var stored sql.NullString
+	if err := database.QueryRow(`SELECT image FROM runs WHERE task_id = 'photo-task'`).Scan(&stored); err != nil {
+		t.Fatalf("read run image: %v", err)
+	}
+	var storedImages []string
+	if !stored.Valid || json.Unmarshal([]byte(stored.String), &storedImages) != nil || len(storedImages) != 1 || storedImages[0] != dataURL {
+		t.Errorf("custom-named image not stored: valid=%v got=%q", stored.Valid, stored.String)
 	}
 }
 

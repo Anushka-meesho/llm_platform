@@ -44,17 +44,26 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	authUser := &auth.User{Subject: u.ID, Email: u.Email, Name: u.Name, Role: u.Role}
-	token, err := auth.IssueToken(authUser, h.Auth.Secret, h.Auth.Issuer, h.Auth.TokenExpiry)
-	if err != nil {
-		writeErr(w, r, Internal(CodeInternal, "issue token").WithCause(err))
+	if err := h.issueSession(w, r, &auth.User{Subject: u.ID, Email: u.Email, Name: u.Name, Role: u.Role}); err != nil {
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"user": u})
+}
 
+// issueSession mints a signed session token for the resolved principal and sets
+// it as the HttpOnly cookie. Shared by the demo Login and the SSO callback so
+// both deliver an identical session — only how identity is *established* differs
+// (passwordless pick-a-user in demo, IdP handshake in sso). On error it writes
+// the response envelope and returns the error so the caller can stop.
+func (h *Handler) issueSession(w http.ResponseWriter, r *http.Request, u *auth.User) error {
+	token, err := auth.IssueToken(u, h.Auth.Secret, h.Auth.Issuer, h.Auth.TokenExpiry)
+	if err != nil {
+		writeErr(w, r, Internal(CodeInternal, "issue token").WithCause(err))
+		return err
+	}
 	auth.SetAuthCookie(w, h.Auth.CookieName, token, h.Auth.Domain, h.Auth.Secure,
 		int(h.Auth.TokenExpiry.Seconds()))
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{"user": u})
+	return nil
 }
 
 // POST /auth/logout — clears the session cookie.

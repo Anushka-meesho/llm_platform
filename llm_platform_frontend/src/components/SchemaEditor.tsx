@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { Button, TextArea, Typography, cn } from '@meesho/merlin-ui-tailwind';
 import {
   FIELD_TYPES,
+  INPUT_FIELD_TYPES,
   emptyField,
   fieldNameIssues,
   fieldsToSchema,
@@ -29,13 +30,19 @@ const SchemaEditor = ({
   initial,
   onChange,
   readOnly = false,
+  allowImages = false,
 }: {
   initial: JsonSchema | undefined;
   onChange: (s: SchemaEditorState) => void;
   readOnly?: boolean;
+  // Offer the image pseudo-type (task input schemas only). Off for outputs.
+  allowImages?: boolean;
 }) => {
-  const initialFields = schemaToFields(initial);
+  const initialFields = schemaToFields(initial, { allowImages });
   const representable = initialFields !== null;
+
+  // Standard types, plus the image option only where images make sense.
+  const typeOptions = allowImages ? INPUT_FIELD_TYPES : FIELD_TYPES;
 
   const [mode, setMode] = useState<Mode>(representable ? 'fields' : 'json');
   const [fields, setFields] = useState<SchemaField[]>(initialFields ?? []);
@@ -83,7 +90,7 @@ const SchemaEditor = ({
     // JSON → Visual: only possible if the JSON maps cleanly onto fields.
     try {
       const parsed = JSON.parse(rawText) as JsonSchema;
-      const asFields = schemaToFields(parsed);
+      const asFields = schemaToFields(parsed, { allowImages });
       if (asFields === null) {
         setRawError('This schema uses advanced features — keep editing it as JSON.');
         return;
@@ -125,6 +132,7 @@ const SchemaEditor = ({
               key={i}
               field={f}
               readOnly={readOnly}
+              typeOptions={typeOptions}
               duplicate={duplicates.includes(f.name.trim()) && f.name.trim() !== ''}
               onChange={(patch) => updateField(i, patch)}
               onRemove={() => removeField(i)}
@@ -165,92 +173,118 @@ function duplicatesIn(fields: SchemaField[]): string[] {
 const FieldRow = ({
   field,
   readOnly,
+  typeOptions,
   duplicate,
   onChange,
   onRemove,
 }: {
   field: SchemaField;
   readOnly: boolean;
+  typeOptions: FieldType[];
   duplicate: boolean;
   onChange: (patch: Partial<SchemaField>) => void;
   onRemove: () => void;
-}) => (
-  <div className="border border-solid border-tertiary-border rounded-md p-2 flex flex-col gap-2">
-    <div className="flex items-center gap-2 flex-wrap">
-      <input
-        className={cn(selectCls, 'flex-1 min-w-[8rem]', duplicate && 'border-error-text')}
-        placeholder="field name"
-        value={field.name}
-        disabled={readOnly}
-        onChange={(e) => onChange({ name: e.target.value })}
-      />
-      <select
-        className={selectCls}
-        value={field.type}
-        disabled={readOnly}
-        onChange={(e) => onChange({ type: e.target.value as FieldType })}
-      >
-        {FIELD_TYPES.map((t) => (
-          <option key={t} value={t}>
-            {t}
-          </option>
-        ))}
-      </select>
-      {field.type === 'array' && (
+}) => {
+  const isImage = field.type === 'image';
+  return (
+    <div className="border border-solid border-tertiary-border rounded-md p-2 flex flex-col gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <input
+          className={cn(selectCls, 'flex-1 min-w-[8rem]', duplicate && 'border-error-text')}
+          placeholder="field name"
+          value={field.name}
+          disabled={readOnly}
+          onChange={(e) => onChange({ name: e.target.value })}
+        />
         <select
           className={selectCls}
-          value={field.itemType}
+          value={field.type}
           disabled={readOnly}
-          onChange={(e) => onChange({ itemType: e.target.value as FieldType })}
-          title="array element type"
+          onChange={(e) => onChange({ type: e.target.value as FieldType })}
         >
-          {FIELD_TYPES.filter((t) => t !== 'array').map((t) => (
+          {typeOptions.map((t) => (
             <option key={t} value={t}>
-              of {t}
+              {t}
             </option>
           ))}
         </select>
-      )}
-      <label className="flex items-center gap-1 text-sm text-secondary-text select-none">
-        <input
-          type="checkbox"
-          checked={field.required}
-          disabled={readOnly}
-          onChange={(e) => onChange({ required: e.target.checked })}
-        />
-        required
-      </label>
-      {!readOnly && (
-        <Button variant="ghost" size="s" onClick={onRemove} title="remove field">
-          ✕
-        </Button>
-      )}
-    </div>
-    <input
-      className={cn(selectCls, 'w-full')}
-      placeholder="description (optional)"
-      value={field.description}
-      disabled={readOnly}
-      onChange={(e) => onChange({ description: e.target.value })}
-    />
-    {field.type === 'string' && (
+        {field.type === 'array' && (
+          <select
+            className={selectCls}
+            value={field.itemType}
+            disabled={readOnly}
+            onChange={(e) => onChange({ itemType: e.target.value as FieldType })}
+            title="array element type"
+          >
+            {FIELD_TYPES.filter((t) => t !== 'array').map((t) => (
+              <option key={t} value={t}>
+                of {t}
+              </option>
+            ))}
+          </select>
+        )}
+        {isImage && (
+          // Max images this field accepts. 1 = a single image (the `image`
+          // string); ≥2 caps the `images` array (maxItems); blank/0 = no limit.
+          <label className="flex items-center gap-1 text-sm text-secondary-text select-none" title="Maximum number of images (1 = single image; blank/0 = no limit)">
+            max
+            <input
+              className={cn(selectCls, 'w-16')}
+              type="number"
+              min={0}
+              step={1}
+              value={field.maxImages || ''}
+              placeholder="∞"
+              disabled={readOnly}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                onChange({ maxImages: Number.isNaN(n) || n < 0 ? 0 : n });
+              }}
+            />
+            images
+          </label>
+        )}
+        <label className="flex items-center gap-1 text-sm text-secondary-text select-none">
+          <input
+            type="checkbox"
+            checked={field.required}
+            disabled={readOnly}
+            onChange={(e) => onChange({ required: e.target.checked })}
+          />
+          required
+        </label>
+        {!readOnly && (
+          <Button variant="ghost" size="s" onClick={onRemove} title="remove field">
+            ✕
+          </Button>
+        )}
+      </div>
       <input
         className={cn(selectCls, 'w-full')}
-        placeholder="allowed values, comma-separated (optional enum)"
-        value={field.enumValues.join(', ')}
+        placeholder="description (optional)"
+        value={field.description}
         disabled={readOnly}
-        onChange={(e) =>
-          onChange({
-            enumValues: e.target.value
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean),
-          })
-        }
+        onChange={(e) => onChange({ description: e.target.value })}
       />
-    )}
-  </div>
-);
+      {field.type === 'string' && (
+        <input
+          className={cn(selectCls, 'w-full')}
+          placeholder="allowed values, comma-separated (optional enum)"
+          value={field.enumValues.join(', ')}
+          disabled={readOnly}
+          onChange={(e) =>
+            onChange({
+              enumValues: e.target.value
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            })
+          }
+        />
+      )}
+    </div>
+  );
+};
 
 const ModeTab = ({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) => (
   <button

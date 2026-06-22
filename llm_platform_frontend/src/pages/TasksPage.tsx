@@ -320,6 +320,12 @@ const TaskDetail = ({
       {/* Sampling (max output tokens) */}
       <SamplingSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
+      {/* Daily spend cap */}
+      <BudgetSection task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
+
+      {/* Input size limits (text + image) */}
+      <LimitsSection key={`limits-${task.id}`} task={task} onSaved={onChanged} setFlash={setFlash} canWrite={canWrite} />
+
       {/* Input / output schema */}
       <SchemaSection key={task.id} task={task} onChanged={onChanged} setFlash={setFlash} canWrite={canWrite} />
 
@@ -775,12 +781,12 @@ const CreateTaskForm = ({
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <SchemaPane
             title="Input schema"
-            hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Off = free-form."
+            hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Add an Image field for vision inputs and cap how many. Off = free-form."
             enabled={inputEnabled}
             onToggle={setInputEnabled}
             canWrite={true}
           >
-            <SchemaEditor initial={input.schema} readOnly={false} onChange={setInput} />
+            <SchemaEditor initial={input.schema} readOnly={false} allowImages onChange={setInput} />
           </SchemaPane>
           <SchemaPane
             title="Output schema"
@@ -880,7 +886,7 @@ const SchemaSection = ({
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <SchemaPane
           title="Input schema"
-          hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Off = free-form."
+          hint="Validates request inputs (422 on mismatch) and auto-populates prompt variables. Add an Image field for vision inputs and cap how many. Off = free-form."
           enabled={inputEnabled}
           onToggle={setInputEnabled}
           canWrite={canWrite}
@@ -888,6 +894,7 @@ const SchemaSection = ({
           <SchemaEditor
             initial={input.schema}
             readOnly={!canWrite}
+            allowImages
             onChange={setInput}
           />
         </SchemaPane>
@@ -1273,6 +1280,242 @@ const SamplingSection = ({
           {dirty && valid && (
             <Typography variant="body" size="1" className="text-tertiary-text">
               Unsaved — caps each model's response length on the next predict.
+            </Typography>
+          )}
+        </div>
+      ) : (
+        <Typography variant="body" size="1" className="text-tertiary-text mt-2">
+          Your role cannot edit task config.
+        </Typography>
+      )}
+    </Section>
+  );
+};
+
+// BudgetSection edits the task's daily spend cap on an existing task. Saves via
+// PUT merge semantics — only daily_budget_usd changes. The budget gate enforces
+// it per UTC day (429 + Retry-After when today's spend reaches the cap); 0 (or a
+// blank field) means no cap. Admin-only, like every other config edit.
+const BudgetSection = ({
+  task,
+  onSaved,
+  setFlash,
+  canWrite,
+}: {
+  task: TTask;
+  onSaved: () => Promise<void>;
+  setFlash: (msg: string) => void;
+  canWrite: boolean;
+}) => {
+  const current = task.daily_budget_usd ?? 0;
+  // Show 0 as blank so "no cap" reads cleanly; a blank field saves as 0.
+  const [budget, setBudget] = useState(current ? String(current) : '');
+  const [saving, setSaving] = useState(false);
+
+  const trimmed = budget.trim();
+  const budgetNum = trimmed === '' ? 0 : Number(trimmed);
+  const valid = Number.isFinite(budgetNum) && budgetNum >= 0;
+  const dirty = budgetNum !== current;
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateTask(task.id, { daily_budget_usd: budgetNum });
+      setFlash(
+        budgetNum > 0
+          ? `Daily budget set to $${budgetNum}/day — enforced from the next predict (resets at UTC midnight).`
+          : 'Daily budget cleared — this task now has no spend cap.',
+      );
+      await onSaved();
+    } catch (e) {
+      setFlash(e instanceof Error ? e.message : 'Daily budget change failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Daily budget">
+      <label className="block max-w-xs">
+        <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+          Daily budget USD (blank or 0 = no cap)
+        </Typography>
+        <input
+          className={INPUT_CLS}
+          type="number"
+          min={0}
+          step="any"
+          value={budget}
+          disabled={!canWrite}
+          placeholder="no cap"
+          onChange={(e) => setBudget(e.target.value)}
+        />
+        {trimmed !== '' && !valid && (
+          <Typography variant="body" size="1" className="text-error-text mt-0.5">
+            Must be a number ≥ 0.
+          </Typography>
+        )}
+      </label>
+      {canWrite ? (
+        <div className="flex items-center gap-3 mt-3">
+          <Button variant="primary" size="s" disabled={!dirty || !valid || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+          {dirty && (
+            <Button
+              variant="ghost"
+              size="s"
+              disabled={saving}
+              onClick={() => setBudget(current ? String(current) : '')}
+            >
+              Reset
+            </Button>
+          )}
+          {dirty && valid && (
+            <Typography variant="body" size="1" className="text-tertiary-text">
+              Unsaved — the spend cap applies on the next predict.
+            </Typography>
+          )}
+        </div>
+      ) : (
+        <Typography variant="body" size="1" className="text-tertiary-text mt-2">
+          Your role cannot edit task config.
+        </Typography>
+      )}
+    </Section>
+  );
+};
+
+// LimitsSection edits a task's input size guardrails: max characters of the text
+// sent to the model, max size of each uploaded image (KB), and max number of
+// images per prediction. Text and image limits are independent. Saved together
+// via PUT merge semantics; a blank field or 0 means "no limit" for that field.
+// The backend enforces these on every predict (413 when exceeded), and the
+// playground pre-checks image uploads against them. Admin-only, like all config.
+const LimitsSection = ({
+  task,
+  onSaved,
+  setFlash,
+  canWrite,
+}: {
+  task: TTask;
+  onSaved: () => Promise<void>;
+  setFlash: (msg: string) => void;
+  canWrite: boolean;
+}) => {
+  const curChars = task.max_prompt_chars ?? 0;
+  const curImageKB = task.max_image_kb ?? 0;
+  const curImages = task.max_images ?? 0;
+
+  // Show 0 as blank so "no limit" reads cleanly; a blank field saves as 0.
+  const [chars, setChars] = useState(curChars ? String(curChars) : '');
+  const [imageKB, setImageKB] = useState(curImageKB ? String(curImageKB) : '');
+  const [images, setImages] = useState(curImages ? String(curImages) : '');
+  const [saving, setSaving] = useState(false);
+
+  // Each field: blank → 0 (no limit); otherwise a non-negative whole number.
+  const parse = (s: string) => (s.trim() === '' ? 0 : Number(s));
+  const charsNum = parse(chars);
+  const imageKBNum = parse(imageKB);
+  const imagesNum = parse(images);
+  const okInt = (n: number) => Number.isInteger(n) && n >= 0;
+  const valid = okInt(charsNum) && okInt(imageKBNum) && okInt(imagesNum);
+  const dirty = charsNum !== curChars || imageKBNum !== curImageKB || imagesNum !== curImages;
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateTask(task.id, {
+        max_prompt_chars: charsNum,
+        max_image_kb: imageKBNum,
+        max_images: imagesNum,
+      });
+      setFlash('Input limits saved — enforced from the next predict.');
+      await onSaved();
+    } catch (e) {
+      setFlash(e instanceof Error ? e.message : 'Input limit change failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = () => {
+    setChars(curChars ? String(curChars) : '');
+    setImageKB(curImageKB ? String(curImageKB) : '');
+    setImages(curImages ? String(curImages) : '');
+  };
+
+  return (
+    <Section title="Input limits">
+      <Typography variant="body" size="1" className="text-tertiary-text mb-3">
+        Hard ceilings on what one prediction may send. Blank or 0 = no limit. Text
+        and image limits are set independently.
+      </Typography>
+      <div className="flex flex-wrap gap-4">
+        <label className="block w-44">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Max text length (characters)
+          </Typography>
+          <input
+            className={INPUT_CLS}
+            type="number"
+            min={0}
+            step={1}
+            value={chars}
+            disabled={!canWrite}
+            placeholder="no limit"
+            onChange={(e) => setChars(e.target.value)}
+          />
+        </label>
+        <label className="block w-44">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Max image size (KB each)
+          </Typography>
+          <input
+            className={INPUT_CLS}
+            type="number"
+            min={0}
+            step={1}
+            value={imageKB}
+            disabled={!canWrite}
+            placeholder="no limit"
+            onChange={(e) => setImageKB(e.target.value)}
+          />
+        </label>
+        <label className="block w-44">
+          <Typography variant="body" size="1" className="text-tertiary-text mb-1">
+            Max number of images
+          </Typography>
+          <input
+            className={INPUT_CLS}
+            type="number"
+            min={0}
+            step={1}
+            value={images}
+            disabled={!canWrite}
+            placeholder="no limit"
+            onChange={(e) => setImages(e.target.value)}
+          />
+        </label>
+      </div>
+      {!valid && (
+        <Typography variant="body" size="1" className="text-error-text mt-1">
+          Each limit must be a whole number ≥ 0 (blank = no limit).
+        </Typography>
+      )}
+      {canWrite ? (
+        <div className="flex items-center gap-3 mt-3">
+          <Button variant="primary" size="s" disabled={!dirty || !valid || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+          {dirty && (
+            <Button variant="ghost" size="s" disabled={saving} onClick={reset}>
+              Reset
+            </Button>
+          )}
+          {dirty && valid && (
+            <Typography variant="body" size="1" className="text-tertiary-text">
+              Unsaved — the limits apply on the next predict.
             </Typography>
           )}
         </div>

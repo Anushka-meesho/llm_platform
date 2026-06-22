@@ -197,6 +197,10 @@ export type TRunListResponse = {
   page_size: number;
   total_runs: number;
   total_pages: number;
+  // Point-in-time snapshot the list was sliced against. The client echoes it
+  // back on page changes so paging stays stable as new runs arrive; a fresh
+  // value is issued only when no anchor is sent (initial load / refresh).
+  anchor_id: number;
   runs: TRunListItem[];
 };
 
@@ -279,6 +283,10 @@ export type TRunFilters = {
   q?: string;
   status?: '' | 'success' | 'error';
   type?: '' | 'production' | 'test';
+  // Point-in-time snapshot anchor. When set, the list is sliced against this
+  // fixed run id so paging doesn't shift; omitted/0 asks the server for a fresh
+  // snapshot at the newest run.
+  anchorId?: number;
 };
 
 // ── Admin: model health (per-(task, model) circuit breaker) ───────────────────
@@ -392,6 +400,10 @@ export type TTask = {
   daily_budget_usd?: number;
   cache_enabled: boolean;
   cache_ttl_seconds?: number;
+  // Per-task input size limits (UI-configurable guardrails). 0 = no limit.
+  max_prompt_chars?: number; // max characters of the text sent to the model
+  max_image_kb?: number; // max size of each uploaded image, in KB
+  max_images?: number; // max number of images per prediction
   active: boolean;
   created_at: string;
   updated_at: string;

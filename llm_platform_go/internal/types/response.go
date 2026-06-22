@@ -141,7 +141,12 @@ type RunListResponse struct {
 	PageSize   int           `json:"page_size"`
 	TotalRuns  int           `json:"total_runs"`
 	TotalPages int           `json:"total_pages"`
-	Runs       []RunListItem `json:"runs"`
+	// AnchorID is the point-in-time snapshot the list was sliced against
+	// (the newest run id at the moment the snapshot was taken). The client
+	// echoes it back on subsequent page requests so paging stays stable as
+	// new runs arrive; a fresh value is issued only when no anchor is sent.
+	AnchorID int           `json:"anchor_id"`
+	Runs     []RunListItem `json:"runs"`
 }
 
 // RunDetailResult is one model's outcome within a run (a playground /run stores

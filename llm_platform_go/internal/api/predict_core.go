@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
 
@@ -46,6 +49,11 @@ type predictOptions struct {
 	overrideModel   string               // test a specific model instead of the task's chain
 	useCache        bool                 // production predicts only — test/shadow always run fresh
 	enforceLimits   bool                 // apply the per-task request/token rate limiter (production predicts)
+	// enforceSizeLimits applies the per-task input size guardrails (text length,
+	// image size/count). Separate from enforceLimits so the Studio test panel
+	// enforces the same size ceilings as production without also burning the
+	// task's request/token rate-limit windows on author iteration.
+	enforceSizeLimits bool
 }
 
 // predictOutcome is everything a prediction produced, shared by the Predict,
@@ -82,6 +90,66 @@ func limiterError(d ratelimit.Decision) *AppError {
 	default:
 		return TooMany(CodeRateLimited, "%s", d.Message)
 	}
+}
+
+// enforceInputLimits applies a task's per-task input size guardrails (set in the
+// task UI; 0 = no limit), independent of the global rate limiter. text is the
+// full text sent to the model (system + user prompt). Every breach is a
+// deterministic 413: retrying won't help, the input has to shrink. Remote image
+// URLs are skipped — their size isn't known without fetching them.
+func enforceInputLimits(task *tasks.Task, text string, images []string) *AppError {
+	if task.MaxPromptChars > 0 {
+		if n := utf8.RuneCountInString(text); n > task.MaxPromptChars {
+			return PayloadTooLarge(CodeInputTooLarge,
+				"text is %d characters, over this task's limit of %d", n, task.MaxPromptChars)
+		}
+	}
+	if task.MaxImages > 0 && len(images) > task.MaxImages {
+		return PayloadTooLarge(CodeInputTooLarge,
+			"%d images submitted, over this task's limit of %d", len(images), task.MaxImages)
+	}
+	if task.MaxImageKB > 0 {
+		limit := task.MaxImageKB * 1024
+		for i, img := range images {
+			if n, ok := imageByteSize(img); ok && n > limit {
+				return PayloadTooLarge(CodeInputTooLarge,
+					"image %d is ~%d KB, over this task's per-image limit of %d KB",
+					i+1, (n+1023)/1024, task.MaxImageKB)
+			}
+		}
+	}
+	return nil
+}
+
+// imageByteSize returns the decoded size in bytes of an inline data-URL image
+// and whether it was measurable. The base64 payload size is derived from its
+// length (4 encoded chars → 3 bytes, less padding) without allocating to decode
+// it. Non-data URLs (e.g. https links) return ok=false: their size is unknown
+// without a fetch, so size limits don't apply to them.
+func imageByteSize(s string) (int, bool) {
+	if !strings.HasPrefix(s, "data:") {
+		return 0, false
+	}
+	comma := strings.IndexByte(s, ',')
+	if comma < 0 {
+		return 0, false
+	}
+	meta, payload := s[:comma], s[comma+1:]
+	if !strings.Contains(meta, ";base64") {
+		// Non-base64 data URL: the payload is the (percent-encoded) bytes as-is.
+		return len(payload), true
+	}
+	n := len(payload) / 4 * 3
+	switch {
+	case strings.HasSuffix(payload, "=="):
+		n -= 2
+	case strings.HasSuffix(payload, "="):
+		n--
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n, true
 }
 
 // retryAfterSeconds rounds a sub-second window remainder up to at least 1, so a
@@ -191,7 +259,16 @@ func (h *Handler) executePrediction(ctx context.Context, task *tasks.Task, input
 	// image_url blocks for vision models. They must also key the cache (same text
 	// + different photos is a different prediction). Both a single "image" string
 	// and an "images" array are accepted, in submission order.
-	images := collectImages(inputMap)
+	images := collectImages(inputMap, task.InputSchema)
+
+	// Per-task input size limits. Enforced on production predicts and Studio test
+	// runs alike (opts.enforceSizeLimits); text and image ceilings are configured
+	// independently per task.
+	if opts.enforceSizeLimits {
+		if herr := enforceInputLimits(task, renderTask.SystemPrompt+"\n"+prompt, images); herr != nil {
+			return nil, herr
+		}
+	}
 
 	messages := []llm.ChatMessage{}
 	if renderTask.SystemPrompt != "" {
@@ -509,24 +586,72 @@ func (h *Handler) recordAttempts(runID string, taskID *string, attempts []llm.At
 	}
 }
 
-// collectImages gathers the multimodal inputs from a request, in submission
-// order: a single "image" string (legacy single-image contract) first, then any
-// entries of an "images" array. Blank entries are dropped. Both keys are
-// accepted so existing single-image callers keep working alongside multi-image
-// ones, and a non-string entry is simply ignored rather than failing the call.
-func collectImages(inputMap map[string]any) []string {
-	var out []string
-	if s, ok := inputMap["image"].(string); ok && s != "" {
-		out = append(out, s)
+// collectImages gathers the multimodal inputs from a request. Image inputs are
+// the values of properties the task's input schema types as images (a string or
+// an array-of-strings carrying format:"image"), under whatever name the author
+// chose. The implicit "image"/"images" names are always honoured too, so tasks
+// authored before image fields were typed — and untyped callers — keep working.
+// A property may hold a single string or an array; blank/non-string entries are
+// dropped rather than failing the call.
+func collectImages(inputMap map[string]any, inputSchema json.RawMessage) []string {
+	names := imageSchemaFieldNames(inputSchema)
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		seen[n] = true
 	}
-	if arr, ok := inputMap["images"].([]any); ok {
-		for _, v := range arr {
-			if s, ok := v.(string); ok && s != "" {
-				out = append(out, s)
+	for _, legacy := range []string{"image", "images"} {
+		if !seen[legacy] {
+			names = append(names, legacy)
+			seen[legacy] = true
+		}
+	}
+
+	var out []string
+	for _, name := range names {
+		switch v := inputMap[name].(type) {
+		case string:
+			if v != "" {
+				out = append(out, v)
+			}
+		case []any:
+			for _, e := range v {
+				if s, ok := e.(string); ok && s != "" {
+					out = append(out, s)
+				}
 			}
 		}
 	}
 	return out
+}
+
+// imageSchemaFieldNames returns the names of input-schema properties typed as
+// images: a string with format:"image", or an array whose items carry it. Names
+// are sorted for deterministic ordering (the order images are attached in is
+// cosmetic). Returns nil for an absent or unparseable schema.
+func imageSchemaFieldNames(inputSchema json.RawMessage) []string {
+	if len(inputSchema) == 0 {
+		return nil
+	}
+	var s struct {
+		Properties map[string]struct {
+			Type   string `json:"type"`
+			Format string `json:"format"`
+			Items  struct {
+				Format string `json:"format"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(inputSchema, &s); err != nil {
+		return nil
+	}
+	var names []string
+	for name, p := range s.Properties {
+		if (p.Type == "string" && p.Format == "image") || (p.Type == "array" && p.Items.Format == "image") {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // shapePredictResponse converts an outcome into the public predict JSON shape.
