@@ -67,7 +67,6 @@ If one is missing (but not both), the server starts with a warning: models that 
 | `DB_PATH` | `DBPath` | Path to the SQLite database file | `./llm_platform.db` |
 | `PORT` | `Port` | HTTP port to listen on | `8000` |
 | `PRICING_PATH` | `PricingPath` | Path to the pricing JSON file | `./pricing.json` |
-| `TASKS_DIR` | *(read directly)* | Directory of YAML task configs | `./tasks.d` |
 
 ---
 

@@ -92,13 +92,6 @@ func New(cfg Config) *Limiter {
 // Enabled reports whether gating is active (nil-safe).
 func (l *Limiter) Enabled() bool { return l != nil && l.cfg.Enabled }
 
-// Window returns the configured window length (for logging/diagnostics).
-func (l *Limiter) Window() time.Duration {
-	if l == nil {
-		return 0
-	}
-	return l.cfg.Window
-}
 
 // Estimate returns the rough input-token cost of a request: text length over
 // CharsPerToken (rounded up), plus a flat per-image cost. Deliberately a cheap

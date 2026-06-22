@@ -41,7 +41,7 @@ graph TD
     BE -->|calls| MG[Meesho Bifrost Gateway<br/>GPT-4o · Gemini · Claude]
     BE -->|calls| GQ[Groq API<br/>Llama 3.3]
     BE -->|reads/writes| DB[(SQLite Database)]
-    BE -->|reads| CF[pricing.json<br/>tasks.d/*.yaml]
+    BE -->|reads| CF[pricing.json]
 ```
 
 - **Product Builder** — writes prompt templates, defines input/output schemas, iterates on quality.

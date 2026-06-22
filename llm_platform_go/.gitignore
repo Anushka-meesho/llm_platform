@@ -17,5 +17,12 @@
 # Test output
 *.out
 
+# Build outputs
+/bin/
+/llm-platform
+/migrate
+/bootstrap
+/issue-token
+
 # macOS
 .DS_Store

@@ -129,30 +129,33 @@ To connect to a real user system (LDAP, OAuth2 + Google SSO, internal Meesho IdP
 
 ## Roles and permissions
 
-Currently one role is implemented:
+Two roles are implemented — one human operator role and one machine/service role:
 
 ```go
 const (
-    RoleAdmin = "admin" // superuser: every capability
+    RoleAdmin  = "admin"  // superuser: every capability (Studio operators)
+    RoleClient = "client" // service principal: read + predict only; never sees prompts
 )
 ```
 
-`RoleAdmin` grants all six permissions. Any user with an unknown role (or an empty role claim) falls back to `RoleAdmin` via `DefaultRole`.
+`RoleAdmin` grants all six permissions; `RoleClient` grants only `task:read` + `task:predict`. Any user with an unknown role (or an empty role claim) falls back to `RoleAdmin` via `DefaultRole`.
 
 ### The six permissions
 
-| Permission | Admin | What it gates |
-|-----------|:-----:|--------------|
-| `task:read` | ✅ | View task config, stats, run history, shadow reports |
-| `task:predict` | ✅ | Call the predict endpoint |
-| `task:write` | ✅ | Create/update tasks, save prompt drafts, run Studio tests, shadow comparisons |
-| `task:deploy` | ✅ | Activate a prompt version into production |
-| `task:delete` | ✅ | Delete prompt versions (irreversible) |
-| `task:view_prompt` | ✅ | See prompt template + system prompt text |
+| Permission | Admin | Client | What it gates |
+|-----------|:-----:|:------:|--------------|
+| `task:read` | ✅ | ✅ | View task config, stats, run history, shadow reports |
+| `task:predict` | ✅ | ✅ | Call the predict endpoint |
+| `task:write` | ✅ | ❌ | Create/update tasks, save prompt drafts, run Studio tests, shadow comparisons |
+| `task:deploy` | ✅ | ❌ | Activate a prompt version into production |
+| `task:delete` | ✅ | ❌ | Delete prompt versions (irreversible) |
+| `task:view_prompt` | ✅ | ❌ | See prompt template + system prompt text |
+
+`client` is the least-privilege role for backend services and integrations — it can read a task's contract and call predict, but never sees prompt text.
 
 ### Planned roles (not yet implemented)
 
-The permission model is designed for a multi-role workflow where authoring and publishing are held by different people. The planned role split — `creator`, `approver`, `caller`, `viewer` — is documented here as intent; the `rolePermissions` map in `internal/auth/rbac.go` is the single place to add them when ready.
+Beyond `admin`/`client`, the permission model is designed for a richer multi-role authoring workflow where authoring and publishing are held by different people. The planned role split — `creator`, `approver`, `viewer` (the `caller` role is already realized as `client`) — is documented here as intent; the `rolePermissions` map in `internal/auth/rbac.go` is the single place to add them when ready.
 
 | Permission | Creator | Approver | Caller | Viewer |
 |-----------|:-------:|:--------:|:------:|:------:|

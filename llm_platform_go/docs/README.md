@@ -29,7 +29,7 @@ The Go backend sits between the frontend and every LLM provider. It validates in
 # 1. Copy the sample env file
 cp .env.example .env   # or edit .env directly — fill in your provider keys
 
-# 2. Run the server (Go 1.22+ required)
+# 2. Run the server (Go 1.25+ required)
 go run ./cmd/server
 
 # 3. Check it's alive
@@ -37,7 +37,7 @@ curl http://localhost:8000/health
 # → {"status":"ok"}
 ```
 
-The database (`llm_platform.db`) and task configs (`tasks.d/`) are created automatically on first run.
+The database (`llm_platform.db`) is created automatically on first run and seeded with two built-in tasks (`playground` and `attribute-extraction`). Tasks live in the database — the single source of truth — and are authored at runtime via the API, not from config files.
 
 ---
 
@@ -71,7 +71,7 @@ These docs explain every part of the codebase from scratch — no Go experience 
 | [docs/06-circuit-breaker.md](docs/06-circuit-breaker.md) | The two-layer circuit breaker system and the background recovery prober |
 | [docs/07-tasks.md](docs/07-tasks.md) | Task anatomy, JSON Schema validation, Go prompt templates, and versioning |
 | [docs/08-database.md](docs/08-database.md) | SQLite, WAL mode, every table, and why DB writes are done asynchronously |
-| [docs/09-auth-and-rbac.md](docs/09-auth-and-rbac.md) | JWT authentication, HttpOnly cookies, and the five-role permission model |
+| [docs/09-auth-and-rbac.md](docs/09-auth-and-rbac.md) | JWT authentication, HttpOnly cookies, and the two-role (admin/client) permission model |
 | [docs/10-caching-and-cost.md](docs/10-caching-and-cost.md) | The prediction cache, what makes a cache key unique, and how token costs are calculated |
 
 **Suggested reading order:** 00 → 01 → 03 → 04 → 05 → 06 → rest in any order.
@@ -84,6 +84,8 @@ These docs explain every part of the codebase from scratch — no Go experience 
 llm_platform_go/
 ├── cmd/
 │   ├── server/main.go         ← entry point — wires everything together
+│   ├── bootstrap/main.go      ← first-run: gen JWT secret, validate, migrate, mint admin
+│   ├── migrate/main.go        ← out-of-band schema migration (prod doesn't auto-migrate)
 │   └── issue-token/main.go    ← CLI tool for minting auth tokens
 ├── internal/
 │   ├── api/                   ← HTTP handlers, router, middleware
@@ -96,7 +98,6 @@ llm_platform_go/
 │   ├── users/                 ← user store (demo swap seam)
 │   ├── config/                ← environment variable loading
 │   └── types/                 ← shared request/response types
-├── tasks.d/                   ← YAML task definitions (loaded at startup)
 ├── pricing.json               ← per-model token pricing (USD per 1M tokens)
 ├── .env                       ← local secrets (gitignored — never commit this)
 └── docs/                      ← this learning guide

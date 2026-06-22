@@ -1,0 +1,18 @@
+# Keep the build context small and never ship local secrets / data.
+.git
+.github
+docs
+tests
+
+# Local runtime artifacts (also gitignored)
+*.db
+*.db-shm
+*.db-wal
+.env
+*.env
+
+# Build outputs / editor junk
+bin/
+*.out
+*.exe
+.DS_Store

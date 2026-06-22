@@ -15,7 +15,7 @@ Postgres (prod) behind one dialect seam.
 > [`10-caching-and-cost`](docs/10-caching-and-cost.md), plus
 > [`DEPLOY.md`](docs/DEPLOY.md). The repo-wide guides live one level up in
 > [`../docs/repo-guide.md`](../docs/repo-guide.md) and
-> [`../docs/repo_work_doc.md`](../docs/repo_work_doc.md).
+> [`../docs/repo-reference.md`](../docs/repo-reference.md).
 
 ## Tech stack
 
@@ -166,7 +166,7 @@ go test ./...            # unit + integration tests
 `anchor_id` pins a point-in-time snapshot so paging through history doesn't shift
 as new runs arrive; `has_task` excludes playground/compare runs. See
 [docs/08-database.md](docs/08-database.md) and the API sections of
-[../docs/repo_work_doc.md](../docs/repo_work_doc.md).
+[../docs/repo-reference.md](../docs/repo-reference.md).
 
 ## Contributing
 

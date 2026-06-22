@@ -20,9 +20,6 @@ const (
 // get correct placeholder handling.
 var activeDriver = SQLite
 
-// ActiveDriver returns the backend selected at Open time.
-func ActiveDriver() Driver { return activeDriver }
-
 // rebind converts the portable `?` placeholders used throughout queries.go into
 // the form the active driver expects. SQLite uses `?` as-is; Postgres needs
 // positional `$1, $2, …`. All Exec/Query/QueryRow calls route through the

@@ -42,12 +42,6 @@ type Config struct {
 	Factor       int           // cooldown multiplier per re-trip
 }
 
-// DefaultConfig is the out-of-the-box breaker: trip after 3 consecutive
-// failures, 30s first cooldown doubling up to 30m.
-func DefaultConfig() Config {
-	return Config{Enabled: true, Threshold: 3, BaseCooldown: 30 * time.Second, MaxCooldown: 30 * time.Minute, Factor: 2}
-}
-
 type entry struct {
 	provider       string
 	consecutive    int
@@ -181,6 +175,9 @@ func (t *Tracker) RecordFailure(task, model, provider, reason string) {
 // Reset forces (task, model) back to healthy (admin override). Returns false if
 // the pair was never seen. `by` is recorded on the emitted event.
 func (t *Tracker) Reset(task, model, by string) bool {
+	if t == nil {
+		return false
+	}
 	t.mu.Lock()
 	e := t.entries[key{task, model}]
 	if e == nil {

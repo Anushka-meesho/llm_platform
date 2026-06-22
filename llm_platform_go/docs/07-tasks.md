@@ -223,65 +223,44 @@ func redactedTask(t *tasks.Task) *TaskResponse {
 
 **Why?** The prompt is intellectual property. The callers' contract is "given these inputs, get this output" — they don't need to know how the sausage is made. This also lets the prompt team iterate on prompts without exposing internal reasoning to external services.
 
-Roles that CAN see prompts: Admin, Creator, Approver, Viewer.
-Roles that CANNOT: Caller.
+Roles that CAN see prompts (the `task:view_prompt` permission): `admin`.
+Roles that CANNOT: `client` (the service principal) — it only gets the input/output contract.
 
 ---
 
-## Defining a task in YAML
+## Creating a task
 
-You don't have to use the API to create tasks. Put a `.yaml` file in `tasks.d/` and it's loaded at startup:
+**The database is the single source of truth for tasks — there is no file-based task
+config.** Tasks are created and edited at runtime through the API (`POST /v1/tasks`,
+backed by the Studio UI) and persist in the `tasks` table. The only tasks seeded at
+boot are the two built-ins (`playground` and `attribute-extraction`); every product
+task is authored against the running service.
 
-```yaml
-id: classify-ticket
-name: Ticket Classifier
-description: Classifies support tickets into predefined categories
+A create request carries the same fields a task row holds — id, name, description,
+`model` + `fallback_models`, sampling params, `daily_budget_usd`, cache opt-in, the
+`system_prompt`/`prompt_template`, and the input/output JSON Schemas:
 
-model: gpt-4o
-fallback_models: [gemini-2.5-flash, llama-groq]
-temperature: 0.1
-max_tokens: 200
-
-daily_budget_usd: 10.0
-cache_enabled: true
-cache_ttl_seconds: 86400  # 24 hours
-
-system_prompt: |
-  You are a support ticket classifier. You ALWAYS respond with valid JSON only.
-  Never include explanation text outside the JSON.
-
-prompt_template: |
-  Classify the following support ticket.
-  Categories: {{.categories}}
-
-  Ticket:
-  {{.body}}
-
-  Respond with: {"label": "<category>", "confidence": <0.0-1.0>}
-
-input_schema:
-  type: object
-  required: [categories, body]
-  properties:
-    categories:
-      type: string
-    body:
-      type: string
-      maxLength: 5000
-
-output_schema:
-  type: object
-  required: [label, confidence]
-  properties:
-    label:
-      type: string
-    confidence:
-      type: number
-      minimum: 0
-      maximum: 1
+```jsonc
+POST /v1/tasks
+{
+  "id": "classify-ticket",
+  "name": "Ticket Classifier",
+  "model": "gpt-4o",
+  "fallback_models": ["gemini-2.5-flash", "llama-groq"],
+  "temperature": 0.1,
+  "max_tokens": 200,
+  "daily_budget_usd": 10.0,
+  "cache_enabled": true,
+  "cache_ttl_seconds": 86400,
+  "system_prompt": "You are a support ticket classifier. Respond with valid JSON only.",
+  "prompt_template": "Classify the ticket.\nCategories: {{.categories}}\n\nTicket:\n{{.body}}",
+  "input_schema":  { "type": "object", "required": ["categories", "body"], "properties": { "categories": {"type": "string"}, "body": {"type": "string", "maxLength": 5000} } },
+  "output_schema": { "type": "object", "required": ["label", "confidence"], "properties": { "label": {"type": "string"}, "confidence": {"type": "number", "minimum": 0, "maximum": 1} } }
+}
 ```
 
-This YAML is loaded by `tasks.LoadYAMLDir(taskStore, "./tasks.d")` during startup (step 10 of the boot sequence). The schema validation and defaults are applied as if you'd created it via the API.
+The same schema validation and defaults are applied on create as on every later edit,
+and onboarding a task is an API/UI action — never a config rollout or server restart.
 
 ---
 

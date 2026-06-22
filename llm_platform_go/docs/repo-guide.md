@@ -2,7 +2,7 @@
 
 **Last updated: 2026-06-22**
 
-> This is the **narrative onboarding companion** to `docs/repo_work_doc.md` (the reference
+> This is the **narrative onboarding companion** to `docs/repo-reference.md` (the reference
 > manual). Where the work doc is tables and exact contracts, this guide is the *why* — the
 > design rationale, the boot story, the invariants you must not regress, and the seams you'll
 > reach for first. Read the work doc when you need the precise field list or endpoint signature;
@@ -121,7 +121,7 @@ llm_platform_go/                       # repo root (the single Go binary)
 ├── tests/                             # black-box HTTP + DB tests (httptest + in-memory SQLite)
 ├── pricing.json                       # per-model $/1M-token rates (the cost source of truth)
 ├── .env.example                       # annotated config template (copy to .env)
-└── docs/                              # this guide, repo_work_doc.md, DEPLOY.md, 00–10 design notes
+└── docs/                              # this guide, repo-reference.md, DEPLOY.md, 00–10 design notes
 ```
 
 **`internal/api` files worth knowing by name:** `router.go` (route table + CORS),
@@ -861,6 +861,6 @@ platform rots.
 
 ---
 
-*Companion to `docs/repo_work_doc.md` (reference manual) and `docs/DEPLOY.md` (deploy runbook).
+*Companion to `docs/repo-reference.md` (reference manual) and `docs/DEPLOY.md` (deploy runbook).
 When the model registry, the endpoint set, RBAC, or the schema change, update this guide and the
 work doc together.*

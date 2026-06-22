@@ -62,7 +62,8 @@ func ValidateInput(t *Task, inputs json.RawMessage) error {
 // the JSON number 42, any text becomes a JSON string — and then validated
 // against the full schema so constraints (enum, pattern, minimum/maximum,
 // min/maxLength, min/maxItems, …) still apply. The returned JSON is the coerced,
-// validated value. Tasks without a schema get the raw text back unparsed.
+// validated value. Tasks without a schema return (nil, nil) — there is nothing
+// to coerce or validate, and the caller serves the raw text directly.
 //
 // Coercion or validation failure is returned as an error, which the prediction
 // pipeline treats as a schema-invalid output (flagged invalid; advances the
