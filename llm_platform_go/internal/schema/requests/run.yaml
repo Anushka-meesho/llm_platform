@@ -32,3 +32,21 @@ properties:
     type: string
   system_prompt:
     type: string
+  # Optional structured-output preference, forwarded to each model as the
+  # OpenAI-compatible response_format. Best-effort: a model that rejects it
+  # answers with a plain call instead (see llm.CallModel).
+  response_format:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type:
+        type: string
+        enum: [json_object, json_schema]
+      json_schema:
+        type: object
+        required: [name, schema]
+        properties:
+          name: { type: string }
+          schema: { type: object }
+          strict: { type: boolean }

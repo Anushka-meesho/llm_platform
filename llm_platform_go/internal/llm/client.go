@@ -23,11 +23,56 @@ type Provider interface {
 // non-default temperature — for those, CallModel sets MaxCompletionTokens
 // instead and omits Temperature (registry flag `reasoning`).
 type chatRequest struct {
-	Model               string        `json:"model"`
-	Messages            []ChatMessage `json:"messages"`
-	MaxTokens           int           `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
-	Temperature         float32       `json:"temperature,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []ChatMessage   `json:"messages"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Temperature         float32         `json:"temperature,omitempty"`
+	// ResponseFormat, when set, asks the provider to constrain its output —
+	// either to any valid JSON object ({"type":"json_object"}) or to a supplied
+	// JSON Schema ({"type":"json_schema",...}). Omitted entirely when nil, so the
+	// wire form for every existing caller is byte-for-byte unchanged.
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+}
+
+// ResponseFormat is the OpenAI-compatible structured-output directive carried on
+// the chat-completions request. Two modes:
+//   - {"type":"json_object"} — the model must emit syntactically valid JSON, with
+//     no schema enforced (Schema nil).
+//   - {"type":"json_schema","json_schema":{...}} — the model must emit JSON that
+//     conforms to the embedded schema (Schema set).
+//
+// Provider support is uneven — this is a request-shaping convenience, NOT a
+// substitute for tasks.ValidateOutput, which stays the source of truth. See
+// docs and the runner gate for which models it is sent to.
+type ResponseFormat struct {
+	Type   string          `json:"type"`
+	Schema *JSONSchemaSpec `json:"json_schema,omitempty"`
+}
+
+// JSONSchemaSpec is the OpenAI json_schema payload. Name is a required label the
+// provider echoes back; Schema is the JSON Schema document; Strict requests that
+// the provider reject any output the schema does not match (where supported).
+type JSONSchemaSpec struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict,omitempty"`
+}
+
+// JSONObjectFormat returns a response_format that asks only for valid JSON, with
+// no schema enforced — the broadly-supported, low-risk mode.
+func JSONObjectFormat() *ResponseFormat {
+	return &ResponseFormat{Type: "json_object"}
+}
+
+// JSONSchemaFormat returns a response_format that asks the provider to constrain
+// output to schema. name is a short label (e.g. the task id); strict requests
+// hard schema enforcement where the provider supports it.
+func JSONSchemaFormat(name string, schema json.RawMessage, strict bool) *ResponseFormat {
+	return &ResponseFormat{
+		Type:   "json_schema",
+		Schema: &JSONSchemaSpec{Name: name, Schema: schema, Strict: strict},
+	}
 }
 
 type ChatMessage struct {

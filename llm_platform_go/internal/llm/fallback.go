@@ -104,7 +104,7 @@ func CallWithFallbackOpts(ctx context.Context, clients *Clients, models []string
 			}
 		}
 
-		last = CallModel(ctx, clients, model, messages, temperature, maxTokens)
+		last = CallModel(ctx, clients, model, messages, temperature, maxTokens, nil)
 		last.FallbackUsed = i > 0
 		last.Degraded = i > 0
 

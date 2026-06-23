@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -123,13 +124,36 @@ func callSingleModel(ctx context.Context, clients *Clients, modelName string, re
 	if req.MaxTokens != nil {
 		maxTok = *req.MaxTokens
 	}
-	return CallModel(ctx, clients, modelName, buildMessages(modelName, req), temp, maxTok)
+	// Optional structured-output preference from the request. Best-effort: a
+	// malformed directive is ignored (nil) so the call behaves exactly as before.
+	return CallModel(ctx, clients, modelName, buildMessages(modelName, req), temp, maxTok,
+		parseResponseFormat(req.ResponseFormat))
+}
+
+// parseResponseFormat decodes the optional response_format directive carried on a
+// request into the typed form CallModel takes. Returns nil for an absent or
+// unparseable directive — the preference is best-effort, never a hard error.
+func parseResponseFormat(raw json.RawMessage) *ResponseFormat {
+	if len(raw) == 0 {
+		return nil
+	}
+	var rf ResponseFormat
+	if err := json.Unmarshal(raw, &rf); err != nil || rf.Type == "" {
+		return nil
+	}
+	return &rf
 }
 
 // CallModel calls one model with the given messages and always returns a
 // ModelResult — never panics. This is the single execution path shared by the
 // playground fan-out (/run) and the task prediction endpoint (/v1/tasks/.../predict).
-func CallModel(ctx context.Context, clients *Clients, modelName string, messages []ChatMessage, temperature float32, maxTokens int) ModelResult {
+//
+// responseFormat, when non-nil, is a *preference*: the call asks the provider to
+// honour the structured-output directive, but if the provider rejects the request
+// because of it (a 400/422 bad-request), the directive is dropped and the call is
+// retried once in plain mode. So a model that cannot do structured output still
+// answers — "prefer if possible, else the basic call". Pass nil to opt out.
+func CallModel(ctx context.Context, clients *Clients, modelName string, messages []ChatMessage, temperature float32, maxTokens int, responseFormat *ResponseFormat) ModelResult {
 	start := time.Now()
 
 	cfg, ok := registry[modelName]
@@ -148,10 +172,11 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		maxTokens = cfg.minOutputTokens
 	}
 	apiReq := chatRequest{
-		Model:       cfg.modelID,
-		Messages:    messages,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
+		Model:          cfg.modelID,
+		Messages:       messages,
+		MaxTokens:      maxTokens,
+		Temperature:    temperature,
+		ResponseFormat: responseFormat,
 	}
 	if cfg.reasoning {
 		// gpt-5 family / o-series: max_tokens and temperature are rejected.
@@ -160,28 +185,20 @@ func CallModel(ctx context.Context, clients *Clients, modelName string, messages
 		apiReq.Temperature = 0 // omitted via omitempty → provider default
 	}
 
-	var resp *chatResponse
-	var err error
-	tries := 0           // upstream HTTP attempts actually made (incl. retries)
-	lastStatus := 0      // last upstream HTTP status seen (0 = no response reached)
-	for attempt := 0; attempt < 3; attempt++ {
-		tries++
-		resp, err = provider.Call(ctx, &apiReq)
-		if err == nil {
-			break
+	resp, err, tries, lastStatus := callWithRetries(ctx, provider, &apiReq)
+
+	// Structured-output degradation: if a response_format directive was sent and
+	// the provider rejected the *request* (400/422 — it doesn't support the
+	// directive or the schema), drop it and try once more in plain mode. This is
+	// what makes the preference best-effort per model rather than a hard failure.
+	if err != nil && apiReq.ResponseFormat != nil && isBadRequest(lastStatus) {
+		apiReq.ResponseFormat = nil
+		var tries2, lastStatus2 int
+		resp, err, tries2, lastStatus2 = callWithRetries(ctx, provider, &apiReq)
+		tries += tries2
+		if lastStatus2 != 0 {
+			lastStatus = lastStatus2
 		}
-		var apiErr *APIError
-		if errors.As(err, &apiErr) {
-			lastStatus = apiErr.HTTPStatusCode
-		}
-		if ctx.Err() != nil {
-			break // context cancelled or timed out — do not retry
-		}
-		if apiErr != nil && isRetryable(apiErr.HTTPStatusCode) {
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
-			continue
-		}
-		break // non-retryable error
 	}
 
 	latencyMs := int(time.Since(start).Milliseconds())
@@ -320,9 +337,45 @@ func classifyError(err error) string {
 	return fmt.Sprintf("Unexpected error: %v", err)
 }
 
+// callWithRetries performs the provider call with transient-error retries (the
+// same 3-attempt backoff CallModel has always used). It returns the response
+// (nil on failure), the error, the number of upstream attempts actually made,
+// and the last upstream HTTP status seen (0 if no response reached). Extracted
+// so CallModel can run it twice — once with a structured-output directive, then,
+// if that is rejected, once without.
+func callWithRetries(ctx context.Context, provider Provider, apiReq *chatRequest) (resp *chatResponse, err error, tries, lastStatus int) {
+	for attempt := 0; attempt < 3; attempt++ {
+		tries++
+		resp, err = provider.Call(ctx, apiReq)
+		if err == nil {
+			break
+		}
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			lastStatus = apiErr.HTTPStatusCode
+		}
+		if ctx.Err() != nil {
+			break // context cancelled or timed out — do not retry
+		}
+		if apiErr != nil && isRetryable(apiErr.HTTPStatusCode) {
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			continue
+		}
+		break // non-retryable error
+	}
+	return resp, err, tries, lastStatus
+}
+
 // isRetryable returns true for transient HTTP status codes worth retrying.
 func isRetryable(status int) bool {
 	return status == 429 || status == 500 || status == 503
+}
+
+// isBadRequest reports whether the upstream rejected the request itself (as
+// opposed to a transient/infra failure). A response_format directive a provider
+// cannot honour surfaces here, which is the signal to retry in plain mode.
+func isBadRequest(status int) bool {
+	return status == 400 || status == 422
 }
 
 func errResult(model string, start time.Time, msg string) ModelResult {
