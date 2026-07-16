@@ -56,6 +56,8 @@ const (
 	CodeTaskInactive        = "task_inactive"
 	CodeVersionNotFound     = "version_not_found"
 	CodeVersionActive       = "version_active"
+	CodeDatasetNotFound     = "eval_dataset_not_found"
+	CodeDatasetValidation   = "eval_dataset_validation_failed"
 	CodePlaygroundProtected = "playground_protected"
 	CodeRunNotFound         = "run_not_found"
 	CodeSessionNotFound     = "session_not_found"

@@ -16,8 +16,7 @@ The prediction cache stores responses so identical requests return the stored an
 ```go
 type Cache interface {
     Get(ctx context.Context, key string) ([]byte, bool)
-    Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
-    Close() error
+    Set(ctx context.Context, key string, val []byte, ttl time.Duration)
 }
 ```
 
@@ -25,6 +24,8 @@ type Cache interface {
 > The `Cache` interface means the rest of the platform doesn't know or care whether it's talking to Redis or an in-memory map. Both `redis.Cache` and `memory.Cache` implement the same two methods. In production: Redis. In local dev: in-memory. In tests: in-memory.
 >
 > This is the **strategy pattern**: define a contract (interface), then swap implementations without changing calling code.
+>
+> Notice that `Set` does not return an error. Implementations must treat backend failures as misses because caching is an optimization, not correctness. A Redis problem should make the request slower, not fail the prediction.
 
 Two backends:
 - **`cache.NewMemory()`** — an in-process map with TTL expiry. Data is lost when the server restarts. Fine for development.
@@ -61,23 +62,10 @@ When a cache hit is served, `cost_usd = 0.0` in the response — no tokens were 
 Two requests are "identical" and should share a cache entry if and only if every factor that could influence the output is the same. The cache key is a SHA-256 hash of all those factors concatenated:
 
 ```go
-func cacheKey(task *tasks.Task, model, renderedPrompt, systemPrompt string,
-              temperature float64, maxTokens int, outputSchema json.RawMessage,
-              images []string) string {
-
-    h := sha256.New()
-    fmt.Fprintf(h, "%s\x00", task.ID)
-    fmt.Fprintf(h, "%d\x00", task.PromptVersion)  // version number
-    fmt.Fprintf(h, "%s\x00", renderedPrompt)       // AFTER template rendering
-    fmt.Fprintf(h, "%s\x00", systemPrompt)
-    fmt.Fprintf(h, "%s\x00", model)
-    fmt.Fprintf(h, "%f\x00", temperature)
-    fmt.Fprintf(h, "%d\x00", maxTokens)
-    fmt.Fprintf(h, "%s\x00", string(outputSchema))
-    for _, img := range images {
-        fmt.Fprintf(h, "%s\x00", img)
-    }
-    return hex.EncodeToString(h.Sum(nil))
+func Key(in KeyInputs) string {
+    b, _ := json.Marshal(in)
+    sum := sha256.Sum256(b)
+    return "predict:" + hex.EncodeToString(sum[:])
 }
 ```
 
@@ -122,6 +110,7 @@ During the walk, when the chain reaches "gpt-4o", it calls `Lookup("gpt-4o")`. I
 ## When caching is skipped
 
 - **Studio test runs (`is_test=true`):** When a product builder is testing a draft prompt in the Studio panel, they always want to see the live model response — not a cached answer from the old deployed prompt.
+- **Override model/version runs:** Eval checks and Studio test calls can override the deployed version or model. Those are intentionally live and are not stored under the production cache key.
 - **Cache disabled (`cache_enabled=false`):** Each task can individually opt out of caching.
 - **No cache configured:** If `CACHE_BACKEND=off` (the default when Redis isn't configured), the cache lookup function always returns "miss".
 

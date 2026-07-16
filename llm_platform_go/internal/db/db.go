@@ -105,6 +105,57 @@ func Migrate(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_shadow_task ON shadow_reports(task_id);
 
+		CREATE TABLE IF NOT EXISTS eval_datasets (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id        TEXT NOT NULL,
+			name           TEXT NOT NULL,
+			version        INTEGER NOT NULL,
+			source_type    TEXT NOT NULL, -- csv | prism_sql
+			source_ref     TEXT NOT NULL DEFAULT '',
+			status         TEXT NOT NULL DEFAULT 'ready', -- ready | pending_import
+			input_mapping  TEXT NOT NULL DEFAULT '{}',
+			output_mapping TEXT NOT NULL DEFAULT '{}',
+			row_count      INTEGER NOT NULL DEFAULT 0,
+			schema_hash    TEXT NOT NULL DEFAULT '',
+			created_by     TEXT NOT NULL DEFAULT '',
+			created_at     DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(task_id, name, version)
+		);
+		CREATE INDEX IF NOT EXISTS idx_eval_datasets_task ON eval_datasets(task_id);
+
+		CREATE TABLE IF NOT EXISTS eval_examples (
+			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+			dataset_id           INTEGER NOT NULL,
+			example_id           TEXT NOT NULL DEFAULT '',
+			row_no               INTEGER NOT NULL,
+			inputs_json          TEXT NOT NULL,
+			expected_output_json TEXT NOT NULL,
+			metadata_json        TEXT NOT NULL DEFAULT '{}'
+		);
+		CREATE INDEX IF NOT EXISTS idx_eval_examples_dataset ON eval_examples(dataset_id);
+
+		CREATE TABLE IF NOT EXISTS eval_runs (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id         TEXT NOT NULL,
+			prompt_version  INTEGER NOT NULL,
+			dataset_id      INTEGER NOT NULL,
+			dataset_name    TEXT NOT NULL,
+			dataset_version INTEGER NOT NULL,
+			model           TEXT NOT NULL DEFAULT '',
+			total           INTEGER NOT NULL DEFAULT 0,
+			passed          INTEGER NOT NULL DEFAULT 0,
+			failed          INTEGER NOT NULL DEFAULT 0,
+			match_rate      REAL NOT NULL DEFAULT 0,
+			avg_latency_ms  REAL NOT NULL DEFAULT 0,
+			total_cost_usd  REAL NOT NULL DEFAULT 0,
+			details         TEXT NOT NULL DEFAULT '{}',
+			created_by      TEXT NOT NULL DEFAULT '',
+			created_at      DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_eval_runs_task ON eval_runs(task_id);
+		CREATE INDEX IF NOT EXISTS idx_eval_runs_dataset ON eval_runs(dataset_id);
+		CREATE INDEX IF NOT EXISTS idx_eval_runs_version ON eval_runs(task_id, prompt_version);
+
 		CREATE TABLE IF NOT EXISTS model_health_events (
 			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
 			task_id              TEXT NOT NULL,

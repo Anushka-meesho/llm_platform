@@ -409,6 +409,78 @@ export type TPromptVersion = {
   active: boolean;
 };
 
+export type TEvalDataset = {
+  id: number;
+  task_id: string;
+  name: string;
+  version: number;
+  source_type: 'csv' | 'xlsx' | 'prism_sql';
+  source_ref?: string;
+  status: 'ready' | 'pending_import';
+  input_mapping?: Record<string, string>;
+  output_mapping?: Record<string, string>;
+  row_count: number;
+  schema_hash?: string;
+  created_by?: string;
+  created_at: string;
+};
+
+export type TEvalValidationError = {
+  row: number;
+  field?: string;
+  message: string;
+};
+
+export type TEvalRun = {
+  id: number;
+  task_id: string;
+  prompt_version: number;
+  dataset_id: number;
+  dataset_name: string;
+  dataset_version: number;
+  model: string;
+  total: number;
+  passed: number;
+  failed: number;
+  match_rate: number;
+  avg_latency_ms: number;
+  total_cost_usd: number;
+  details: {
+    output_samples?: {
+      item: number;
+      row_no: number;
+      inputs?: unknown;
+      expected_output: unknown;
+      actual_output: unknown;
+      error?: string;
+      matched: boolean;
+      mismatch_fields?: string[];
+    }[];
+    mismatches?: {
+      item: number;
+      field: string;
+      expected: unknown;
+      got: unknown;
+    }[];
+    matched_fields?: number;
+    total_fields?: number;
+  };
+  created_by?: string;
+  created_at: string;
+};
+
+export type TEvalDatasetsResponse = {
+  task_id: string;
+  datasets: TEvalDataset[];
+  runs: TEvalRun[];
+};
+
+export type TEvalDatasetUploadResult = {
+  dataset?: TEvalDataset;
+  detail?: string;
+  errors?: TEvalValidationError[];
+};
+
 export type TPredictResult = {
   task_run_id: string;
   task_id: string;

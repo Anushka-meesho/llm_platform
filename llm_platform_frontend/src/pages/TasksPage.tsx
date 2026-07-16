@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Button, Checkbox, Input, Spinner, TextArea, Typography, cn } from '@meesho/merlin-ui-tailwind';
 import type {
   TPromptVersion,
@@ -12,6 +12,7 @@ import { can } from '../auth/permissions';
 import SchemaEditor, { type SchemaEditorState } from '../components/SchemaEditor';
 import OutputSchemaEditor from '../components/OutputSchemaEditor';
 import VersionHistory from '../components/VersionHistory';
+import EvalDatasetSection from '../components/EvalDatasetSection';
 import ErrorState from '../components/ErrorState';
 import { stableStringify } from '../utils/schema';
 import { buildDefaultPrompts, canBuildDefaultPrompts } from '../utils/defaultPrompts';
@@ -31,6 +32,7 @@ const TasksPage = () => {
   // catalog (selected resolves to null below).
   const [selectedId, setSelectedId] = usePersistentState<string | null>('tasks.selectedId', null);
   const [creating, setCreating] = usePersistentState('tasks.creating', false);
+  const [focusEvalAfterCreate, setFocusEvalAfterCreate] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -115,6 +117,7 @@ const TasksPage = () => {
             onCancel={() => setCreating(false)}
             onCreated={async (id) => {
               setCreating(false);
+              setFocusEvalAfterCreate(true);
               await refresh();
               setSelectedId(id);
             }}
@@ -129,6 +132,8 @@ const TasksPage = () => {
           <TaskDetail
             key={selected.id}
             task={selected}
+            focusEval={focusEvalAfterCreate}
+            onEvalFocused={() => setFocusEvalAfterCreate(false)}
             onChanged={refresh}
             onDeleted={async () => {
               setSelectedId(null);
@@ -145,10 +150,14 @@ const TasksPage = () => {
 
 const TaskDetail = ({
   task,
+  focusEval,
+  onEvalFocused,
   onChanged,
   onDeleted,
 }: {
   task: TTask;
+  focusEval: boolean;
+  onEvalFocused: () => void;
   onChanged: () => Promise<void>;
   onDeleted: () => Promise<void>;
 }) => {
@@ -169,6 +178,7 @@ const TaskDetail = ({
   const [note, setNote] = usePersistentState(`tasks.note.${task.id}`, '');
   const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
+  const evalSectionRef = useRef<HTMLDivElement | null>(null);
 
   const loadVersions = useCallback(async () => {
     const data = await api.listVersions(task.id).catch((e) => {
@@ -185,6 +195,15 @@ const TaskDetail = ({
       .then(setStats)
       .catch((e) => console.error('load task stats:', errorMessage(e)));
   }, [task.id, loadVersions]);
+
+  useEffect(() => {
+    if (!focusEval) return;
+    const timer = window.setTimeout(() => {
+      evalSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      onEvalFocused();
+    }, 100);
+    return () => window.clearTimeout(timer);
+  }, [focusEval, onEvalFocused]);
 
   const draftDirty =
     draft !== task.prompt_template || draftSystem !== (task.system_prompt ?? '');
@@ -380,6 +399,13 @@ const TaskDetail = ({
           {task.max_tokens} output tokens (before input values)
         </Typography>
       </Section>
+
+      {/* Eval datasets */}
+      <div ref={evalSectionRef}>
+        <Section title="Eval datasets">
+          <EvalDatasetSection task={task} canWrite={canWrite} />
+        </Section>
+      </div>
 
       {/* Cost estimate */}
       <EstimateSection draft={draft} draftSystem={draftSystem} />
@@ -792,6 +818,15 @@ const CreateTaskForm = ({
             <OutputSchemaEditor initial={output.schema} readOnly={false} onChange={setOutput} />
           </SchemaPane>
         </div>
+      </Section>
+
+      <Section title="Eval dataset">
+        <Typography variant="body" size="2" className="text-primary-text">
+          CSV/XLSX upload becomes available after this task is created.
+        </Typography>
+        <Typography variant="body" size="1" className="text-tertiary-text mt-1">
+          The uploaded file is validated against the saved task schema, then you can run the saved prompt and download row-level LLM outputs as CSV.
+        </Typography>
       </Section>
 
       {err && (

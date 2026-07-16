@@ -14,7 +14,7 @@ The fallback chain walks a list of models in priority order. For each model, it 
 
 ```mermaid
 flowchart TD
-    Start([Start: model list]) --> Gate{Circuit breaker<br/>allows this model?}
+    Start([Start: model list]) --> Gate{Health tracker<br/>allows this task/model?}
     Gate -->|No — skip| Next
     Gate -->|Yes| Cache{Cache hit<br/>for this model?}
     Cache -->|Yes| Done([Return cached result ✓])
@@ -22,7 +22,7 @@ flowchart TD
     Call --> Success{Call succeeded?}
     Success -->|Yes| Valid{Output passes<br/>schema validation?}
     Valid -->|Yes| Done2([Return result ✓])
-    Valid -->|No — treated as infra failure| Record[Record failure to health tracker]
+    Valid -->|No — unusable output| Record[Record failure to health tracker]
     Success -->|No| Error{What kind of error?}
     Error -->|Content error 400/422| Halt([Return error immediately ✗<br/>bad input — no point retrying])
     Error -->|Infra/auth error 5xx/429/401/403| Record
@@ -87,6 +87,37 @@ if opts.Validate != nil && !opts.Validate(*last.Response) {
 **Why?** You specified an output schema because your application needs structured data. A model that returns prose when you expected JSON is effectively broken *for this task* — it produced output that your code can't use. The right response is to try a different model that might give valid JSON.
 
 This is one of the most powerful features: **output schema enforcement as a fallback trigger**. You get reliable structured output because the chain keeps trying until something works.
+
+---
+
+## The valid-only predict contract
+
+The platform enforces a "valid-only" contract on the predict endpoint: **a response is only returned to the caller if it passes the task's output schema.** A schema-invalid response is treated identically to a 5xx infra error — it is recorded as a failure, advances the chain, and trips the per-(task, model) circuit breaker after repeated violations.
+
+This means the three failure types now map to a single decision tree:
+
+```mermaid
+flowchart TD
+    Call([Model returned a response]) --> OK{HTTP 200?}
+    OK -->|No| Class{Error type?}
+    Class -->|5xx · 429 · network · timeout| InfraFail[Infra failure<br/>fallbackEligible = true]
+    Class -->|401 · 403 · 404| ConfigFail[Config failure<br/>fallbackEligible = true]
+    Class -->|400 · 422| ContentFail[Content failure<br/>fallbackEligible = false<br/>STOP — return error]
+    OK -->|Yes| Schema{Output schema<br/>validation passes?}
+    Schema -->|Yes| Return([Return to caller ✓])
+    Schema -->|No| SchemaFail[Schema-invalid<br/>fallbackEligible = true<br/>Outcome: schema_invalid]
+    InfraFail --> Next{More models?}
+    ConfigFail --> Next
+    SchemaFail --> Next
+    Next -->|Yes| Gate([Try next model])
+    Next -->|No| Degraded([Return degraded — all failed ✗])
+```
+
+**Practical implications:**
+- If every model in your chain returns the wrong format, the platform returns a degraded signal (not a randomly-shaped response that silently breaks your parser).
+- Repeated schema failures for a specific (task, model) pair trip the per-(task, model) circuit breaker — that model gets deprioritised automatically.
+- The raw (invalid) response is still persisted in `gateway_attempts.response` so you can inspect what the model actually returned.
+- Output schema validation is triggered by `opts.Validate` in `CallWithFallbackOpts` (`internal/llm/fallback.go`). The playground `/run` endpoint passes `nil` — it accepts any response and lets the caller inspect the raw output.
 
 ---
 
@@ -225,12 +256,12 @@ The user gets an answer from Llama, `fallback_used=true`, `degraded=true`. The s
 
 ---
 
-## What "probe-only mode" means for the chain
+## How circuit recovery works in the chain
 
-When the recovery prober is running, all circuit breakers operate in "probe-only mode". This means:
-- Open circuits **never** transition to half-open for live production requests.
-- The only way a circuit closes is a successful *probe* from the background prober.
+The circuit breaker uses **lazy (on-demand) probe recovery** — there is no background goroutine.
 
-Without this, the standard circuit breaker behavior would be: after the cooldown expires, allow one live production request through as a "test". If it fails, re-trip. This means a real user's request is used as the probe, potentially failing for them while the circuit was recovering.
+Once an UNHEALTHY circuit's cooldown expires, the breaker transitions to a probing state. The **very next real production request** to that model is used as the probe:
+- If it succeeds → the circuit closes and the model is HEALTHY again.
+- If it fails → the circuit re-trips and the cooldown doubles (30s → 60s → 2m → 4m → ... up to 30m).
 
-With probe-only mode: the background prober sends a tiny 1-token request to the unhealthy provider every 15 seconds. Real users never see the "testing if it's recovered" failure. When the prober confirms recovery, the circuit closes and all production traffic resumes.
+This means one real user's request can "absorb" the probe failure. The trade-off is accepted: a single extra failure during recovery is preferable to running a separate background goroutine just to probe providers. Admins can also force-reset a circuit via `POST /v1/admin/model-health/reset` with body `{"task_id":"...","model":"..."}` without waiting for any cooldown.

@@ -287,7 +287,7 @@ addr := ":" + cfg.Port  // e.g. ":8000"
 http.ListenAndServe(addr, router)
 ```
 
-The server is now ready. It will run until the process is killed (Ctrl+C or SIGTERM), at which point all the `defer` calls run in reverse order (close cache, close limiter, close writers, close DB).
+The server is now ready. The current implementation uses plain `http.ListenAndServe`, not a graceful-shutdown `http.Server`, so a hard process kill will stop immediately. When `main()` returns after `ListenAndServe` errors, deferred cleanup runs in reverse order for components that have `Close` methods, such as async writers and the database handle.
 
 ---
 

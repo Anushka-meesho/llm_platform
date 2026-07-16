@@ -10,6 +10,9 @@ import type {
   TPromptVersion,
   TPredictResult,
   TTaskStatsDetail,
+  TEvalDatasetsResponse,
+  TEvalDatasetUploadResult,
+  TEvalRun,
   TLeaderboardResponse,
   TRunListResponse,
   TRunDetail,
@@ -95,6 +98,111 @@ const jsonPost = (body: unknown): RequestInit => ({
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(body),
 });
+
+async function fetchEvalUpload(url: string, form: FormData): Promise<TEvalDatasetUploadResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      body: form,
+      credentials: 'include',
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new ApiError(0, 'Request timed out after 60s', 'timeout');
+    }
+    throw new ApiError(0, "Can't reach the server — is it running?", 'network');
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const data = (await res.json().catch(() => ({}))) as TEvalDatasetUploadResult & {
+    code?: string;
+    request_id?: string;
+  };
+  if (!res.ok && data.code !== 'eval_dataset_validation_failed') {
+    throw new ApiError(
+      res.status,
+      data.detail ?? `HTTP ${res.status}`,
+      data.code,
+      data.request_id,
+    );
+  }
+  return data;
+}
+
+async function fetchEvalCSV(url: string, body: unknown): Promise<Blob> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120_000);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...jsonPost(body),
+      credentials: 'include',
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new ApiError(0, 'Request timed out after 120s', 'timeout');
+    }
+    throw new ApiError(0, "Can't reach the server — is it running?", 'network');
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as {
+      detail?: string;
+      code?: string;
+      request_id?: string;
+    };
+    throw new ApiError(
+      res.status,
+      data.detail ?? `HTTP ${res.status}`,
+      data.code,
+      data.request_id,
+    );
+  }
+  return res.blob();
+}
+
+async function fetchTestTaskForBatch(url: string, body: unknown): Promise<TPredictResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...jsonPost(body),
+      credentials: 'include',
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new ApiError(0, 'Request timed out after 60s', 'timeout');
+    }
+    throw new ApiError(0, "Can't reach the server — is it running?", 'network');
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const data = (await res.json().catch(() => ({}))) as Partial<TPredictResult> & {
+    detail?: string;
+    code?: string;
+    request_id?: string;
+  };
+  if (!res.ok && typeof data.task_run_id !== 'string') {
+    throw new ApiError(
+      res.status,
+      data.detail ?? `HTTP ${res.status}`,
+      data.code,
+      data.request_id ?? res.headers.get('X-Request-ID') ?? undefined,
+    );
+  }
+  return data as TPredictResult;
+}
 
 // Bundles the predict response body with the degraded-mode signal, which the
 // platform delivers as an X-Platform-Degraded response header.
@@ -201,6 +309,16 @@ export const api = {
       60_000,
     ),
 
+  testTaskForBatch: (
+    id: string,
+    inputs: Record<string, unknown>,
+    opts?: { version?: number; model?: string },
+  ) =>
+    fetchTestTaskForBatch(
+      `${BASE}/v1/tasks/${id}/test`,
+      { inputs, version: opts?.version, model: opts?.model },
+    ),
+
   // Call the real production predict endpoint and return the result together
   // with the degraded-mode flag from the X-Platform-Degraded response header.
   // Uses cookie auth like all other calls in this client.
@@ -250,6 +368,54 @@ export const api = {
 
   taskStats: (id: string, days = 30) =>
     fetchJSON<TTaskStatsDetail>(`${BASE}/v1/tasks/${id}/stats?days=${days}`),
+
+  listEvalDatasets: (id: string) =>
+    fetchJSON<TEvalDatasetsResponse>(`${BASE}/v1/tasks/${id}/eval-datasets`),
+
+  uploadEvalDataset: (id: string, form: FormData) =>
+    fetchEvalUpload(`${BASE}/v1/tasks/${id}/eval-datasets/upload`, form),
+
+  createPrismEvalDataset: (
+    id: string,
+    payload: {
+      name: string;
+      sql: string;
+      input_mapping: Record<string, string>;
+      output_mapping?: Record<string, string>;
+    },
+  ) =>
+    fetchJSON<TEvalDatasetUploadResult>(
+      `${BASE}/v1/tasks/${id}/eval-datasets/prism`,
+      jsonPost(payload),
+    ),
+
+  runEval: (
+    id: string,
+    version: number,
+    payload: { dataset_id: number; max_items?: number; model?: string },
+  ) =>
+    fetchJSON<TEvalRun>(
+      `${BASE}/v1/tasks/${id}/versions/${version}/eval`,
+      jsonPost(payload),
+      120_000,
+    ),
+
+  checkEvalDataset: (
+    id: string,
+    version: number,
+    payload: { dataset_id: number; max_items?: number; model?: string },
+  ) =>
+    fetchJSON<TEvalRun>(
+      `${BASE}/v1/tasks/${id}/versions/${version}/check`,
+      jsonPost(payload),
+      120_000,
+    ),
+
+  downloadEvalCSV: (
+    id: string,
+    version: number,
+    payload: { dataset_id: number; max_items?: number; model?: string },
+  ) => fetchEvalCSV(`${BASE}/v1/tasks/${id}/versions/${version}/check.csv`, payload),
 
   // ── Admin: prompt history (admin role only, 403 otherwise) ─────────────────
   adminRuns: (f: TRunFilters = {}) => {

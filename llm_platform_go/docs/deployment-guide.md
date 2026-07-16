@@ -1,7 +1,7 @@
 # Production Deployment Guide — What Must Change Before Real Deployment
 
-**Audience:** a future Claude (Opus) session asked to "make this deployable" or to ship
-the platform to a real environment. Read `docs/repo-guide.md` first. This doc lists
+**Audience:** a future engineering session asked to "make this deployable" or to ship
+the platform to a real environment. Read `docs/12-implementation-reference.md` first. This doc lists
 every place the codebase currently makes a **dev/demo assumption**, what to change,
 where the seam is, and in what order. The architecture was built so most of these are
 contained swaps — do not refactor around the seams, use them.
@@ -97,13 +97,14 @@ COOKIE_SECURE=true
 COOKIE_DOMAIN=llm-platform.meesho.internal     # or leave empty for host-only
 TOKEN_EXPIRY=8h                                # shorter than the 12h dev default
 ALLOWED_ORIGINS=https://llm-platform.meesho.internal
-OPENAI_API_KEY / GROQ_API_KEY / GEMINI_API_KEY # from secret manager
+GROQ_API_KEY / MEESHO_GATEWAY_VK               # from secret manager
+MEESHO_GATEWAY_BASE_URL                        # if overriding the default gateway
 DB_*            # see §3
 PRICING_PATH=/etc/llm-platform/pricing.json
 ```
 
 Tasks are **not** seeded from files — they live in the DB and are authored at runtime
-through the Studio (`POST /v1/tasks`, creator/admin). There is no `TASKS_DIR` to mount;
+through the Studio/API (`POST /v1/tasks`; currently admin-only, future creator/admin workflow). There is no `TASKS_DIR` to mount;
 task config is data, carried by the database (back it up / migrate it like any other data).
 
 Delete nothing in `.env` handling — `godotenv.Load()` is a no-op when the file is
@@ -125,7 +126,7 @@ deliberately contained to `internal/db/*` and `internal/tasks/store.go` +
    (`SetMaxOpenConns(20)`, `SetMaxIdleConns(10)`, `SetConnMaxLifetime(30m)`).
 3. **Migrations:** replace boot-time guarded ALTERs with **versioned migrations**
    (`golang-migrate` or `pressly/goose`, embedded via `embed.FS`, run on startup).
-   Translate the current schema (repo-guide §3.7) once as migration 0001. SQL deltas:
+   Translate the current schema from `internal/db/db.go` and [08-database.md](08-database.md) once as migration 0001. SQL deltas:
    - `INTEGER PRIMARY KEY AUTOINCREMENT` → `BIGINT GENERATED ALWAYS AS IDENTITY`
    - `DATETIME ... datetime('now')` → `TIMESTAMPTZ ... now()`; store `time.Time`
      directly, delete the string `fmtTime`/`parseTime` round-trips
@@ -177,9 +178,10 @@ Also:
   under the WriteTimeout.
 - **TLS:** terminate at the LB/ingress. Do not add TLS into the Go server unless
   there's no LB; if so, `srv.ListenAndServeTLS` with mounted certs.
-- **Protective rate limit:** the real token-aware limiter is Phase 2; until then add
-  `middleware.Throttle(256)` (max concurrent) so a runaway caller can't exhaust
-  goroutines waiting on 120s model calls.
+- **Protective concurrency cap:** the token-aware per-task limiter is already implemented.
+  Production should still consider `middleware.Throttle(256)` or an equivalent max
+  concurrent request cap so a runaway caller cannot exhaust goroutines waiting on
+  long model calls.
 
 ---
 
@@ -279,18 +281,19 @@ rollout — nothing task-shaped needs to be mounted.
 
 ## 9. Things that must NOT change in the move
 
-(Reiterating repo-guide §6 where deployment pressure tends to break them.)
+(Reiterating the implementation reference's future coding practices where deployment pressure tends to break them.)
 
 1. `users.Store`, `llm.Provider`, `internal/db` query funcs are the swap seams — swap
    behind them, don't bypass.
 2. `/v1/tasks/*` response shapes are now CIS-facing: **additive changes only.**
 3. Playground (`/run`, `/sessions`) stays internal-only — never document it to service
    callers; consider requiring a non-`svc:` subject for it.
-4. Observability writes never fail or block a prediction (RunWriter semantics).
+4. Observability writes never fail or block a prediction (RunWriter, GatewayAttemptWriter, and HealthEventWriter semantics).
 5. Budget cap 0 = exempt is the documented escape hatch for critical compliance paths.
 6. Tasks are DB-resident, authored via `POST /v1/tasks` (no file seeding) — the database
    is the source of truth, so back it up and migrate it like any other stateful data
-   through the Postgres port. Only the built-in `playground` task is seeded at boot.
+   through the Postgres port. Only the built-in `playground` and `attribute-extraction`
+   tasks are seeded at boot.
 
 ---
 

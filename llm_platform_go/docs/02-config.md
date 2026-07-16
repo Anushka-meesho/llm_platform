@@ -67,7 +67,15 @@ If one is missing (but not both), the server starts with a warning: models that 
 | `DB_PATH` | `DBPath` | Path to the SQLite database file | `./llm_platform.db` |
 | `PORT` | `Port` | HTTP port to listen on | `8000` |
 | `PRICING_PATH` | `PricingPath` | Path to the pricing JSON file | `./pricing.json` |
-| `TASKS_DIR` | *(read directly)* | Directory of YAML task configs | `./tasks.d` |
+
+Task configuration is stored in the database. The server seeds only the built-in `playground` and `attribute-extraction` tasks at startup; new product tasks are created through `POST /v1/tasks` or the Studio UI. There is no `TASKS_DIR` loader in the current implementation.
+
+### Runtime and browser integration
+
+| Env var | Config field | What it does | Default |
+|---------|-------------|--------------|---------|
+| `LOG_LEVEL` | *(read directly)* | Set to `debug` for verbose structured logs | `info` |
+| `ALLOWED_ORIGINS` | *(read directly)* | Comma-separated CORS origins allowed to call the API | `http://localhost:5173` |
 
 ---
 

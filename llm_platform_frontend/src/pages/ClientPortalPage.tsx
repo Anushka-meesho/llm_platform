@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type React
 import { Typography, Button } from '@meesho/merlin-ui-tailwind';
 import type { TTask, TTaskStatsDetail, TPredictResult, TGatewayAttempt } from '../types';
 import { type PredictOutcome, api, ApiError, errorMessage } from '../api/client';
+import CSVBatchTestPanel from '../components/CSVBatchTestPanel';
 import { usePersistentState } from '../hooks/usePersistentState';
 import { formatCost } from '../utils/tokens';
 
@@ -303,7 +304,7 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
   };
 
   return (
-    <Section title="Try it — live production call">
+    <Section title="Try it">
       {fields.length === 0 ? (
         <div className="text-sm text-secondary-text">
           This task declares no input schema; call it from code with arbitrary inputs.
@@ -376,6 +377,8 @@ const TryItPanel = ({ task, onPredicted }: { task: TTask; onPredicted: () => voi
 
       {outcome && <ResultCard outcome={outcome} />}
       {outcome && attempts && attempts.length > 0 && <GatewayTrace attempts={attempts} />}
+
+      <CSVBatchTestPanel task={task} />
     </Section>
   );
 };

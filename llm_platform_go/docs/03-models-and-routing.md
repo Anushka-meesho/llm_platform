@@ -132,6 +132,8 @@ Each entry has three fields:
 | `modelID` | string | The actual model identifier sent in the API request |
 | `provider` | string | Attribution name for logging/cost tracking ("openai", "groq", "gemini", "anthropic") |
 | `clientFn` | `func(*Clients) Provider` | A function that picks the right provider from the Clients struct |
+| `reasoning` | bool | For OpenAI reasoning-family models that need `max_completion_tokens` and default temperature |
+| `minOutputTokens` | int | For thinking-heavy models (Gemini 2.5) where too-low `max_tokens` leaves no room for the answer |
 
 The `clientFn` field is the clever part:
 
@@ -169,12 +171,15 @@ func CallModel(ctx context.Context, clients *Clients, modelName string,
     // 2. Get the right provider
     provider := cfg.clientFn(clients)
 
-    // 3. Build the request (special case for reasoning models)
+    // 3. Build the request (special cases are driven by registry flags)
     req := &chatRequest{
         Model:       cfg.modelID,
         Messages:    messages,
         Temperature: temperature,
         MaxTokens:   maxTokens,
+    }
+    if cfg.minOutputTokens > 0 && maxTokens < cfg.minOutputTokens {
+        maxTokens = cfg.minOutputTokens
     }
     if cfg.reasoning {
         req.MaxCompletionTokens = maxTokens
@@ -205,7 +210,12 @@ Then add a pricing entry to `pricing.json`:
 "gpt-5-mini": { "input_per_1m": 0.40, "output_per_1m": 1.60 }
 ```
 
-That's it. No new code, no new HTTP client, no recompilation — just config.
+Also update:
+- `pricing.json`, otherwise cost reports as `$0.00`.
+- Any frontend model picker/constants that should expose the new key.
+- Registry/pricing tests so missing attribution or pricing is caught before deploy.
+
+This does require a backend rebuild/redeploy because the routing registry lives in Go code. The deliberate choice is: provider routing is code-reviewed, typed, and tested instead of being silently changed by runtime config.
 
 ---
 

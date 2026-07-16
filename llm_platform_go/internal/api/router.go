@@ -135,6 +135,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 		pr.With(write, v("test_task")).Post("/v1/tasks/{task_id}/test", h.TestTask)
 		pr.With(read).Get("/v1/tasks/{task_id}/stats", h.TaskStats)
 
+		// Eval datasets + prompt-version evaluation (Phase 2 foundation).
+		pr.With(read).Get("/v1/tasks/{task_id}/eval-datasets", h.ListEvalDatasets)
+		pr.With(write).Post("/v1/tasks/{task_id}/eval-datasets/upload", h.UploadEvalDataset)
+		pr.With(write, v("create_prism_eval_dataset")).Post("/v1/tasks/{task_id}/eval-datasets/prism", h.CreatePrismEvalDataset)
+		pr.With(write, v("run_eval")).Post("/v1/tasks/{task_id}/versions/{version}/check", h.CheckEvalDataset)
+		pr.With(write, v("run_eval")).Post("/v1/tasks/{task_id}/versions/{version}/check.csv", h.DownloadEvalCSV)
+		pr.With(write, v("run_eval")).Post("/v1/tasks/{task_id}/versions/{version}/eval", h.RunEval)
+
 		// Shadow comparison harness (Phase 1 success metric).
 		pr.With(write, v("shadow_compare")).Post("/v1/shadow/compare", h.ShadowCompare)
 		pr.With(read).Get("/v1/shadow/reports", h.ListShadowReports)

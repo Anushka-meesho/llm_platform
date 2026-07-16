@@ -8,10 +8,10 @@ Core capabilities:
 
 - **Task registry** — named prediction use-cases with JSON Schema in/out contracts, versioned prompts, and per-task model routing chains.
 - **Fallback walk** — if the primary model fails or is unhealthy, the platform tries the next model automatically; the caller never sees a provider error unless the entire chain exhausts.
-- **Two-layer circuit breaker** — a provider-wide breaker stops all traffic to a failing provider; a per-(task, model) health gate skips a model only for that task.
+- **Per-task/model health tracker** — unhealthy model-task pairs are skipped, and recovery is probed lazily after cooldown.
 - **Prediction cache** — semantically identical predictions (same task, prompt version, rendered prompt, model, params, schema) are served from cache; zero provider cost.
 - **Cost tracking** — every prediction records input/output tokens and USD cost; daily budget gates are enforced per task.
-- **RBAC** — five roles (admin, creator, approver, caller, viewer) gate every API action; JWT tokens issued as HttpOnly session cookies.
+- **RBAC seam** — the current backend ships admin permissions with JWT tokens issued as HttpOnly session cookies; creator/approver/caller/viewer are the planned role split.
 - **Async observability** — DB writes happen off the hot path through buffered channel writers; dropped rows are counted but never fail a prediction.
 
 ## System topology
@@ -25,9 +25,11 @@ Go Backend  (:8000)
      │
      ├─ /v1/tasks/{id}/predict
      │       │
-     │       ├─ cache lookup (Redis / in-memory)
-     │       │
+     │       ├─ request + task schema validation
+     │       ├─ rate limiter + daily budget gate
      │       └─ fallback walk
+     │               ├─ per-model cache lookup (Redis / in-memory)
+     │               ├─ per-task/model health gate
      │               ├─ Groq API  (Bearer token, direct)
      │               └─ Meesho bifrost gateway  (x-bf-vk)
      │                       ├─ OpenAI GPT-4o / GPT-4o-mini
@@ -38,6 +40,8 @@ Go Backend  (:8000)
              ├─ runs          (prediction history, tokens, cost)
              ├─ tasks         (registry)
              ├─ prompt_versions
+             ├─ gateway_attempts
+             ├─ eval_datasets / eval_examples / eval_runs
              ├─ feedback
              ├─ shadow_reports
              └─ model_health_events
@@ -45,10 +49,10 @@ Go Backend  (:8000)
 
 ## Why Go?
 
-- **Goroutines are cheap.** The async DB writers (RunWriter, HealthEventWriter) are goroutines that drain buffered channels. Under Go's M:N scheduler this costs almost nothing; the same pattern in a thread-per-goroutine language would be expensive.
+- **Goroutines are cheap.** The async DB writers (RunWriter, GatewayAttemptWriter, HealthEventWriter) are goroutines that drain buffered channels. Under Go's M:N scheduler this costs almost nothing; the same pattern in a thread-per-goroutine language would be expensive.
 - **Single binary.** `go build` produces one statically-linked executable with no runtime dependency (no JVM, no interpreter). Deploy by copying a file.
 - **Standard library covers the stack.** `net/http`, `text/template`, `encoding/json`, `crypto/sha256` — no framework needed for this surface area.
-- **Concurrency primitives match the problem.** Channels for the writers, `sync.Map` for the registry, `sync.RWMutex` for the circuit breaker state — the idioms are exact fits.
+- **Concurrency primitives match the problem.** Channels for the writers and `sync.RWMutex` for task cache / health state keep the implementation direct and testable.
 
 ## Why SQLite?
 
@@ -66,6 +70,6 @@ Go Backend  (:8000)
 | **Session** | A sequence of runs from one user in one sitting |
 | **Provider** | An LLM backend (openai, groq, gemini, anthropic) |
 | **Fallback chain** | Ordered list of models tried in sequence on failure |
-| **Circuit breaker** | State machine that stops sending traffic to a failing provider |
+| **Health tracker** | Per-task/per-model state machine that skips unhealthy model-task pairs |
 | **Prompt version** | Integer that increments every time a task's prompt is deployed |
 | **Cache hit** | A prediction served from cache; zero provider cost, zero tokens consumed |

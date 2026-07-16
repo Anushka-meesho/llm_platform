@@ -87,11 +87,11 @@ Schemas use [JSON Schema](https://json-schema.org/) — an industry-standard for
 }
 ```
 
-When a caller sends inputs, they're validated against this schema before the prompt is rendered. A missing required field, a wrong type, or an extra unexpected field → 400 error, no LLM call.
+When a caller sends inputs, they're validated against this schema before the prompt is rendered. A missing required field, a wrong type, or an extra unexpected field returns `422 Unprocessable Entity` with code `input_validation_failed` — no LLM call is made.
 
 **Why validate inputs?** 1. Costs money to call an LLM with bad data. 2. Clear error messages help callers fix their integration. 3. The platform is a contract — schema defines the contract.
 
-**Output schema** works the same way. After the model responds, the response text is validated as JSON against the output schema. If it doesn't match, the fallback chain advances. This makes structured output reliable.
+**Output schema** works the same way. After the model responds, the response text is stripped of Markdown code fences, parsed/coerced into the top-level schema type (object, array, string, number, integer, or boolean), and validated. If it doesn't match, the fallback chain advances. This makes structured output reliable without forcing every model to naturally emit perfect JSON every time.
 
 ---
 
@@ -206,9 +206,9 @@ This prevents collisions — even if you save 3 drafts before deploying, they ge
 
 ---
 
-## RBAC on tasks: why callers can't see the prompt
+## RBAC on tasks: prompt visibility is permission-based
 
-When a service with the `caller` role calls `GET /v1/tasks/classify-ticket`, the response has the input/output schemas and task metadata — but `prompt_template` and `system_prompt` are **blanked out** (`""`).
+The current implementation ships one concrete role, `admin`, which has every permission. The RBAC seam is already in place for future roles: task responses are passed through a redaction helper, and callers without `task:view_prompt` receive metadata and schemas but not the raw `prompt_template` or `system_prompt`.
 
 ```go
 func redactedTask(t *tasks.Task) *TaskResponse {
@@ -221,67 +221,57 @@ func redactedTask(t *tasks.Task) *TaskResponse {
 }
 ```
 
-**Why?** The prompt is intellectual property. The callers' contract is "given these inputs, get this output" — they don't need to know how the sausage is made. This also lets the prompt team iterate on prompts without exposing internal reasoning to external services.
+**Why?** The prompt is intellectual property. The caller's contract is "given these inputs, get this output" — the schema is the interface, not the prompt text. This lets the prompt team iterate without coupling external services to internal prompt implementation.
 
-Roles that CAN see prompts: Admin, Creator, Approver, Viewer.
-Roles that CANNOT: Caller.
+Planned future split: Admin/Creator/Approver/Viewer can see prompts; Caller cannot. See [09-auth-and-rbac.md](09-auth-and-rbac.md).
 
 ---
 
-## Defining a task in YAML
+## Creating a task through the API or Studio
 
-You don't have to use the API to create tasks. Put a `.yaml` file in `tasks.d/` and it's loaded at startup:
+Tasks are persisted in the `tasks` table. The backend seeds only built-ins at startup; product tasks are created through the Studio or `POST /v1/tasks`:
 
-```yaml
-id: classify-ticket
-name: Ticket Classifier
-description: Classifies support tickets into predefined categories
-
-model: gpt-4o
-fallback_models: [gemini-2.5-flash, llama-groq]
-temperature: 0.1
-max_tokens: 200
-
-daily_budget_usd: 10.0
-cache_enabled: true
-cache_ttl_seconds: 86400  # 24 hours
-
-system_prompt: |
-  You are a support ticket classifier. You ALWAYS respond with valid JSON only.
-  Never include explanation text outside the JSON.
-
-prompt_template: |
-  Classify the following support ticket.
-  Categories: {{.categories}}
-
-  Ticket:
-  {{.body}}
-
-  Respond with: {"label": "<category>", "confidence": <0.0-1.0>}
-
-input_schema:
-  type: object
-  required: [categories, body]
-  properties:
-    categories:
-      type: string
-    body:
-      type: string
-      maxLength: 5000
-
-output_schema:
-  type: object
-  required: [label, confidence]
-  properties:
-    label:
-      type: string
-    confidence:
-      type: number
-      minimum: 0
-      maximum: 1
+```json
+{
+  "id": "classify-ticket",
+  "name": "Ticket Classifier",
+  "description": "Classifies support tickets into predefined categories",
+  "model": "gpt-4o",
+  "fallback_models": ["gemini-2.5-flash", "llama-groq"],
+  "temperature": 0.1,
+  "max_tokens": 200,
+  "daily_budget_usd": 10.0,
+  "cache_enabled": true,
+  "cache_ttl_seconds": 86400,
+  "system_prompt": "You are a support ticket classifier. You ALWAYS respond with valid JSON only.",
+  "prompt_template": "Classify the ticket. Categories: {{.categories}}\n\nTicket:\n{{.body}}\n\nRespond with JSON.",
+  "input_schema": {
+    "type": "object",
+    "required": ["categories", "body"],
+    "properties": {
+      "categories": {"type": "string"},
+      "body": {"type": "string", "maxLength": 5000}
+    },
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["label", "confidence"],
+    "properties": {
+      "label": {"type": "string"},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    },
+    "additionalProperties": false
+  }
+}
 ```
 
-This YAML is loaded by `tasks.LoadYAMLDir(taskStore, "./tasks.d")` during startup (step 10 of the boot sequence). The schema validation and defaults are applied as if you'd created it via the API.
+The same validation and defaults apply whether the request comes from the Studio or a direct API client:
+- task IDs must match the slug regex;
+- model and fallback keys must exist in the model registry;
+- prompt templates must parse as Go `text/template`;
+- input/output schemas are compiled before the task is saved;
+- prompt changes create a new prompt version, and deploying a version updates `tasks.prompt_version`.
 
 ---
 
@@ -293,3 +283,5 @@ The playground compare UI (`/run` endpoint) runs under a special built-in task w
 - The playground respects the global daily budget (if ever configured).
 
 `tasks.SeedPlayground(taskStore)` creates this task at startup if it doesn't exist. It uses no schemas (free-form input/output) and no prompt template (the raw prompt is sent directly).
+
+The backend also seeds `attribute-extraction`, a structured demo task that exercises the production predict path: input schema, output schema, prompt rendering, fallback routing, health tracking, and cache/rate-limit behavior.

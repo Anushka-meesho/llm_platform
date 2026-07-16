@@ -53,6 +53,16 @@ func ValidateInput(t *Task, inputs json.RawMessage) error {
 	return validateAgainst(t.InputSchema, inputs)
 }
 
+// ValidateExpectedOutput checks an uploaded labelled example against the task's
+// output schema. Unlike model output validation, it does not coerce from text:
+// eval labels are already JSON values and should match the contract exactly.
+func ValidateExpectedOutput(t *Task, expected json.RawMessage) error {
+	if len(t.OutputSchema) == 0 {
+		return nil
+	}
+	return validateAgainst(t.OutputSchema, expected)
+}
+
 // ValidateOutput turns a model's raw response into the value handed back to the
 // API caller, according to the task's output schema — the response contract.
 //

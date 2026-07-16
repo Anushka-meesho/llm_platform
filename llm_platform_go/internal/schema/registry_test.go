@@ -10,6 +10,7 @@ import (
 // or stray schema file is caught here rather than in production.
 var expectedSchemas = []string{
 	"auth_login",
+	"create_prism_eval_dataset",
 	"create_task",
 	"delete_sessions",
 	"deploy_version",
@@ -17,6 +18,7 @@ var expectedSchemas = []string{
 	"model_health_reset",
 	"predict",
 	"run",
+	"run_eval",
 	"save_draft_version",
 	"shadow_compare",
 	"test_task",

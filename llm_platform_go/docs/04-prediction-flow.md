@@ -13,6 +13,7 @@ sequenceDiagram
     participant H as Handler
     participant EP as executePrediction
     participant RL as Rate Limiter
+    participant HT as Health Tracker
     participant C as Cache
     participant FB as Fallback Chain
     participant P as LLM Provider
@@ -21,7 +22,7 @@ sequenceDiagram
     App->>Mid: POST /v1/tasks/classify-ticket/predict
     Mid->>Mid: Parse JWT from cookie/header
     Mid->>H: (user attached to request context)
-    H->>H: Load task config
+    H->>H: Load task config (from 5s memory cache)
     H->>H: Check permission (task:predict)
     H->>EP: executePrediction(task, inputs, user)
     EP->>EP: 1. Validate inputs against input schema
@@ -30,19 +31,22 @@ sequenceDiagram
     EP->>EP: 4. Build chat messages [system, user]
     EP->>RL: 5. Reserve capacity (estimate input tokens)
     RL-->>EP: allowed (or 413/429 if over limit)
-    EP->>C: 6. Cache lookup (per-model, inside fallback walk)
-    C-->>EP: miss
-    EP->>FB: 7. CallWithFallbackOpts(models, messages)
+    EP->>FB: 6. CallWithFallbackOpts(models, messages)
+    FB->>HT: Allow(task, model)?
+    HT-->>FB: yes / skip-unhealthy
+    FB->>C: Cache lookup for this model
+    C-->>FB: hit or miss
     FB->>P: Call primary model (gpt-4o)
     P-->>FB: Response text + token counts
-    FB->>FB: 8. Validate output against output schema
+    FB->>FB: 7. Validate output against output schema
+    FB->>HT: RecordSuccess / RecordFailure
     FB-->>EP: ModelResult + Attempts trace
-    EP->>RL: 9. Reconcile reservation (actual tokens consumed)
-    EP--)DB: 10. Log gateway attempts (async, per model touched)
-    EP->>C: 11. Store in cache (24h TTL)
+    EP->>RL: 8. Reconcile reservation (actual tokens consumed)
+    EP--)DB: 9. Log gateway attempts (async, per model touched)
+    EP->>C: 10. Store in cache (24h TTL)
     EP-->>H: predictOutcome {output, gateway_latency_ms, ...}
     H-->>App: 200 OK {output, tokens, cost_usd, latency_ms, gateway_latency_ms}
-    H--)DB: 12. Log run (async, non-blocking)
+    H--)DB: 11. Log run (async, non-blocking)
 ```
 
 ---
@@ -76,19 +80,19 @@ task, err := h.Tasks.Get(taskID)
 The task store's `Get` method checks an in-memory cache first (5-second TTL) before hitting the database. For a task that's called 1,000 times per minute, this means ~200 DB reads per minute instead of 1,000.
 
 If the task doesn't exist → `404 Not Found`.
-If the task is inactive → `404 Not Found` (inactive tasks are effectively deleted from the API surface).
+If the task is inactive → `409 Conflict` with code `task_inactive`.
 
 ---
 
 ## Step 3: Input validation
 
 ```go
-if err := validateInputs(task.InputSchema, inputs); err != nil {
-    return nil, &httpError{Status: 400, Detail: err.Error()}
+if err := tasks.ValidateInput(task, rawInputs); err != nil {
+    return nil, Unprocessable(CodeInputValidation, "%s", err.Error())
 }
 ```
 
-If the task has an `input_schema`, the submitted JSON inputs are validated against it using the [JSON Schema](https://json-schema.org/) standard. For example, if the schema says `"category"` is required and must be a string, and the caller sends `{"category": 42}`, the call fails with a 400 error *before* any LLM API is called.
+If the task has an `input_schema`, the submitted JSON inputs are validated against it using the [JSON Schema](https://json-schema.org/) standard. For example, if the schema says `"category"` is required and must be a string, and the caller sends `{"category": 42}`, the call fails with `422 Unprocessable Entity` (`input_validation_failed`) *before* any LLM API is called.
 
 **Why validate before calling the LLM?** LLM API calls cost money. A malformed request that fails schema validation should be caught instantly, not after spending $0.002 on tokens.
 
@@ -123,7 +127,7 @@ Respond with only the label."
 
 ---
 
-## Step 5: Build chat messages
+## Step 4b: Build chat messages
 
 ```go
 messages := buildMessages(task, renderedPrompt, images)
@@ -162,11 +166,26 @@ If the request is allowed, a **reservation** is created. After the fallback walk
 
 **Rate limiting only applies to production predicts.** Studio test panel runs (`is_test=true`) and shadow comparisons bypass the limiter.
 
+### The three-gate funnel
+
+```mermaid
+flowchart TD
+    In([Predict request]) --> G1{Gate 1<br/>est. tokens ≤ MaxInputTokens?}
+    G1 -->|No| E1[413 — input_too_large<br/>Do not retry]
+    G1 -->|Yes| G2{Gate 2<br/>requests this window ≤ MaxRequests?}
+    G2 -->|No| E2[429 — request_rate_exceeded<br/>Retry-After: Xs]
+    G2 -->|Yes| G3{Gate 3<br/>reserved tokens ≤ MaxTokens?}
+    G3 -->|No| E3[429 — token_budget_exhausted<br/>Retry-After: Xs]
+    G3 -->|Yes| OK([✓ Reserve — proceed to cache + LLM])
+```
+
+See [11-rate-limiter.md](11-rate-limiter.md) for the full reserve → reconcile lifecycle and configuration reference.
+
 ---
 
-## Step 6: Cache lookup
+## Step 6: Prepare cache lookup
 
-Before making any LLM API call, the platform checks the prediction cache:
+Before making any live LLM API call for a model, the fallback walk can check the prediction cache. The handler prepares that lookup as a function:
 
 ```go
 cacheLookup := func(model string) (ModelResult, bool) {
@@ -207,7 +226,7 @@ This is where the actual LLM API calls happen. See [05-fallback-chain.md](05-fal
 - Try the primary model.
 - If it fails for an infra reason (5xx, 429, timeout), try the first fallback model.
 - And so on, until a model succeeds or all models are exhausted.
-- The circuit breaker skips models it knows are currently unhealthy.
+- The health tracker skips model-task pairs it knows are currently unhealthy.
 
 The walk returns a `ModelResult` that now carries an `Attempts` slice — the full gateway trace, one entry per model the walk touched. Each entry records the outcome, fallback reason, HTTP status, whether it was an infra failure, retry count, latency, and token costs.
 
@@ -331,15 +350,22 @@ Before the cache lookup and model calls, there's a budget check:
 
 ```go
 if task.DailyBudgetUSD > 0 {
-    spent := h.currentSpend(ctx, task.ID)
+    spent, err := h.currentSpend(task.ID)
+    if err != nil {
+        writeErr(w, r, Internal(CodeInternal, "budget check").WithCause(err))
+        return
+    }
     if spent >= task.DailyBudgetUSD {
-        return nil, &httpError{Status: 429, Detail: "daily budget exceeded"}
+        w.Header().Set("Retry-After", strconv.Itoa(secondsToUTCMidnight()))
+        writeErr(w, r, TooMany(CodeBudgetExhausted, "daily budget exhausted"))
+        return
     }
 }
 ```
 
-`currentSpend` uses an in-memory spend cache that's refreshed every 5 seconds from the database. It accumulates local costs on top of the refreshed DB value. This means:
+`currentSpend` uses an in-memory spend cache that's refreshed every 5 seconds from the database. It accumulates local costs on top of the refreshed DB value after predictions complete. This means:
 - No DB query on every prediction (would bottleneck at scale).
-- The spend value is slightly stale (up to 5s + the async writer lag), so enforcement is conservative — it might allow a few calls over budget by a small margin, but never allows unbounded overspend.
+- Back-to-back requests on the same instance see local cost increments before the async run writer flushes.
+- In a future multi-instance deployment, strict global budget enforcement would need a shared atomic counter such as Redis or Postgres row locking.
 
 **Why not just query the DB?** A `SUM(cost_usd) WHERE task_id=? AND date=today` query would need to run on every prediction. At 1,000 predictions/minute, that's 1,000 SUM queries per minute — each one a full table scan or index scan on an ever-growing table.

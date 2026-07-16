@@ -55,7 +55,7 @@ The most important table. One row per model per call. If you call the playground
 | `task_id` | TEXT | Which task (e.g. "classify-ticket") — "playground" for /run |
 | `prompt` | TEXT | The full rendered prompt sent to the model |
 | `system_prompt` | TEXT | The system prompt (if any) |
-| `images` | TEXT | JSON array of image URLs/data-URLs (for vision calls) |
+| `image` | TEXT | JSON payload of image URLs/data-URLs for multimodal calls; empty for text-only runs |
 | `model` | TEXT | Friendly model name ("gpt-4o") |
 | `response` | TEXT | The model's response text |
 | `latency_ms` | INTEGER | Time from API call to response in milliseconds |
@@ -67,7 +67,6 @@ The most important table. One row per model per call. If you call the playground
 | `error` | TEXT | Error message if success=0 |
 | `user_id` | TEXT | Who made the call |
 | `user_email` | TEXT | Their email (denormalized for fast display) |
-| `task_id` | TEXT | Which task |
 | `prompt_version` | INTEGER | Which prompt version was active |
 | `provider` | TEXT | "openai", "groq", "gemini", "anthropic" |
 | `fallback_used` | INTEGER | 0 or 1: was this served by a non-primary model? |
@@ -82,7 +81,7 @@ The most important table. One row per model per call. If you call the playground
 
 ### `tasks` — task configurations
 
-Stores every task created via the API or seeded from YAML. All the fields from the `Task` struct, including the full `prompt_template` and `system_prompt`.
+Stores every task created through the API/Studio, plus the two built-in seeded tasks (`playground` and `attribute-extraction`). All the fields from the `Task` struct live here, including the full `prompt_template`, `system_prompt`, input/output schemas, model chain, cache flags, and daily budget.
 
 Indexes: `id` (primary key), `active` (for listing active tasks).
 
@@ -100,7 +99,9 @@ Each row is one historical snapshot of a task's prompt.
 | `system_prompt` | The system prompt at that version |
 | `note` | Optional description ("Fixed JSON format issue") |
 | `created_by` | Who saved this version |
-| `active` | Is this the currently deployed version? |
+| `created_at` | When this version was saved |
+
+There is no persisted `active` column in this table. The active version is computed by comparing `prompt_versions.version` to `tasks.prompt_version`. Deploying a prompt updates the `tasks` row with the selected version's template/system prompt and version number.
 
 ---
 
@@ -115,6 +116,45 @@ One row per (run_id, model, user_id) triplet. If a user re-rates an output, the 
 | `rating` | 1–5 stars |
 | `user_id` | Who rated it |
 | `created_at` | When |
+
+---
+
+### `shadow_reports` — side-by-side task comparisons
+
+Stores the summary of shadow compare runs, where the platform evaluates alternate model/prompt choices against existing task traffic or sample rows without changing production routing.
+
+| Column | Purpose |
+|--------|---------|
+| `task_id` | Which task was compared |
+| `created_by` | User who ran the comparison |
+| `items` | Number of evaluated examples |
+| `match_rate` | Fraction whose outputs matched |
+| `avg_latency_ms` | Average latency across compared rows |
+| `p95_latency_ms` | 95th percentile latency |
+| `total_cost_usd` | Total model cost for the comparison |
+| `details` | JSON payload with per-row details |
+
+---
+
+### `eval_datasets` / `eval_examples` / `eval_runs` — quality checks
+
+The eval plane is implemented as three tables:
+
+| Table | Purpose |
+|-------|---------|
+| `eval_datasets` | Dataset metadata: task, name, version, source type (`csv`, `xlsx`, or `prism_sql` registration), mappings, schema hash, row count, status |
+| `eval_examples` | Row-level inputs and expected outputs for uploaded CSV/XLSX datasets |
+| `eval_runs` | Results of running a prompt version/model against a dataset: total, passed, failed, match rate, latency, cost, details |
+
+The API supports:
+- listing datasets and previous runs;
+- uploading CSV/XLSX datasets with column mappings;
+- registering Prism SQL datasets as `pending_import`;
+- checking a prompt version against a dataset;
+- downloading a CSV mismatch report;
+- recording eval run summaries.
+
+The hard deploy gate is not enforced yet: `Deploy` contains the intended insertion point, but today evals are advisory/manual.
 
 ---
 
@@ -286,5 +326,10 @@ SQLite uses indexes to find rows without scanning the whole table. The platform 
 | `runs.task_id` + `created_at` | Budget tracking — today's spend for a task |
 | `prompt_versions.task_id` | `ListVersions` — all versions of a task |
 | `model_health_events.task_id` + `model` | Health history for a (task, model) pair |
+| `gateway_attempts.run_id` | Full fallback trace for one served prediction |
+| `gateway_attempts.task_id` / `model` / `outcome` | Admin filtering and debugging |
+| `eval_datasets.task_id` | List datasets for a task |
+| `eval_examples.dataset_id` | Load examples for an eval run |
+| `eval_runs.task_id`, `dataset_id`, `(task_id, prompt_version)` | Eval history and prompt-version comparisons |
 
 Without these indexes, every query would scan every row — fine for 1,000 rows, very slow for 1,000,000.

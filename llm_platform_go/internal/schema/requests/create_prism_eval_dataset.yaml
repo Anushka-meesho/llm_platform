@@ -1,0 +1,25 @@
+# POST /v1/tasks/{task_id}/eval-datasets/prism — register a Prism silver table
+# SQL source. Import execution is pending Prism connector integration.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Create Prism eval dataset request
+type: object
+additionalProperties: false
+required: [name, sql, input_mapping]
+properties:
+  name:
+    type: string
+    minLength: 1
+  sql:
+    type: string
+    minLength: 1
+  input_mapping:
+    type: object
+    minProperties: 1
+    additionalProperties:
+      type: string
+      minLength: 1
+  output_mapping:
+    type: object
+    additionalProperties:
+      type: string
+      minLength: 1

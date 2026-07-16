@@ -35,7 +35,7 @@ The **payload** (middle part), when decoded, contains:
   "sub": "user123",
   "email": "alice@meesho.com",
   "name": "Alice",
-  "role": "creator",
+  "role": "admin",
   "iss": "llm-platform-demo",
   "exp": 1699999999
 }
@@ -137,7 +137,7 @@ const (
 )
 ```
 
-`RoleAdmin` grants all six permissions. Any user with an unknown role (or an empty role claim) falls back to `RoleAdmin` via `DefaultRole`.
+`RoleAdmin` grants all six permissions. An empty role is normalized to `admin` by `DefaultRole`; an unknown non-empty role grants no permissions and the `issue-token` CLI rejects it. This keeps typos from silently becoming superuser access.
 
 ### The six permissions
 
@@ -147,7 +147,7 @@ const (
 | `task:predict` | ✅ | Call the predict endpoint |
 | `task:write` | ✅ | Create/update tasks, save prompt drafts, run Studio tests, shadow comparisons |
 | `task:deploy` | ✅ | Activate a prompt version into production |
-| `task:delete` | ✅ | Delete prompt versions (irreversible) |
+| `task:delete` | ✅ | Delete non-protected tasks and delete non-active prompt versions |
 | `task:view_prompt` | ✅ | See prompt template + system prompt text |
 
 ### Planned roles (not yet implemented)
